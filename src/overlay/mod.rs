@@ -294,11 +294,18 @@ impl OverlayManager {
 
                 // Register global hotkeys
                 let mod_flags = HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0);
+                let mut hotkey_warning: Option<String> = None;
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_TRANSLATE, mod_flags, 0x54) {
                     error!("Failed to register Alt+T (Translate): {:?}", e);
+                    hotkey_warning =
+                        Some("Предупреждение: Alt+T занят другой программой".to_string());
                 }
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI, mod_flags, 0x53) {
                     error!("Failed to register Alt+S (Select ROI): {:?}", e);
+                    if hotkey_warning.is_none() {
+                        hotkey_warning =
+                            Some("Предупреждение: Alt+S занят другой программой".to_string());
+                    }
                 }
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE_AUTO, mod_flags, 0x41) {
                     error!("Failed to register Alt+A (Toggle Auto): {:?}", e);
@@ -311,6 +318,11 @@ impl OverlayManager {
                 }
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_QUIT, mod_flags, 0x51) {
                     error!("Failed to register Alt+Q (Quit): {:?}", e);
+                }
+
+                if let Some(msg) = hotkey_warning {
+                    let mut s = shared_for_thread.lock().unwrap_or_else(|e| e.into_inner());
+                    s.status_msg = Some(msg);
                 }
 
                 let renderer =
