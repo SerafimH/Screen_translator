@@ -331,8 +331,8 @@ impl AppConfig {
                 "openai_base_url" => cfg.openai_base_url = val_unquoted.to_string(),
                 "openai_model" => cfg.openai_model = val_unquoted.to_string(),
                 "auto_mode_interval_ms" => {
-                    if let Ok(n) = val_unquoted.parse() {
-                        cfg.auto_mode_interval_ms = n;
+                    if let Ok(n) = val_unquoted.parse::<u64>() {
+                        cfg.auto_mode_interval_ms = n.max(100);
                     }
                 }
                 "font_size" => {
@@ -449,5 +449,26 @@ mod tests {
         assert!(!debug_str.contains("abcdef-1234-5678:fx"));
         assert!(!debug_str.contains("gsk_topsecrettoken"));
         assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_med_01_auto_mode_interval_bounds() {
+        // config with 0 yields 100
+        let toml_zero = "auto_mode_interval_ms = 0\n";
+        let cfg_zero = AppConfig::from_toml_str(toml_zero);
+        assert_eq!(cfg_zero.auto_mode_interval_ms, 100);
+
+        // empty, negative, and garbage values do not panic and keep valid default >= 100
+        let toml_empty = "auto_mode_interval_ms = \n";
+        let cfg_empty = AppConfig::from_toml_str(toml_empty);
+        assert!(cfg_empty.auto_mode_interval_ms >= 100);
+
+        let toml_neg = "auto_mode_interval_ms = -50\n";
+        let cfg_neg = AppConfig::from_toml_str(toml_neg);
+        assert!(cfg_neg.auto_mode_interval_ms >= 100);
+
+        let toml_garbage = "auto_mode_interval_ms = not_a_number\n";
+        let cfg_garbage = AppConfig::from_toml_str(toml_garbage);
+        assert!(cfg_garbage.auto_mode_interval_ms >= 100);
     }
 }

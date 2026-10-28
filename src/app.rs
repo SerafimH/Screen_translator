@@ -91,7 +91,7 @@ impl App {
             let mut last_signature = FrameSignature::default();
             let interval_ms = {
                 let cfg = auto_state.config.lock().unwrap_or_else(|e| e.into_inner());
-                cfg.auto_mode_interval_ms
+                cfg.auto_mode_interval_ms.max(100)
             };
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
