@@ -2,9 +2,9 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 use tracing::error;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC, HGDIOBJ, ROP_CODE,
-    ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC,
+    HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -343,8 +343,8 @@ impl ScreenCapture {
                 obj: hbitmap_obj,
             };
 
-            // 0x40000000 is CAPTUREBLT, combined with SRCCOPY (0x00CC0020) = 0x40CC0020
-            let rop = ROP_CODE(SRCCOPY.0 | 0x40000000);
+            // Combine SRCCOPY (0x00CC0020) with CAPTUREBLT (0x40000000) = 0x40CC0020
+            let rop = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
             let blt_res = BitBlt(
                 hdc_mem_raw,
                 0,
@@ -553,5 +553,10 @@ mod tests {
         // Dialogue change produces MAD >> 3.5
         assert!(mad >= DELTA_THRESHOLD);
         assert!(sig2.has_changed(&sig1));
+    }
+
+    #[test]
+    fn test_captureblt_constant_value() {
+        assert_eq!(CAPTUREBLT.0, 0x4000_0000);
     }
 }
