@@ -1105,4 +1105,47 @@ mod tests {
         let score = score_recognized_lines(&good);
         assert!(score >= 40, "Clear sentences must score high: {}", score);
     }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_meme_in_full_desktop_screen() {
+        if !WinrtOcrEngine::is_language_available("en") {
+            return;
+        }
+        let img = match image::open("tests/fixtures/meme_no_pickles.png") {
+            Ok(im) => im.to_rgba8(),
+            Err(_) => return,
+        };
+        let screen_w = 1920;
+        let screen_h = 1080;
+        let mut bgra = vec![40u8; (screen_w * screen_h * 4) as usize];
+
+        let paste_x = 400;
+        let paste_y = 50;
+        for y in 0..img.height().min(screen_h - paste_y) {
+            for x in 0..img.width().min(screen_w - paste_x) {
+                let px = img.get_pixel(x, y);
+                let idx = (((paste_y + y) * screen_w + (paste_x + x)) * 4) as usize;
+                bgra[idx] = px[2];
+                bgra[idx + 1] = px[1];
+                bgra[idx + 2] = px[0];
+                bgra[idx + 3] = 255;
+            }
+        }
+
+        let frame = CapturedFrame {
+            bgra_bytes: bgra,
+            width: screen_w,
+            height: screen_h,
+            offset_x: 0,
+            offset_y: 0,
+        };
+
+        let engine = WinrtOcrEngine::new().unwrap();
+        let blocks = engine.recognize(&frame).await.unwrap();
+        println!("Full screen blocks: {}", blocks.len());
+        for b in &blocks {
+            println!("  Block: '{}' at {:?}", b.text, b.rect);
+        }
+    }
 }
