@@ -5,7 +5,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::capture::{FrameSignature, ScreenCapture};
+use crate::capture::{CapturedFrame, FrameSignature, ScreenCapture};
 use crate::ocr::{WinrtOcrEngine, is_ocr_garbage};
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
@@ -147,7 +147,7 @@ impl App {
                 last_signature = sig;
 
                 let task_state = auto_state.clone();
-                task_state.dispatch_translation_task();
+                task_state.dispatch_translation_task(Some(frame));
             }
         });
 
@@ -155,7 +155,7 @@ impl App {
         while let Some(event) = self.event_rx.recv().await {
             match event {
                 AppEvent::TriggerTranslate => {
-                    self.state.dispatch_translation_task();
+                    self.state.dispatch_translation_task(None);
                 }
 
                 AppEvent::RoiSelected(rect) => {
@@ -166,7 +166,7 @@ impl App {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(rect);
                     self.state.overlay.set_active_roi(Some(rect));
-                    self.state.dispatch_translation_task();
+                    self.state.dispatch_translation_task(None);
                 }
 
                 AppEvent::ToggleAutoMode => {
@@ -247,14 +247,14 @@ where
 }
 
 impl AppState {
-    fn dispatch_translation_task(&self) {
+    fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
         let state = self.clone();
         spawn_cancellable_task(&self.current_task, async move {
-            state.perform_translation().await;
+            state.perform_translation(prefetched_frame).await;
         });
     }
 
-    async fn perform_translation(&self) {
+    async fn perform_translation(&self, prefetched_frame: Option<CapturedFrame>) {
         let Some(_guard) = ProcessingGuard::acquire_or_wait(
             &self.is_processing,
             std::time::Duration::from_millis(500),
@@ -273,28 +273,33 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        self.overlay
-            .set_loading(true, Some("Захват экрана (D3D11 GPU)...".to_string()));
-        info!("Capturing frame (ROI: {:?})...", roi);
-
-        let capture_res =
-            tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(roi)).await;
-
-        let frame = match capture_res {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
-                error!("Capture failed: {}", e);
+        let frame = match prefetched_frame {
+            Some(f) => f,
+            None => {
                 self.overlay
-                    .update_blocks(Vec::new(), Some(format!("Ошибка захвата: {}", e)));
-                return;
-            }
-            Err(join_err) => {
-                error!("Capture join error: {:?}", join_err);
-                self.overlay.update_blocks(
-                    Vec::new(),
-                    Some("Ошибка фонового потока захвата".to_string()),
-                );
-                return;
+                    .set_loading(true, Some("Захват экрана (D3D11 GPU)...".to_string()));
+                info!("Capturing frame (ROI: {:?})...", roi);
+
+                let capture_res =
+                    tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(roi)).await;
+
+                match capture_res {
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => {
+                        error!("Capture failed: {}", e);
+                        self.overlay
+                            .update_blocks(Vec::new(), Some(format!("Ошибка захвата: {}", e)));
+                        return;
+                    }
+                    Err(join_err) => {
+                        error!("Capture join error: {:?}", join_err);
+                        self.overlay.update_blocks(
+                            Vec::new(),
+                            Some("Ошибка фонового потока захвата".to_string()),
+                        );
+                        return;
+                    }
+                }
             }
         };
 
