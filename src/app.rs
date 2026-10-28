@@ -28,6 +28,24 @@ impl ProcessingGuard {
             None
         }
     }
+
+    /// Tries to acquire the guard, waiting for a pending task cancellation/drop to complete
+    /// up to `timeout` before giving up.
+    pub async fn acquire_or_wait(
+        flag: &Arc<AtomicBool>,
+        timeout: std::time::Duration,
+    ) -> Option<Self> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(guard) = Self::try_acquire(flag) {
+                return Some(guard);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Drop for ProcessingGuard {
@@ -207,28 +225,42 @@ impl App {
     }
 }
 
+/// Cancels any currently running task in `task_slot` by calling `abort()` and
+/// awaiting its termination inside the newly spawned task, ensuring that all resources
+/// (like `ProcessingGuard`) are fully dropped before `fut` starts.
+pub fn spawn_cancellable_task<Fut>(task_slot: &Arc<Mutex<Option<JoinHandle<()>>>>, fut: Fut)
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = slot_lock.take();
+
+    let handle = tokio::spawn(async move {
+        if let Some(prev) = prev {
+            prev.abort();
+            let _ = prev.await;
+        }
+        fut.await;
+    });
+
+    *slot_lock = Some(handle);
+}
+
 impl AppState {
     fn dispatch_translation_task(&self) {
-        // Cancel any pending/outdated translation task
-        if let Some(prev) = self
-            .current_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            prev.abort();
-        }
-
         let state = self.clone();
-        let handle = tokio::spawn(async move {
+        spawn_cancellable_task(&self.current_task, async move {
             state.perform_translation().await;
         });
-
-        *self.current_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     async fn perform_translation(&self) {
-        let Some(_guard) = ProcessingGuard::try_acquire(&self.is_processing) else {
+        let Some(_guard) = ProcessingGuard::acquire_or_wait(
+            &self.is_processing,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        else {
             info!("Translation already in progress, skipping trigger.");
             return;
         };
@@ -413,5 +445,113 @@ mod tests {
         let third_guard = ProcessingGuard::try_acquire(&flag);
         assert!(third_guard.is_some());
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_high_02_cancellable_task_waits_for_old_task_to_release_guard() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
+        let flag_clone = flag.clone();
+        let old_task_started = Arc::new(tokio::sync::Notify::new());
+        let old_task_started_clone = old_task_started.clone();
+
+        struct SlowGuard {
+            _guard: ProcessingGuard,
+        }
+        impl Drop for SlowGuard {
+            fn drop(&mut self) {
+                // Simulates teardown latency (e.g. closing network stream/D3D textures)
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+
+        // Start old task that acquires the ProcessingGuard with teardown latency
+        let old_handle = tokio::spawn(async move {
+            let guard = ProcessingGuard::try_acquire(&flag_clone).expect("old task acquires guard");
+            let slow_guard = SlowGuard { _guard: guard };
+            old_task_started_clone.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(slow_guard);
+        });
+
+        *task_slot.lock().unwrap() = Some(old_handle);
+
+        // Wait until old task has actually acquired the guard and is sleeping
+        old_task_started.notified().await;
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "Flag must be true while old task runs"
+        );
+
+        // Flag to record whether new task executed successfully
+        let new_task_ran = Arc::new(AtomicBool::new(false));
+        let new_task_ran_clone = new_task_ran.clone();
+        let flag_for_new = flag.clone();
+
+        // New dispatch logic (spawn_cancellable_task awaits prev.abort()):
+        spawn_cancellable_task(&task_slot, async move {
+            if let Some(_guard) = ProcessingGuard::acquire_or_wait(
+                &flag_for_new,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            {
+                new_task_ran_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // Await the new task
+        let new_handle = task_slot.lock().unwrap().take().unwrap();
+        new_handle.await.unwrap();
+
+        assert!(
+            new_task_ran.load(Ordering::SeqCst),
+            "New task must have acquired guard and executed after cancelling old task"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "Flag must be released upon task completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_02_rapid_dispatches_do_not_accumulate_or_deadlock() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let completed_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Rapidly dispatch 20 tasks
+        for _ in 0..20 {
+            let flag_clone = flag.clone();
+            let counter_clone = completed_counter.clone();
+            spawn_cancellable_task(&task_slot, async move {
+                if let Some(_guard) = ProcessingGuard::acquire_or_wait(
+                    &flag_clone,
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+                {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+        }
+
+        // Await the final task
+        let final_handle = task_slot.lock().unwrap().take().unwrap();
+        final_handle.await.unwrap();
+
+        // Exactly one (or very few if early ones ran briefly) executed, not all 20
+        let count = completed_counter.load(Ordering::SeqCst);
+        assert!(count >= 1, "At least the final task must execute");
+        assert!(
+            count < 20,
+            "Tasks must not queue up sequentially without cancellation"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "Flag must be false at the end"
+        );
     }
 }
