@@ -18,11 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_CROSS, LoadCursorW, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SET_WINDOW_POS_FLAGS, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor,
-    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SMTO_ABORTIFHUNG, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SendMessageTimeoutW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Result, w};
 
@@ -223,7 +224,15 @@ impl OverlayManager {
                         "Found existing Screen Translator window {:?}, closing old instance...",
                         old_hwnd
                     );
-                    let _ = SendMessageW(old_hwnd, WM_CLOSE, None, None);
+                    let _ = SendMessageTimeoutW(
+                        old_hwnd,
+                        WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                        SMTO_ABORTIFHUNG,
+                        500,
+                        None,
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
 
@@ -641,6 +650,7 @@ unsafe fn enter_selection_mode(state: &mut WindowThreadState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     #[test]
     #[cfg(windows)]
