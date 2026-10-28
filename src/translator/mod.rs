@@ -1152,6 +1152,8 @@ impl TranslatorService {
                             cleaned_texts[i]
                         );
                         self.cache.insert(key, final_text.clone());
+                        self.context
+                            .record_translation(cleaned_texts[i].clone(), final_text.clone());
 
                         results.push(TranslationBlock {
                             original_text: blocks[i].text.clone(),
@@ -1397,5 +1399,19 @@ mod tests {
         let postprocessed = ctx.postprocess(translated);
         assert!(postprocessed.contains("HP"));
         assert!(postprocessed.contains("Опыт"));
+    }
+
+    #[test]
+    fn test_context_manager_record_translation_history() {
+        let ctx = ContextManager::new(2);
+        ctx.record_translation("one".to_string(), "один".to_string());
+        ctx.record_translation("two".to_string(), "два".to_string());
+        assert_eq!(ctx.get_recent_history().len(), 2);
+
+        ctx.record_translation("three".to_string(), "три".to_string());
+        let hist = ctx.get_recent_history();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ("two".to_string(), "два".to_string()));
+        assert_eq!(hist[1], ("three".to_string(), "три".to_string()));
     }
 }
