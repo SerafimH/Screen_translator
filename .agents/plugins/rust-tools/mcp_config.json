@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rust-lsp": {
+      "command": "cmd.exe",
+      "args": ["/c", "npx", "-y", "lsp-mcp-server"],
+      "env": {
+        "LSP_LOG_LEVEL": "info"
+      }
+    }
+  }
+}

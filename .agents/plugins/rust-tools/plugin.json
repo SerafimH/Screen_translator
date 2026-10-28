@@ -1,0 +1,4 @@
+{
+  "name": "rust-tools",
+  "description": "LSP and developer tooling for Rust projects"
+}
