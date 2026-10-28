@@ -52,8 +52,33 @@ struct OcrPassParams<'a> {
     remap: RemapParams,
 }
 
+/// Evaluates the linguistic quality of recognized lines to rank candidate OCR passes.
+/// Lines classified as garbage are skipped; points are awarded for alphabetic letters and valid words.
+pub fn score_recognized_lines(lines: &[RecognizedLine]) -> usize {
+    let mut score = 0;
+    for line in lines {
+        if is_ocr_garbage(&line.text) {
+            continue;
+        }
+        let letters = line.text.chars().filter(|c| c.is_alphabetic()).count();
+        let words = line.text.split_whitespace().count();
+        score += letters + (words * 2);
+    }
+    score
+}
+
 impl WinrtOcrEngine {
     pub fn new() -> Result<Self, String> {
+        if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
+            && let Ok(size) = langs.Size()
+            && size == 0
+        {
+            return Err(
+                "В Windows не установлен языковой пакет OCR. Установите английский пакет OCR в Параметрах Windows (Время и язык -> Язык и регион)."
+                    .to_string(),
+            );
+        }
+
         let engine = OcrEngine::TryCreateFromUserProfileLanguages()
             .map_err(|e| format!("Failed to create WinRT OcrEngine: {:?}", e))?;
         let lang = engine
@@ -74,22 +99,44 @@ impl WinrtOcrEngine {
         &self.language_tag
     }
 
-    /// Recognizes text in the captured frame using intelligent manga preprocessing
-    /// (bubble flood-fill cleaner, contrast sharpening, 2x upscale, pure white padding)
-    /// with an automatic high-contrast inversion fallback pass if no lines are initially detected.
+    /// Checks if a given language (e.g. "en" or "ru") is installed and available for WinRT OCR.
+    pub fn is_language_available(target_lang: &str) -> bool {
+        if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
+            && let Ok(size) = langs.Size()
+        {
+            for i in 0..size {
+                if let Ok(lang) = langs.GetAt(i)
+                    && let Ok(tag) = lang.LanguageTag()
+                {
+                    let tag_str = tag.to_string().to_lowercase();
+                    if tag_str.starts_with(&target_lang.to_lowercase()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Recognizes text in the captured frame using an adaptive multi-pass OCR strategy:
+    ///
+    /// 1. Standard manga preprocessing (bubble cleaner, contrast, 2x upscale, white padding)
+    ///
+    /// If pass 1 yields no or low-quality text, subsequent fallback passes execute within an 800ms deadline:
+    /// - Outlined text mask (for meme/Impact font text with black outlines on colored/noisy backgrounds)
+    /// - Inverted manga buffer (for inverted / glowing text)
+    /// - Raw image without manga cleaner (for game UI / HUD / photo text)
+    /// - Upscaled & contrast-enhanced image (for fine / small print)
     pub async fn recognize(&self, frame: &CapturedFrame) -> Result<Vec<OcrBlock>, String> {
         if frame.width == 0 || frame.height == 0 || frame.bgra_bytes.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 1. Preprocess frame with manga cleaning and contrast enhancement
-        let (prep, fallback_inv) = prepare_ocr_image(frame);
-
         save_debug_image("raw.png", &frame.bgra_bytes, frame.width, frame.height);
+
+        // 1. Pass 1: Standard manga preprocessing (bubble cleaning and contrast enhancement)
+        let (prep, fallback_inv) = prepare_ocr_image(frame);
         save_debug_image("prep.png", &prep.bgra_bytes, prep.width, prep.height);
-        if let Some(inv) = &fallback_inv {
-            save_debug_image("inv.png", inv, prep.width, prep.height);
-        }
 
         let remap = RemapParams {
             pad: prep.pad,
@@ -98,32 +145,155 @@ impl WinrtOcrEngine {
             offset_y: frame.offset_y,
         };
 
-        // First pass: cleaned and enhanced image
         let pass_params = OcrPassParams {
             bgra_bytes: &prep.bgra_bytes,
             width: prep.width,
             height: prep.height,
             remap,
         };
-        let lines = self.run_ocr_pass(pass_params).await?;
+        let first_lines = self.run_ocr_pass(pass_params).await?;
+        let first_score = score_recognized_lines(&first_lines);
 
-        // Fallback pass: if 0 lines detected, try inverted buffer (great for inverted/glowing text)
-        let final_lines = if lines.is_empty() && fallback_inv.is_some() {
-            let inv_bytes = fallback_inv.unwrap_or_default();
-            let inv_pass = OcrPassParams {
-                bgra_bytes: &inv_bytes,
-                width: prep.width,
-                height: prep.height,
-                remap,
-            };
-            self.run_ocr_pass(inv_pass).await?
-        } else {
-            lines
-        };
+        info!(
+            "OCR pass 1 (manga): found {} raw lines (score={})",
+            first_lines.len(),
+            first_score
+        );
+
+        let mut best_lines = first_lines;
+        let mut best_score = first_score;
+
+        // If first pass found quality text, do not waste time on extra passes
+        if best_score < 12 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+
+            // Pass 2: Outlined text mask (meme font filter)
+            if std::time::Instant::now() < deadline {
+                let mask_bgra = preprocessing::extract_outlined_text_mask(
+                    &frame.bgra_bytes,
+                    frame.width,
+                    frame.height,
+                );
+                save_debug_image("meme_mask.png", &mask_bgra, frame.width, frame.height);
+
+                let mask_pass = OcrPassParams {
+                    bgra_bytes: &mask_bgra,
+                    width: frame.width,
+                    height: frame.height,
+                    remap: RemapParams {
+                        pad: 0,
+                        scale: 1.0,
+                        offset_x: frame.offset_x,
+                        offset_y: frame.offset_y,
+                    },
+                };
+                if let Ok(mask_lines) = self.run_ocr_pass(mask_pass).await {
+                    let score = score_recognized_lines(&mask_lines);
+                    info!(
+                        "OCR pass 2 (meme_mask): found {} raw lines (score={})",
+                        mask_lines.len(),
+                        score
+                    );
+                    if score > best_score {
+                        best_score = score;
+                        best_lines = mask_lines;
+                    }
+                }
+            }
+
+            // Pass 3: Inverted manga buffer (if available)
+            if best_score < 15
+                && std::time::Instant::now() < deadline
+                && let Some(inv) = &fallback_inv
+            {
+                save_debug_image("inv.png", inv, prep.width, prep.height);
+                let inv_pass = OcrPassParams {
+                    bgra_bytes: inv,
+                    width: prep.width,
+                    height: prep.height,
+                    remap,
+                };
+                if let Ok(inv_lines) = self.run_ocr_pass(inv_pass).await {
+                    let score = score_recognized_lines(&inv_lines);
+                    info!(
+                        "OCR pass 3 (inverted_manga): found {} raw lines (score={})",
+                        inv_lines.len(),
+                        score
+                    );
+                    if score > best_score {
+                        best_score = score;
+                        best_lines = inv_lines;
+                    }
+                }
+            }
+
+            // Pass 4: Raw image (no manga cleaner, e.g. for photo / clean game UI)
+            if best_score < 15 && std::time::Instant::now() < deadline {
+                let raw_pass = OcrPassParams {
+                    bgra_bytes: &frame.bgra_bytes,
+                    width: frame.width,
+                    height: frame.height,
+                    remap: RemapParams {
+                        pad: 0,
+                        scale: 1.0,
+                        offset_x: frame.offset_x,
+                        offset_y: frame.offset_y,
+                    },
+                };
+                if let Ok(raw_lines) = self.run_ocr_pass(raw_pass).await {
+                    let score = score_recognized_lines(&raw_lines);
+                    info!(
+                        "OCR pass 4 (raw): found {} raw lines (score={})",
+                        raw_lines.len(),
+                        score
+                    );
+                    if score > best_score {
+                        best_score = score;
+                        best_lines = raw_lines;
+                    }
+                }
+            }
+
+            // Pass 5: Upscaled & contrast-enhanced (for small / fine print)
+            if best_score < 15 && std::time::Instant::now() < deadline {
+                let (up_bgra, up_w, up_h, applied_scale) =
+                    preprocessing::upscale_and_enhance_contrast(
+                        &frame.bgra_bytes,
+                        frame.width,
+                        frame.height,
+                        2.0,
+                    );
+                if applied_scale > 1.05 {
+                    save_debug_image("upscaled.png", &up_bgra, up_w, up_h);
+                    let up_pass = OcrPassParams {
+                        bgra_bytes: &up_bgra,
+                        width: up_w,
+                        height: up_h,
+                        remap: RemapParams {
+                            pad: 0,
+                            scale: applied_scale,
+                            offset_x: frame.offset_x,
+                            offset_y: frame.offset_y,
+                        },
+                    };
+                    if let Ok(up_lines) = self.run_ocr_pass(up_pass).await {
+                        let score = score_recognized_lines(&up_lines);
+                        info!(
+                            "OCR pass 5 (upscaled): found {} raw lines (score={})",
+                            up_lines.len(),
+                            score
+                        );
+                        if score > best_score {
+                            best_lines = up_lines;
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Cluster recognized lines into coherent paragraphs and speech bubbles
         let blocks = cluster_lines_into_blocks(
-            final_lines,
+            best_lines,
             Some((&frame.bgra_bytes, frame.width, frame.height)),
         );
         Ok(blocks)
@@ -828,24 +998,24 @@ mod tests {
 
     #[tokio::test]
     #[cfg(windows)]
-    async fn test_diagnose_ocr_languages() {
-        if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
-            && let Ok(size) = langs.Size()
-        {
-            for i in 0..size {
-                if let Ok(lang) = langs.GetAt(i)
-                    && let Ok(tag) = lang.LanguageTag()
-                {
-                    println!("Available OCR language: {}", tag);
-                }
-            }
+    async fn test_meme_no_pickles_integration() {
+        if !WinrtOcrEngine::is_language_available("en") {
+            println!("SKIPPED: English WinRT OCR language pack is not installed on this system.");
+            return;
         }
 
-        let img = image::open("tests/fixtures/meme_no_pickles.png")
-            .expect("open fixture")
-            .to_rgba8();
+        let img = match image::open("tests/fixtures/meme_no_pickles.png") {
+            Ok(im) => im.to_rgba8(),
+            Err(e) => {
+                println!(
+                    "SKIPPED: tests/fixtures/meme_no_pickles.png not found: {}",
+                    e
+                );
+                return;
+            }
+        };
+
         let (width, height) = (img.width(), img.height());
-        println!("Fixture dimensions: {}x{}", width, height);
         let mut bgra = Vec::with_capacity((width * height * 4) as usize);
         for pixel in img.pixels() {
             bgra.push(pixel[2]);
@@ -854,91 +1024,85 @@ mod tests {
             bgra.push(pixel[3]);
         }
         let frame = CapturedFrame {
-            bgra_bytes: bgra.clone(),
+            bgra_bytes: bgra,
             width,
             height,
             offset_x: 0,
             offset_y: 0,
         };
 
-        let engine = WinrtOcrEngine::new().expect("create engine");
-        println!("Engine language: {}", engine.language());
+        let engine = WinrtOcrEngine::new().expect("Failed to initialize WinrtOcrEngine");
+        let blocks = engine
+            .recognize(&frame)
+            .await
+            .expect("OCR recognition failed");
 
-        // 1. Raw frame OCR pass
-        let raw_pass = OcrPassParams {
-            bgra_bytes: &frame.bgra_bytes,
-            width: frame.width,
-            height: frame.height,
-            remap: RemapParams {
-                pad: 0,
-                scale: 1.0,
-                offset_x: 0,
-                offset_y: 0,
+        assert!(
+            blocks.len() >= 2,
+            "Expected at least 2 distinct blocks (top and bottom), found {}",
+            blocks.len()
+        );
+
+        let full_text = blocks
+            .iter()
+            .map(|b| b.text.to_uppercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("Full recognized meme text: {}", full_text);
+
+        // Check top text: "EXCUSE ME SIR" (allowing 1-2 symbol errors)
+        assert!(
+            full_text.contains("EXCUSE")
+                && (full_text.contains("SIR")
+                    || full_text.contains("SOR")
+                    || full_text.contains("SW")),
+            "Top text 'EXCUSE ME SIR' must be detected: {}",
+            full_text
+        );
+
+        // Check bottom text: "SHE ASKED FOR NO PICKLES" (allowing 1-2 symbol errors)
+        assert!(
+            full_text.contains("ASKED")
+                && full_text.contains("NO")
+                && (full_text.contains("PICKLE") || full_text.contains("PIC")),
+            "Bottom text 'SHE ASKED FOR NO PICKLES' must be detected: {}",
+            full_text
+        );
+    }
+
+    #[test]
+    fn test_score_recognized_lines_quality() {
+        let garbage = vec![
+            RecognizedLine {
+                text: "|| // 1! \\".to_string(),
+                rect: ScreenRect::new(0, 0, 10, 10),
+                words: vec![],
             },
-        };
-        let raw_lines = engine.run_ocr_pass(raw_pass).await.expect("raw ocr pass");
-        println!("Raw image OCR lines count: {}", raw_lines.len());
-        for (i, l) in raw_lines.iter().enumerate() {
-            println!("  Raw line {}: '{}'", i, l.text);
-        }
-
-        // 2. Preprocessed image (current manga pipeline)
-        let (prep, fallback_inv) = prepare_ocr_image(&frame);
-        let prep_pass = OcrPassParams {
-            bgra_bytes: &prep.bgra_bytes,
-            width: prep.width,
-            height: prep.height,
-            remap: RemapParams {
-                pad: prep.pad,
-                scale: prep.scale,
-                offset_x: 0,
-                offset_y: 0,
+            RecognizedLine {
+                text: "~~~___".to_string(),
+                rect: ScreenRect::new(0, 0, 10, 10),
+                words: vec![],
             },
-        };
-        let prep_lines = engine.run_ocr_pass(prep_pass).await.expect("prep ocr pass");
-        println!("Prep image OCR lines count: {}", prep_lines.len());
-        for (i, l) in prep_lines.iter().enumerate() {
-            println!("  Prep line {}: '{}'", i, l.text);
-        }
+        ];
+        assert_eq!(
+            score_recognized_lines(&garbage),
+            0,
+            "Garbage lines must score 0"
+        );
 
-        if let Some(inv) = fallback_inv {
-            let inv_pass = OcrPassParams {
-                bgra_bytes: &inv,
-                width: prep.width,
-                height: prep.height,
-                remap: RemapParams {
-                    pad: prep.pad,
-                    scale: prep.scale,
-                    offset_x: 0,
-                    offset_y: 0,
-                },
-            };
-            let inv_lines = engine.run_ocr_pass(inv_pass).await.expect("inv ocr pass");
-            println!("Inv image OCR lines count: {}", inv_lines.len());
-            for (i, l) in inv_lines.iter().enumerate() {
-                println!("  Inv line {}: '{}'", i, l.text);
-            }
-        }
-
-        // 3. Outlined text mask (preprocessing module)
-        let mask_bgra = preprocessing::extract_outlined_text_mask(&bgra, width, height);
-        save_debug_image("meme_mask_prototype.png", &mask_bgra, width, height);
-
-        let mask_pass = OcrPassParams {
-            bgra_bytes: &mask_bgra,
-            width,
-            height,
-            remap: RemapParams {
-                pad: 0,
-                scale: 1.0,
-                offset_x: 0,
-                offset_y: 0,
+        let good = vec![
+            RecognizedLine {
+                text: "EXCUSE ME SIR".to_string(),
+                rect: ScreenRect::new(0, 0, 100, 20),
+                words: vec![],
             },
-        };
-        let mask_lines = engine.run_ocr_pass(mask_pass).await.expect("mask ocr pass");
-        println!("Mask image OCR lines count: {}", mask_lines.len());
-        for (i, l) in mask_lines.iter().enumerate() {
-            println!("  Mask line {}: '{}'", i, l.text);
-        }
+            RecognizedLine {
+                text: "SHE ASKED FOR NO PICKLES".to_string(),
+                rect: ScreenRect::new(0, 50, 200, 20),
+                words: vec![],
+            },
+        ];
+        let score = score_recognized_lines(&good);
+        assert!(score >= 40, "Clear sentences must score high: {}", score);
     }
 }

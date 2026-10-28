@@ -197,6 +197,7 @@ pub struct AppConfig {
     pub target_lang: String,
     pub context_history_size: usize,
     pub use_vision_ocr: bool,
+    pub vision_fallback: bool,
     pub deepl_api_key: Option<String>,
     pub gemini_api_key: Option<String>,
     pub openai_api_key: Option<String>,
@@ -216,6 +217,7 @@ impl Default for AppConfig {
             target_lang: "ru".to_string(),
             context_history_size: 5,
             use_vision_ocr: true,
+            vision_fallback: false,
             deepl_api_key: None,
             gemini_api_key: None,
             openai_api_key: None,
@@ -237,6 +239,7 @@ impl fmt::Debug for AppConfig {
             .field("target_lang", &self.target_lang)
             .field("context_history_size", &self.context_history_size)
             .field("use_vision_ocr", &self.use_vision_ocr)
+            .field("vision_fallback", &self.vision_fallback)
             .field(
                 "deepl_api_key",
                 &self.deepl_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -308,6 +311,13 @@ impl AppConfig {
                 }
                 "use_vision_ocr" => {
                     if let Ok(b) = val_unquoted.parse() {
+                        cfg.use_vision_ocr = b;
+                        cfg.vision_fallback = b;
+                    }
+                }
+                "vision_fallback" => {
+                    if let Ok(b) = val_unquoted.parse() {
+                        cfg.vision_fallback = b;
                         cfg.use_vision_ocr = b;
                     }
                 }

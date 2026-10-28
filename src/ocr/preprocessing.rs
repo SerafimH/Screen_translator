@@ -47,7 +47,7 @@ pub fn extract_outlined_text_mask(bgra: &[u8], width: u32, height: u32) -> Vec<u
             if luma <= 85 {
                 is_dark[p_idx] = true;
             }
-            if luma >= 165 && sat <= 65 {
+            if luma >= 170 && sat <= 60 {
                 is_light_candidate[p_idx] = true;
             }
         }

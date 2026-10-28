@@ -319,16 +319,17 @@ impl AppState {
 
         let has_text = !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text));
 
-        // Direct Vision OCR fallback: if WinRT OCR detected nothing or pure garbage and vision is enabled
-        if !has_text
-            && cfg.use_vision_ocr
-            && (cfg.provider == TranslationProvider::Gemini
-                || cfg.provider == TranslationProvider::OpenAICompatible)
-        {
-            info!("WinRT OCR returned no text; triggering Direct Vision OCR fallback...");
+        let has_vision_support = (cfg.provider == TranslationProvider::Gemini
+            && cfg.gemini_api_key.is_some())
+            || (cfg.provider == TranslationProvider::OpenAICompatible
+                && cfg.openai_api_key.is_some());
+
+        // Step 4: Vision fallback if all local passes found nothing and vision_fallback is enabled with API key
+        if !has_text && cfg.vision_fallback && has_vision_support {
+            info!("Local OCR found no text; triggering Vision OCR fallback...");
             self.overlay.set_loading(
                 true,
-                Some("Активация нейросетевого Vision OCR...".to_string()),
+                Some("Локальный OCR не нашёл текст, пробую через ИИ...".to_string()),
             );
 
             match self
@@ -357,10 +358,15 @@ impl AppState {
 
         if blocks.is_empty() {
             let elapsed = start_time.elapsed().as_millis();
-            self.overlay.update_blocks(
-                Vec::new(),
-                Some(format!("Текст не обнаружен ({} мс)", elapsed)),
-            );
+            let status = if !cfg.vision_fallback {
+                format!(
+                    "Текст не найден ({} мс). Для сложных картинок включите vision_fallback = true в config.toml",
+                    elapsed
+                )
+            } else {
+                format!("Текст не найден ({} мс)", elapsed)
+            };
+            self.overlay.update_blocks(Vec::new(), Some(status));
             return;
         }
 
