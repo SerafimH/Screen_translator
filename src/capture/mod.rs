@@ -278,7 +278,7 @@ impl ScreenCapture {
             let _ = WinrtSingleFrameCapture::start(settings);
         });
 
-        match rx.recv_timeout(Duration::from_millis(150)) {
+        match rx.recv_timeout(Duration::from_millis(600)) {
             Ok(frame) => {
                 let _ = capture_thread.join();
                 Ok(frame)
