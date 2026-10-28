@@ -14,7 +14,11 @@ use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect};
 fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
     if std::env::var("SCREEN_TRANSLATOR_DEBUG_OCR").is_ok() {
         let _ = fs::create_dir_all("debug_ocr");
-        if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, buf.to_vec()) {
+        let mut rgba = buf.to_vec();
+        for chunk in rgba.as_chunks_mut::<4>().0 {
+            chunk.swap(0, 2);
+        }
+        if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba) {
             let _ = img.save(format!("debug_ocr/{}", path));
         }
     }
