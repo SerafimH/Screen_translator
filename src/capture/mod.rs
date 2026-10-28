@@ -240,6 +240,15 @@ impl GraphicsCaptureApiHandler for WinrtSingleFrameCapture {
     }
 }
 
+/// Returns true if the given ROI is non-empty and lies entirely within the bounds of the primary monitor
+/// (origin at (0, 0) with dimensions primary_w x primary_h).
+pub fn is_roi_within_primary_monitor(roi: &ScreenRect, primary_w: i32, primary_h: i32) -> bool {
+    if roi.is_empty() || primary_w <= 0 || primary_h <= 0 {
+        return false;
+    }
+    roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= primary_w && roi.y + roi.height <= primary_h
+}
+
 pub struct ScreenCapture;
 
 impl ScreenCapture {
@@ -247,6 +256,16 @@ impl ScreenCapture {
     /// Windows.Graphics.Capture API (D3D11 GPU textures without yellow border),
     /// falling back cleanly to RAII-guarded GDI BitBlt if D3D11 capture is unavailable.
     pub fn capture_primary(roi: Option<ScreenRect>) -> Result<CapturedFrame, String> {
+        // If an ROI is specified and falls outside the primary monitor (e.g. on a secondary display),
+        // skip WinRT and immediately use the GDI fallback which supports virtual multi-monitor coordinates.
+        if let Some(r) = roi {
+            let primary_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            let primary_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+            if !is_roi_within_primary_monitor(&r, primary_w, primary_h) {
+                return Self::capture_gdi_fallback(roi);
+            }
+        }
+
         // Attempt fast D3D11 WinRT Graphics Capture
         if let Ok(frame) = Self::capture_winrt(roi) {
             return Ok(frame);
@@ -563,5 +582,35 @@ mod tests {
     #[test]
     fn test_captureblt_constant_value() {
         assert_eq!(CAPTUREBLT.0, 0x4000_0000);
+    }
+
+    #[test]
+    fn test_is_roi_within_primary_monitor_bounds() {
+        let pw = 1920;
+        let ph = 1080;
+
+        // 1. roi inside primary monitor -> true
+        let inside = ScreenRect::new(100, 100, 800, 600);
+        assert!(is_roi_within_primary_monitor(&inside, pw, ph));
+
+        // 2. roi right of primary monitor -> false
+        let right_of_mon = ScreenRect::new(2000, 100, 400, 300);
+        assert!(!is_roi_within_primary_monitor(&right_of_mon, pw, ph));
+
+        // 3. roi with negative coordinates (e.g. secondary monitor to the left) -> false
+        let left_of_mon = ScreenRect::new(-500, 100, 400, 300);
+        assert!(!is_roi_within_primary_monitor(&left_of_mon, pw, ph));
+
+        // 4. roi partially crossing the right border -> false
+        let crossing_border = ScreenRect::new(1800, 100, 300, 300);
+        assert!(!is_roi_within_primary_monitor(&crossing_border, pw, ph));
+
+        // Edge cases: exact boundary -> true
+        let exact_full = ScreenRect::new(0, 0, pw, ph);
+        assert!(is_roi_within_primary_monitor(&exact_full, pw, ph));
+
+        // Empty rect -> false
+        let empty = ScreenRect::new(100, 100, 0, 100);
+        assert!(!is_roi_within_primary_monitor(&empty, pw, ph));
     }
 }
