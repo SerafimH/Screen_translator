@@ -337,7 +337,7 @@ impl ScreenCapture {
             let hbitmap_raw = hbitmap.0; // copy the raw pointer before consuming hbitmap
             let hbitmap_obj: HGDIOBJ = hbitmap.into();
             let old_bmp = SelectObject(hdc_mem_raw, hbitmap_obj);
-            let _obj_guard = GdiObjectGuard {
+            let mut _obj_guard = GdiObjectGuard {
                 hdc: hdc_mem_raw,
                 old_obj: old_bmp,
                 obj: hbitmap_obj,
@@ -362,6 +362,11 @@ impl ScreenCapture {
                 return Err(format!("BitBlt failed: {:?}", e));
             }
 
+            // Restore the original bitmap back into the memory DC before calling GetDIBits,
+            // satisfying the Win32 GDI requirement that the bitmap must not be selected into any DC.
+            let _ = SelectObject(hdc_mem_raw, old_bmp);
+            _obj_guard.old_obj = HGDIOBJ(core::ptr::null_mut());
+
             let mut bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -379,7 +384,7 @@ impl ScreenCapture {
             let mut bgra_bytes = vec![0u8; buf_size];
 
             let lines = GetDIBits(
-                hdc_mem_raw,
+                hdc_raw,
                 HBITMAP(hbitmap_raw),
                 0,
                 cap_h as u32,
@@ -558,5 +563,16 @@ mod tests {
     #[test]
     fn test_captureblt_constant_value() {
         assert_eq!(CAPTUREBLT.0, 0x4000_0000);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_capture_gdi_fallback_small_rect() {
+        let frame = ScreenCapture::capture_gdi_fallback(Some(ScreenRect::new(0, 0, 10, 10)));
+        assert!(frame.is_ok(), "GDI capture of 10x10 rect must succeed: {:?}", frame.err());
+        let f = frame.unwrap();
+        assert_eq!(f.width, 10);
+        assert_eq!(f.height, 10);
+        assert_eq!(f.bgra_bytes.len(), 10 * 10 * 4);
     }
 }
