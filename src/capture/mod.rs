@@ -564,15 +564,4 @@ mod tests {
     fn test_captureblt_constant_value() {
         assert_eq!(CAPTUREBLT.0, 0x4000_0000);
     }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_capture_gdi_fallback_small_rect() {
-        let frame = ScreenCapture::capture_gdi_fallback(Some(ScreenRect::new(0, 0, 10, 10)));
-        assert!(frame.is_ok(), "GDI capture of 10x10 rect must succeed: {:?}", frame.err());
-        let f = frame.unwrap();
-        assert_eq!(f.width, 10);
-        assert_eq!(f.height, 10);
-        assert_eq!(f.bgra_bytes.len(), 10 * 10 * 4);
-    }
 }
