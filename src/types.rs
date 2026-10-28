@@ -149,7 +149,7 @@ impl TranslationProvider {
         match self {
             Self::Google => "Google Translate (Бесплатно)",
             Self::DeepL => "DeepL API",
-            Self::Gemini => "Gemini 2.5 Flash",
+            Self::Gemini => "Gemini 3.8 Flash",
             Self::OpenAICompatible => "OpenAI / Groq",
         }
     }
