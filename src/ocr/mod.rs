@@ -1,3 +1,5 @@
+pub mod preprocessing;
+
 use image::{ImageBuffer, Rgba};
 use std::collections::VecDeque;
 use std::fs;
@@ -843,6 +845,7 @@ mod tests {
             .expect("open fixture")
             .to_rgba8();
         let (width, height) = (img.width(), img.height());
+        println!("Fixture dimensions: {}x{}", width, height);
         let mut bgra = Vec::with_capacity((width * height * 4) as usize);
         for pixel in img.pixels() {
             bgra.push(pixel[2]);
@@ -851,7 +854,7 @@ mod tests {
             bgra.push(pixel[3]);
         }
         let frame = CapturedFrame {
-            bgra_bytes: bgra,
+            bgra_bytes: bgra.clone(),
             width,
             height,
             offset_x: 0,
@@ -915,6 +918,27 @@ mod tests {
             for (i, l) in inv_lines.iter().enumerate() {
                 println!("  Inv line {}: '{}'", i, l.text);
             }
+        }
+
+        // 3. Outlined text mask (preprocessing module)
+        let mask_bgra = preprocessing::extract_outlined_text_mask(&bgra, width, height);
+        save_debug_image("meme_mask_prototype.png", &mask_bgra, width, height);
+
+        let mask_pass = OcrPassParams {
+            bgra_bytes: &mask_bgra,
+            width,
+            height,
+            remap: RemapParams {
+                pad: 0,
+                scale: 1.0,
+                offset_x: 0,
+                offset_y: 0,
+            },
+        };
+        let mask_lines = engine.run_ocr_pass(mask_pass).await.expect("mask ocr pass");
+        println!("Mask image OCR lines count: {}", mask_lines.len());
+        for (i, l) in mask_lines.iter().enumerate() {
+            println!("  Mask line {}: '{}'", i, l.text);
         }
     }
 }
