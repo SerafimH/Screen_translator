@@ -1,4 +1,6 @@
+use image::{ImageBuffer, Rgba};
 use std::collections::VecDeque;
+use std::fs;
 use tracing::info;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
@@ -6,6 +8,15 @@ use windows::Storage::Streams::DataWriter;
 
 use crate::capture::CapturedFrame;
 use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect};
+
+fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
+    if std::env::var("SCREEN_TRANSLATOR_DEBUG_OCR").is_ok() {
+        let _ = fs::create_dir_all("debug_ocr");
+        if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, buf.to_vec()) {
+            let _ = img.save(format!("debug_ocr/{}", path));
+        }
+    }
+}
 
 pub struct WinrtOcrEngine {
     engine: OcrEngine,
@@ -71,6 +82,12 @@ impl WinrtOcrEngine {
 
         // 1. Preprocess frame with manga cleaning and contrast enhancement
         let (prep, fallback_inv) = prepare_ocr_image(frame);
+
+        save_debug_image("raw.png", &frame.bgra_bytes, frame.width, frame.height);
+        save_debug_image("prep.png", &prep.bgra_bytes, prep.width, prep.height);
+        if let Some(inv) = &fallback_inv {
+            save_debug_image("inv.png", inv, prep.width, prep.height);
+        }
 
         let remap = RemapParams {
             pad: prep.pad,
@@ -805,5 +822,99 @@ mod tests {
         assert!(!is_ocr_garbage("100"));
         assert!(!is_ocr_garbage("Hello world"));
         assert!(!is_ocr_garbage("What is your HP?"));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_diagnose_ocr_languages() {
+        if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
+            && let Ok(size) = langs.Size()
+        {
+            for i in 0..size {
+                if let Ok(lang) = langs.GetAt(i)
+                    && let Ok(tag) = lang.LanguageTag()
+                {
+                    println!("Available OCR language: {}", tag);
+                }
+            }
+        }
+
+        let img = image::open("tests/fixtures/meme_no_pickles.png")
+            .expect("open fixture")
+            .to_rgba8();
+        let (width, height) = (img.width(), img.height());
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in img.pixels() {
+            bgra.push(pixel[2]);
+            bgra.push(pixel[1]);
+            bgra.push(pixel[0]);
+            bgra.push(pixel[3]);
+        }
+        let frame = CapturedFrame {
+            bgra_bytes: bgra,
+            width,
+            height,
+            offset_x: 0,
+            offset_y: 0,
+        };
+
+        let engine = WinrtOcrEngine::new().expect("create engine");
+        println!("Engine language: {}", engine.language());
+
+        // 1. Raw frame OCR pass
+        let raw_pass = OcrPassParams {
+            bgra_bytes: &frame.bgra_bytes,
+            width: frame.width,
+            height: frame.height,
+            remap: RemapParams {
+                pad: 0,
+                scale: 1.0,
+                offset_x: 0,
+                offset_y: 0,
+            },
+        };
+        let raw_lines = engine.run_ocr_pass(raw_pass).await.expect("raw ocr pass");
+        println!("Raw image OCR lines count: {}", raw_lines.len());
+        for (i, l) in raw_lines.iter().enumerate() {
+            println!("  Raw line {}: '{}'", i, l.text);
+        }
+
+        // 2. Preprocessed image (current manga pipeline)
+        let (prep, fallback_inv) = prepare_ocr_image(&frame);
+        let prep_pass = OcrPassParams {
+            bgra_bytes: &prep.bgra_bytes,
+            width: prep.width,
+            height: prep.height,
+            remap: RemapParams {
+                pad: prep.pad,
+                scale: prep.scale,
+                offset_x: 0,
+                offset_y: 0,
+            },
+        };
+        let prep_lines = engine.run_ocr_pass(prep_pass).await.expect("prep ocr pass");
+        println!("Prep image OCR lines count: {}", prep_lines.len());
+        for (i, l) in prep_lines.iter().enumerate() {
+            println!("  Prep line {}: '{}'", i, l.text);
+        }
+
+        if let Some(inv) = fallback_inv {
+            let inv_pass = OcrPassParams {
+                bgra_bytes: &inv,
+                width: prep.width,
+                height: prep.height,
+                remap: RemapParams {
+                    pad: prep.pad,
+                    scale: prep.scale,
+                    offset_x: 0,
+                    offset_y: 0,
+                },
+            };
+            let inv_lines = engine.run_ocr_pass(inv_pass).await.expect("inv ocr pass");
+            println!("Inv image OCR lines count: {}", inv_lines.len());
+            for (i, l) in inv_lines.iter().enumerate() {
+                println!("  Inv line {}: '{}'", i, l.text);
+            }
+        }
     }
 }
