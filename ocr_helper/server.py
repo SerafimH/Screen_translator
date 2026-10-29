@@ -184,6 +184,41 @@ def process_request(
         return {"id": req_id, "ok": False, "error": str(e)}
 
 
+def resolve_models_dir() -> Optional[str]:
+    """
+    Locates the models directory across all execution modes:
+    1. PyInstaller bundled temporary directory (sys._MEIPASS / models)
+    2. Next to the standalone executable (sys.executable dir / models)
+    3. Next to the server.py script file
+    4. Working directory fallback (./models or ./ocr_helper/models)
+    """
+    candidates = []
+
+    # 1. PyInstaller --onefile temp directory
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(sys._MEIPASS, "models"))
+
+    # 2. Next to standalone binary (when models/ is placed alongside ocr_helper.exe)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "models"))
+        candidates.append(os.path.join(exe_dir, "ocr_helper", "models"))
+
+    # 3. Next to this source file
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, "models"))
+
+    # 4. Current working directory
+    cwd = os.getcwd()
+    candidates.append(os.path.join(cwd, "models"))
+    candidates.append(os.path.join(cwd, "ocr_helper", "models"))
+
+    for path in candidates:
+        if os.path.isdir(path) and os.path.exists(path):
+            return path
+    return None
+
+
 def run_server(stdin=None, stdout=None, engine=None):
     if stdin is None:
         stdin = sys.stdin.buffer
@@ -191,9 +226,7 @@ def run_server(stdin=None, stdout=None, engine=None):
         stdout = sys.stdout.buffer
 
     if engine is None:
-        models_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "models"
-        )
+        models_dir = resolve_models_dir()
         try:
             engine = create_ocr_engine(models_dir)
         except Exception as e:

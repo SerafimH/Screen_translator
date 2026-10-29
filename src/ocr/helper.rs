@@ -262,7 +262,8 @@ impl OcrHelperClient {
 
         // 1. Check for standalone compiled binary (ocr_helper.exe)
         let standalone_exe = resolve_helper_path("ocr_helper.exe")
-            .or_else(|| resolve_helper_path("ocr_helper/ocr_helper.exe"));
+            .or_else(|| resolve_helper_path("ocr_helper/ocr_helper.exe"))
+            .or_else(|| resolve_helper_path("dist/ocr_helper.exe"));
 
         let mut cmd = if let Some(exe_path) = standalone_exe {
             info!(
@@ -270,7 +271,9 @@ impl OcrHelperClient {
                 exe_path.display()
             );
             let mut c = Command::new(&exe_path);
-            if let Some(parent) = exe_path.parent() {
+            if let Some(parent) = exe_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
                 c.current_dir(parent);
             }
             c
@@ -330,6 +333,7 @@ impl OcrHelperClient {
             c.arg(&server_path);
             if let Some(parent) = server_path.parent()
                 && let Some(root) = parent.parent()
+                && !root.as_os_str().is_empty()
             {
                 c.current_dir(root);
             }

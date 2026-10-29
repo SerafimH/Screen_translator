@@ -7,10 +7,12 @@ import io
 import json
 import unittest
 
+import os
 from ocr_helper.server import (
     extract_lines_from_result,
     process_request,
     read_exact,
+    resolve_models_dir,
     run_server,
 )
 
@@ -153,6 +155,11 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(out_lines[2]["lines"][0]["text"], "OK")
         # Fourth line is shutdown response
         self.assertEqual(out_lines[3], {"ok": True, "cmd": "shutdown"})
+
+    def test_resolve_models_dir(self):
+        models_dir = resolve_models_dir()
+        self.assertIsNotNone(models_dir)
+        self.assertTrue(os.path.isdir(models_dir))
 
 
 if __name__ == "__main__":
