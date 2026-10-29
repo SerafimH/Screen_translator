@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use tracing::warn;
 
 /// Represents a 2D integer rectangle on screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +253,7 @@ impl fmt::Debug for OcrMode {
 
 /// Configuration settings for Screen Translator
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "AppConfigRaw")]
 pub struct AppConfig {
     pub provider: TranslationProvider,
     pub ocr_engine: OcrMode,
@@ -262,7 +264,6 @@ pub struct AppConfig {
     pub source_lang: String,
     pub target_lang: String,
     pub context_history_size: usize,
-    pub use_vision_ocr: bool,
     pub vision_fallback: bool,
     pub deepl_api_key: Option<String>,
     pub gemini_api_key: Option<String>,
@@ -273,6 +274,111 @@ pub struct AppConfig {
     pub font_size: i32,
     pub font_family: String,
     pub overlay_bg_alpha: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct AppConfigRaw {
+    pub provider: TranslationProvider,
+    pub ocr_engine: OcrMode,
+    pub python_path: String,
+    pub helper_timeout_ms: u64,
+    pub helper_min_score: f32,
+    pub ocr_lang: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub context_history_size: usize,
+    pub use_vision_ocr: Option<bool>,
+    pub vision_fallback: Option<bool>,
+    pub deepl_api_key: Option<String>,
+    pub gemini_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: String,
+    pub openai_model: String,
+    pub auto_mode_interval_ms: u64,
+    pub font_size: i32,
+    pub font_family: String,
+    pub overlay_bg_alpha: u8,
+}
+
+impl Default for AppConfigRaw {
+    fn default() -> Self {
+        let def = AppConfig::default();
+        Self {
+            provider: def.provider,
+            ocr_engine: def.ocr_engine,
+            python_path: def.python_path,
+            helper_timeout_ms: def.helper_timeout_ms,
+            helper_min_score: def.helper_min_score,
+            ocr_lang: def.ocr_lang,
+            source_lang: def.source_lang,
+            target_lang: def.target_lang,
+            context_history_size: def.context_history_size,
+            use_vision_ocr: None,
+            vision_fallback: None,
+            deepl_api_key: def.deepl_api_key,
+            gemini_api_key: def.gemini_api_key,
+            openai_api_key: def.openai_api_key,
+            openai_base_url: def.openai_base_url,
+            openai_model: def.openai_model,
+            auto_mode_interval_ms: def.auto_mode_interval_ms,
+            font_size: def.font_size,
+            font_family: def.font_family,
+            overlay_bg_alpha: def.overlay_bg_alpha,
+        }
+    }
+}
+
+impl From<AppConfigRaw> for AppConfig {
+    fn from(raw: AppConfigRaw) -> Self {
+        let vision_fallback =
+            resolve_vision_fallback(raw.vision_fallback, raw.use_vision_ocr, false);
+        Self {
+            provider: raw.provider,
+            ocr_engine: raw.ocr_engine,
+            python_path: raw.python_path,
+            helper_timeout_ms: raw.helper_timeout_ms,
+            helper_min_score: raw.helper_min_score,
+            ocr_lang: raw.ocr_lang,
+            source_lang: raw.source_lang,
+            target_lang: raw.target_lang,
+            context_history_size: raw.context_history_size,
+            vision_fallback,
+            deepl_api_key: raw.deepl_api_key,
+            gemini_api_key: raw.gemini_api_key,
+            openai_api_key: raw.openai_api_key,
+            openai_base_url: raw.openai_base_url,
+            openai_model: raw.openai_model,
+            auto_mode_interval_ms: raw.auto_mode_interval_ms,
+            font_size: raw.font_size,
+            font_family: raw.font_family,
+            overlay_bg_alpha: raw.overlay_bg_alpha,
+        }
+    }
+}
+
+/// Merges legacy `use_vision_ocr` and canonical `vision_fallback` settings.
+/// Canonical `vision_fallback` has priority over legacy `use_vision_ocr`.
+/// If both are set and their values conflict, a warning is logged and canonical `vision_fallback` takes precedence.
+pub fn resolve_vision_fallback(
+    canonical_vision_fallback: Option<bool>,
+    legacy_use_vision_ocr: Option<bool>,
+    default_value: bool,
+) -> bool {
+    match (canonical_vision_fallback, legacy_use_vision_ocr) {
+        (Some(canonical), Some(legacy)) => {
+            if canonical != legacy {
+                warn!(
+                    "Conflicting config options: canonical 'vision_fallback = {}' conflicts with legacy 'use_vision_ocr = {}'. Using canonical 'vision_fallback'.",
+                    canonical, legacy
+                );
+            }
+            canonical
+        }
+        (Some(canonical), None) => canonical,
+        (None, Some(legacy)) => legacy,
+        (None, None) => default_value,
+    }
 }
 
 impl Default for AppConfig {
@@ -287,7 +393,6 @@ impl Default for AppConfig {
             source_lang: "en".to_string(),
             target_lang: "ru".to_string(),
             context_history_size: 5,
-            use_vision_ocr: true,
             vision_fallback: false,
             deepl_api_key: None,
             gemini_api_key: None,
@@ -314,7 +419,6 @@ impl fmt::Debug for AppConfig {
             .field("source_lang", &self.source_lang)
             .field("target_lang", &self.target_lang)
             .field("context_history_size", &self.context_history_size)
-            .field("use_vision_ocr", &self.use_vision_ocr)
             .field("vision_fallback", &self.vision_fallback)
             .field(
                 "deepl_api_key",
@@ -355,6 +459,8 @@ impl AppConfig {
     /// Parses a simple TOML string into `AppConfig`.
     pub fn from_toml_str(content: &str) -> Self {
         let mut cfg = Self::default();
+        let mut parsed_vision_fallback: Option<bool> = None;
+        let mut parsed_use_vision_ocr: Option<bool> = None;
 
         for raw_line in content.lines() {
             let line = raw_line.trim();
@@ -400,14 +506,12 @@ impl AppConfig {
                 }
                 "use_vision_ocr" => {
                     if let Ok(b) = val_unquoted.parse() {
-                        cfg.use_vision_ocr = b;
-                        cfg.vision_fallback = b;
+                        parsed_use_vision_ocr = Some(b);
                     }
                 }
                 "vision_fallback" => {
                     if let Ok(b) = val_unquoted.parse() {
-                        cfg.vision_fallback = b;
-                        cfg.use_vision_ocr = b;
+                        parsed_vision_fallback = Some(b);
                     }
                 }
                 "deepl_api_key" => {
@@ -448,6 +552,12 @@ impl AppConfig {
                 _ => {}
             }
         }
+
+        cfg.vision_fallback = resolve_vision_fallback(
+            parsed_vision_fallback,
+            parsed_use_vision_ocr,
+            cfg.vision_fallback,
+        );
 
         cfg
     }
@@ -593,5 +703,70 @@ mod tests {
         assert_eq!(cfg.helper_timeout_ms, 8000);
         assert_eq!(cfg.helper_min_score, 0.65);
         assert_eq!(cfg.ocr_lang, "en");
+    }
+
+    #[test]
+    fn test_resolve_vision_fallback_all_combinations() {
+        // 1. Only canonical vision_fallback
+        assert!(resolve_vision_fallback(Some(true), None, false));
+        assert!(!resolve_vision_fallback(Some(false), None, true));
+
+        // 2. Only legacy use_vision_ocr
+        assert!(resolve_vision_fallback(None, Some(true), false));
+        assert!(!resolve_vision_fallback(None, Some(false), true));
+
+        // 3. Both specified and identical
+        assert!(resolve_vision_fallback(Some(true), Some(true), false));
+        assert!(!resolve_vision_fallback(Some(false), Some(false), true));
+
+        // 4. Both specified and conflicting (canonical has priority)
+        assert!(resolve_vision_fallback(Some(true), Some(false), false));
+        assert!(!resolve_vision_fallback(Some(false), Some(true), true));
+
+        // 5. Neither specified (fallback to default)
+        assert!(!resolve_vision_fallback(None, None, false));
+        assert!(resolve_vision_fallback(None, None, true));
+    }
+
+    #[test]
+    fn test_toml_vision_fallback_combinations_and_order_independence() {
+        // 1. Only vision_fallback = true
+        let cfg = AppConfig::from_toml_str("vision_fallback = true\n");
+        assert!(cfg.vision_fallback);
+
+        // 2. Only legacy use_vision_ocr = true
+        let cfg = AppConfig::from_toml_str("use_vision_ocr = true\n");
+        assert!(cfg.vision_fallback);
+
+        // 3. Both identical (true)
+        let cfg = AppConfig::from_toml_str("vision_fallback = true\nuse_vision_ocr = true\n");
+        assert!(cfg.vision_fallback);
+
+        // 4. Both conflicting: canonical true, legacy false (order 1)
+        let cfg1 = AppConfig::from_toml_str("vision_fallback = true\nuse_vision_ocr = false\n");
+        assert!(cfg1.vision_fallback);
+
+        // 5. Both conflicting: canonical true, legacy false (order 2 - legacy first)
+        let cfg2 = AppConfig::from_toml_str("use_vision_ocr = false\nvision_fallback = true\n");
+        assert!(cfg2.vision_fallback);
+        assert_eq!(cfg1.vision_fallback, cfg2.vision_fallback);
+
+        // 6. Both conflicting: canonical false, legacy true (order 1)
+        let cfg3 = AppConfig::from_toml_str("vision_fallback = false\nuse_vision_ocr = true\n");
+        assert!(!cfg3.vision_fallback);
+
+        // 7. Both conflicting: canonical false, legacy true (order 2)
+        let cfg4 = AppConfig::from_toml_str("use_vision_ocr = true\nvision_fallback = false\n");
+        assert!(!cfg4.vision_fallback);
+        assert_eq!(cfg3.vision_fallback, cfg4.vision_fallback);
+
+        // 8. Neither specified -> default false
+        let cfg_none = AppConfig::from_toml_str("");
+        assert!(!cfg_none.vision_fallback);
+
+        // Serde JSON deserialization with both fields present (must not fail duplicate field)
+        let json_both = r#"{"vision_fallback": true, "use_vision_ocr": false}"#;
+        let cfg_serde: AppConfig = serde_json::from_str(json_both).unwrap();
+        assert!(cfg_serde.vision_fallback);
     }
 }
