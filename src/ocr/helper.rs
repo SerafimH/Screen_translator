@@ -14,7 +14,7 @@ use windows::Win32::System::JobObjects::{
 
 use crate::capture::CapturedFrame;
 use crate::ocr::cluster_lines_into_blocks;
-use crate::types::{AppConfig, OcrBlock, RecognizedLine, RecognizedWord, ScreenRect};
+use crate::types::{AppConfig, OcrBlock, OcrMode, RecognizedLine, RecognizedWord, ScreenRect};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -251,48 +251,90 @@ impl OcrHelperClient {
     }
 
     async fn init_session(&self) {
-        let (raw_python_path, raw_server_path) = {
+        let (raw_python_path, raw_server_path, ocr_engine) = {
             let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-            let py = cfg.python_path.clone();
-            let srv = "ocr_helper/server.py".to_string();
-            (py, srv)
+            (
+                cfg.python_path.clone(),
+                "ocr_helper/server.py".to_string(),
+                cfg.ocr_engine,
+            )
         };
 
-        let python_path = match resolve_helper_path(&raw_python_path) {
-            Some(p) => p,
-            None => {
-                if !self.has_warned.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "Python interpreter for OCR helper not found at '{}'. Run ocr_helper/setup.ps1 first. Falling back to WinRT.",
-                        raw_python_path
-                    );
-                }
-                self.is_available.store(false, Ordering::SeqCst);
-                self.is_ready.store(false, Ordering::SeqCst);
-                return;
+        // 1. Check for standalone compiled binary (ocr_helper.exe)
+        let standalone_exe = resolve_helper_path("ocr_helper.exe")
+            .or_else(|| resolve_helper_path("ocr_helper/ocr_helper.exe"));
+
+        let mut cmd = if let Some(exe_path) = standalone_exe {
+            info!(
+                "Spawning standalone OCR helper binary: '{}'...",
+                exe_path.display()
+            );
+            let mut c = Command::new(&exe_path);
+            if let Some(parent) = exe_path.parent() {
+                c.current_dir(parent);
             }
-        };
-
-        let server_path = match resolve_helper_path(&raw_server_path) {
-            Some(p) => p,
-            None => {
-                if !self.has_warned.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "OCR helper script not found at '{}'. Falling back to WinRT.",
-                        raw_server_path
-                    );
+            c
+        } else {
+            // 2. Check for Python interpreter and script
+            let python_path = match resolve_helper_path(&raw_python_path) {
+                Some(p) => p,
+                None => {
+                    if !self.has_warned.swap(true, Ordering::Relaxed) {
+                        if ocr_engine != OcrMode::WinRt {
+                            warn!(
+                                "OCR helper binary ('ocr_helper.exe') or Python interpreter at '{}' not found. Run ocr_helper/setup.ps1 first. Falling back to WinRT.",
+                                raw_python_path
+                            );
+                        } else {
+                            info!(
+                                "Native WinRT OCR active. (OCR helper not found at '{}' or 'ocr_helper.exe').",
+                                raw_python_path
+                            );
+                        }
+                    }
+                    self.is_available.store(false, Ordering::SeqCst);
+                    self.is_ready.store(false, Ordering::SeqCst);
+                    return;
                 }
-                self.is_available.store(false, Ordering::SeqCst);
-                self.is_ready.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
+            };
 
-        info!(
-            "Spawning OCR helper process: '{}' '{}'...",
-            python_path.display(),
-            server_path.display()
-        );
+            let server_path = match resolve_helper_path(&raw_server_path) {
+                Some(p) => p,
+                None => {
+                    if !self.has_warned.swap(true, Ordering::Relaxed) {
+                        if ocr_engine != OcrMode::WinRt {
+                            warn!(
+                                "OCR helper script not found at '{}'. Falling back to WinRT.",
+                                raw_server_path
+                            );
+                        } else {
+                            info!(
+                                "OCR helper script not found at '{}'. Using native WinRT.",
+                                raw_server_path
+                            );
+                        }
+                    }
+                    self.is_available.store(false, Ordering::SeqCst);
+                    self.is_ready.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            info!(
+                "Spawning OCR helper process: '{}' '{}'...",
+                python_path.display(),
+                server_path.display()
+            );
+
+            let mut c = Command::new(&python_path);
+            c.arg(&server_path);
+            if let Some(parent) = server_path.parent()
+                && let Some(root) = parent.parent()
+            {
+                c.current_dir(root);
+            }
+            c
+        };
 
         let job = match create_kill_on_close_job() {
             Ok(j) => j,
@@ -302,14 +344,6 @@ impl OcrHelperClient {
                 return;
             }
         };
-
-        let mut cmd = Command::new(&python_path);
-        cmd.arg(&server_path);
-        if let Some(parent) = server_path.parent()
-            && let Some(root) = parent.parent()
-        {
-            cmd.current_dir(root);
-        }
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
