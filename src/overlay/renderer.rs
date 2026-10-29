@@ -624,8 +624,8 @@ impl OverlayRenderer {
 impl Drop for OverlayRenderer {
     fn drop(&mut self) {
         unsafe {
-            let _ = DeleteObject(self.hbitmap);
             let _ = DeleteDC(self.hdc_mem);
+            let _ = DeleteObject(self.hbitmap);
         }
     }
 }

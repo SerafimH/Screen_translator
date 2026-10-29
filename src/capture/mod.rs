@@ -2,9 +2,9 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 use tracing::error;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC, HGDIOBJ, ROP_CODE,
-    ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC,
+    HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -240,6 +240,15 @@ impl GraphicsCaptureApiHandler for WinrtSingleFrameCapture {
     }
 }
 
+/// Returns true if the given ROI is non-empty and lies entirely within the bounds of the primary monitor
+/// (origin at (0, 0) with dimensions primary_w x primary_h).
+pub fn is_roi_within_primary_monitor(roi: &ScreenRect, primary_w: i32, primary_h: i32) -> bool {
+    if roi.is_empty() || primary_w <= 0 || primary_h <= 0 {
+        return false;
+    }
+    roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= primary_w && roi.y + roi.height <= primary_h
+}
+
 pub struct ScreenCapture;
 
 impl ScreenCapture {
@@ -247,6 +256,16 @@ impl ScreenCapture {
     /// Windows.Graphics.Capture API (D3D11 GPU textures without yellow border),
     /// falling back cleanly to RAII-guarded GDI BitBlt if D3D11 capture is unavailable.
     pub fn capture_primary(roi: Option<ScreenRect>) -> Result<CapturedFrame, String> {
+        // If an ROI is specified and falls outside the primary monitor (e.g. on a secondary display),
+        // skip WinRT and immediately use the GDI fallback which supports virtual multi-monitor coordinates.
+        if let Some(r) = roi {
+            let primary_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            let primary_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+            if !is_roi_within_primary_monitor(&r, primary_w, primary_h) {
+                return Self::capture_gdi_fallback(roi);
+            }
+        }
+
         // Attempt fast D3D11 WinRT Graphics Capture
         if let Ok(frame) = Self::capture_winrt(roi) {
             return Ok(frame);
@@ -278,7 +297,7 @@ impl ScreenCapture {
             let _ = WinrtSingleFrameCapture::start(settings);
         });
 
-        match rx.recv_timeout(Duration::from_millis(150)) {
+        match rx.recv_timeout(Duration::from_millis(600)) {
             Ok(frame) => {
                 let _ = capture_thread.join();
                 Ok(frame)
@@ -337,14 +356,14 @@ impl ScreenCapture {
             let hbitmap_raw = hbitmap.0; // copy the raw pointer before consuming hbitmap
             let hbitmap_obj: HGDIOBJ = hbitmap.into();
             let old_bmp = SelectObject(hdc_mem_raw, hbitmap_obj);
-            let _obj_guard = GdiObjectGuard {
+            let mut _obj_guard = GdiObjectGuard {
                 hdc: hdc_mem_raw,
                 old_obj: old_bmp,
                 obj: hbitmap_obj,
             };
 
-            // 0x40000000 is CAPTUREBLT, combined with SRCCOPY (0x00CC0020) = 0x40CC0020
-            let rop = ROP_CODE(SRCCOPY.0 | 0x40000000);
+            // Combine SRCCOPY (0x00CC0020) with CAPTUREBLT (0x40000000) = 0x40CC0020
+            let rop = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
             let blt_res = BitBlt(
                 hdc_mem_raw,
                 0,
@@ -361,6 +380,11 @@ impl ScreenCapture {
                 error!("BitBlt screen capture failed: {:?}", e);
                 return Err(format!("BitBlt failed: {:?}", e));
             }
+
+            // Restore the original bitmap back into the memory DC before calling GetDIBits,
+            // satisfying the Win32 GDI requirement that the bitmap must not be selected into any DC.
+            let _ = SelectObject(hdc_mem_raw, old_bmp);
+            _obj_guard.old_obj = HGDIOBJ(core::ptr::null_mut());
 
             let mut bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -379,7 +403,7 @@ impl ScreenCapture {
             let mut bgra_bytes = vec![0u8; buf_size];
 
             let lines = GetDIBits(
-                hdc_mem_raw,
+                hdc_raw,
                 HBITMAP(hbitmap_raw),
                 0,
                 cap_h as u32,
@@ -553,5 +577,40 @@ mod tests {
         // Dialogue change produces MAD >> 3.5
         assert!(mad >= DELTA_THRESHOLD);
         assert!(sig2.has_changed(&sig1));
+    }
+
+    #[test]
+    fn test_captureblt_constant_value() {
+        assert_eq!(CAPTUREBLT.0, 0x4000_0000);
+    }
+
+    #[test]
+    fn test_is_roi_within_primary_monitor_bounds() {
+        let pw = 1920;
+        let ph = 1080;
+
+        // 1. roi inside primary monitor -> true
+        let inside = ScreenRect::new(100, 100, 800, 600);
+        assert!(is_roi_within_primary_monitor(&inside, pw, ph));
+
+        // 2. roi right of primary monitor -> false
+        let right_of_mon = ScreenRect::new(2000, 100, 400, 300);
+        assert!(!is_roi_within_primary_monitor(&right_of_mon, pw, ph));
+
+        // 3. roi with negative coordinates (e.g. secondary monitor to the left) -> false
+        let left_of_mon = ScreenRect::new(-500, 100, 400, 300);
+        assert!(!is_roi_within_primary_monitor(&left_of_mon, pw, ph));
+
+        // 4. roi partially crossing the right border -> false
+        let crossing_border = ScreenRect::new(1800, 100, 300, 300);
+        assert!(!is_roi_within_primary_monitor(&crossing_border, pw, ph));
+
+        // Edge cases: exact boundary -> true
+        let exact_full = ScreenRect::new(0, 0, pw, ph);
+        assert!(is_roi_within_primary_monitor(&exact_full, pw, ph));
+
+        // Empty rect -> false
+        let empty = ScreenRect::new(100, 100, 0, 100);
+        assert!(!is_roi_within_primary_monitor(&empty, pw, ph));
     }
 }

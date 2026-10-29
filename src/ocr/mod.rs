@@ -14,7 +14,11 @@ use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect};
 fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
     if std::env::var("SCREEN_TRANSLATOR_DEBUG_OCR").is_ok() {
         let _ = fs::create_dir_all("debug_ocr");
-        if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, buf.to_vec()) {
+        let mut rgba = buf.to_vec();
+        for chunk in rgba.as_chunks_mut::<4>().0 {
+            chunk.swap(0, 2);
+        }
+        if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba) {
             let _ = img.save(format!("debug_ocr/{}", path));
         }
     }
@@ -513,14 +517,20 @@ pub fn sharpen_manga_contrast(buf: &mut [u8]) {
     }
 }
 
+/// Determines the scale factor for the manga OCR pass, enforcing that the padded result
+/// does not exceed the maximum engine dimension (2600 px).
+pub fn calculate_manga_ocr_scale(width: u32, height: u32, pad: u32) -> f32 {
+    let needed = width < 1200 || height < 600;
+    let fits = (width as u64 * 2 + pad as u64 * 2 <= preprocessing::MAX_OCR_DIMENSION as u64)
+        && (height as u64 * 2 + pad as u64 * 2 <= preprocessing::MAX_OCR_DIMENSION as u64);
+    if needed && fits { 2.0 } else { 1.0 }
+}
+
 /// Preprocesses the captured frame with the complete manga OCR pipeline:
 /// Bubble cleaner -> Contrast sharpening -> 2x Catmull-Rom upscale -> 24px white padding.
 pub fn prepare_ocr_image(frame: &CapturedFrame) -> (PreprocessedImage, Option<Vec<u8>>) {
-    let scale: f32 = if frame.width < 1200 || frame.height < 600 {
-        2.0
-    } else {
-        1.0
-    };
+    let pad = 24;
+    let scale = calculate_manga_ocr_scale(frame.width, frame.height, pad);
 
     let mut cleaned_buf = frame.bgra_bytes.clone();
     clean_manga_bubble_background(&mut cleaned_buf, frame.width, frame.height);
@@ -532,7 +542,6 @@ pub fn prepare_ocr_image(frame: &CapturedFrame) -> (PreprocessedImage, Option<Ve
         (cleaned_buf, frame.width, frame.height)
     };
 
-    let pad = 24;
     let (padded_buf, padded_w, padded_h) =
         add_pure_white_padding(&scaled_buf, scaled_w, scaled_h, pad);
     let fallback_inv = Some(create_inverted_buffer(&padded_buf));
@@ -1147,5 +1156,25 @@ mod tests {
         for b in &blocks {
             println!("  Block: '{}' at {:?}", b.text, b.rect);
         }
+    }
+
+    #[test]
+    fn test_calculate_manga_ocr_scale_bounds() {
+        let pad = 24;
+
+        // 1276x300: 1276*2 + 48 = 2600 (exact engine boundary) -> scale 2.0
+        assert_eq!(calculate_manga_ocr_scale(1276, 300, pad), 2.0);
+
+        // 1277x300: 1277*2 + 48 = 2602 > 2600 -> scale 1.0
+        assert_eq!(calculate_manga_ocr_scale(1277, 300, pad), 1.0);
+
+        // 1350x400: 1350*2 + 48 = 2748 > 2600 -> scale 1.0
+        assert_eq!(calculate_manga_ocr_scale(1350, 400, pad), 1.0);
+
+        // 1000x300: 1000*2 + 48 = 2048 <= 2600 -> scale 2.0
+        assert_eq!(calculate_manga_ocr_scale(1000, 300, pad), 2.0);
+
+        // 300x100: 300*2 + 48 = 648 <= 2600 -> scale 2.0
+        assert_eq!(calculate_manga_ocr_scale(300, 100, pad), 2.0);
     }
 }

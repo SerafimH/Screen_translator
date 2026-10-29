@@ -5,6 +5,8 @@ use tracing::{error, warn};
 use crate::capture::CapturedFrame;
 use crate::types::{AppConfig, OcrBlock, ScreenRect, TranslationBlock, TranslationProvider};
 
+pub const GEMINI_MODEL: &str = "gemini-3.8-flash";
+
 /// Character Lorebook / Glossary entry for game terms, character names, and statistics.
 #[derive(Debug, Clone)]
 pub struct GlossaryEntry {
@@ -718,8 +720,8 @@ impl TranslatorService {
         api_key: &str,
     ) -> Result<String, String> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-            api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            GEMINI_MODEL, api_key
         );
 
         let system_instruction = format!(
@@ -866,8 +868,8 @@ impl TranslatorService {
         roi: &ScreenRect,
     ) -> Result<Vec<TranslationBlock>, String> {
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-            api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            GEMINI_MODEL, api_key
         );
 
         let base64_image = {
@@ -1150,6 +1152,8 @@ impl TranslatorService {
                             cleaned_texts[i]
                         );
                         self.cache.insert(key, final_text.clone());
+                        self.context
+                            .record_translation(cleaned_texts[i].clone(), final_text.clone());
 
                         results.push(TranslationBlock {
                             original_text: blocks[i].text.clone(),
@@ -1261,8 +1265,11 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_urls_and_headers() {
-        let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash?key=AIzaSyD_SecretKey1234567890&alt=json";
-        let redacted_url = redact_secrets(url);
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}?key=AIzaSyD_SecretKey1234567890&alt=json",
+            GEMINI_MODEL
+        );
+        let redacted_url = redact_secrets(&url);
         assert!(!redacted_url.contains("AIzaSyD_SecretKey1234567890"));
         assert!(redacted_url.contains("key=[REDACTED]"));
 
@@ -1392,5 +1399,19 @@ mod tests {
         let postprocessed = ctx.postprocess(translated);
         assert!(postprocessed.contains("HP"));
         assert!(postprocessed.contains("Опыт"));
+    }
+
+    #[test]
+    fn test_context_manager_record_translation_history() {
+        let ctx = ContextManager::new(2);
+        ctx.record_translation("one".to_string(), "один".to_string());
+        ctx.record_translation("two".to_string(), "два".to_string());
+        assert_eq!(ctx.get_recent_history().len(), 2);
+
+        ctx.record_translation("three".to_string(), "три".to_string());
+        let hist = ctx.get_recent_history();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ("two".to_string(), "два".to_string()));
+        assert_eq!(hist[1], ("three".to_string(), "три".to_string()));
     }
 }
