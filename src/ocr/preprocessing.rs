@@ -3,6 +3,8 @@
 //! Provides filters for extracting meme-style text (light text with dark outlines),
 //! inverting image buffers, and scaling/contrast-enhancing frames within engine bounds.
 
+use crate::types::luma_from_bgr;
+
 /// Maximum image dimension supported by Windows WinRT OcrEngine (2600x2600).
 pub const MAX_OCR_DIMENSION: u32 = 2600;
 
@@ -34,11 +36,7 @@ pub fn extract_outlined_text_mask(bgra: &[u8], width: u32, height: u32) -> Vec<u
         let row_offset = y as usize * width as usize;
         for x in 0..w {
             let idx = (row_offset + x as usize) * 4;
-            let b = bgra[idx] as f32;
-            let g = bgra[idx + 1] as f32;
-            let r = bgra[idx + 2] as f32;
-
-            let luma = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+            let luma = luma_from_bgr(bgra[idx], bgra[idx + 1], bgra[idx + 2]);
             let max_c = bgra[idx].max(bgra[idx + 1]).max(bgra[idx + 2]);
             let min_c = bgra[idx].min(bgra[idx + 1]).min(bgra[idx + 2]);
             let sat = max_c - min_c;

@@ -20,7 +20,7 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use crate::types::ScreenRect;
+use crate::types::{ScreenRect, luma_from_bgr};
 
 pub const SIGNATURE_COLS: usize = 32;
 pub const SIGNATURE_ROWS: usize = 16;
@@ -80,10 +80,8 @@ impl FrameSignature {
                         // Checking `idx + 2 < bgra.len()` correctly ensures all 3 required color channels
                         // are within bounds without skipping any pixel, while leaving Alpha (idx + 3) unread.
                         if idx + 2 < bgra.len() {
-                            let b = bgra[idx] as f32;
-                            let g = bgra[idx + 1] as f32;
-                            let r = bgra[idx + 2] as f32;
-                            let y_val = (0.299 * r + 0.587 * g + 0.114 * b).round() as u64;
+                            let y_val =
+                                luma_from_bgr(bgra[idx], bgra[idx + 1], bgra[idx + 2]) as u64;
                             sum += y_val;
                             count += 1;
                         }

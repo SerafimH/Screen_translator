@@ -12,7 +12,7 @@ use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
 
 use crate::capture::CapturedFrame;
-use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect};
+use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect, luma_from_bgr};
 
 fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
     if std::env::var("SCREEN_TRANSLATOR_DEBUG_OCR").is_ok() {
@@ -455,10 +455,7 @@ pub fn clean_manga_bubble_background(buf: &mut [u8], width: u32, height: u32) {
     let mut queue = VecDeque::new();
 
     let get_luma = |b: &[u8], idx: usize| -> u8 {
-        let blue = b[idx] as f32;
-        let green = b[idx + 1] as f32;
-        let red = b[idx + 2] as f32;
-        (0.299 * red + 0.587 * green + 0.114 * blue).round() as u8
+        luma_from_bgr(b[idx], b[idx + 1], b[idx + 2])
     };
 
     // Initialize BFS with boundary pixels having Luma <= 205 (frame spikes and speedlines)
@@ -529,10 +526,7 @@ pub fn clean_manga_bubble_background(buf: &mut [u8], width: u32, height: u32) {
 /// Sharpens manga contrast by cutting gray midtones (>215 -> 255) and intensifying black text (<80 -> 0).
 pub fn sharpen_manga_contrast(buf: &mut [u8]) {
     for chunk in buf.as_chunks_mut::<4>().0 {
-        let b = chunk[0] as f32;
-        let g = chunk[1] as f32;
-        let r = chunk[2] as f32;
-        let luma = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+        let luma = luma_from_bgr(chunk[0], chunk[1], chunk[2]);
 
         if luma > 215 {
             chunk[0] = 255;
@@ -668,10 +662,7 @@ pub fn has_border_between(
             return 255;
         }
         let idx = (y as usize * width as usize + x as usize) * 4;
-        let b = bgra[idx] as f32;
-        let g = bgra[idx + 1] as f32;
-        let r = bgra[idx + 2] as f32;
-        (0.299 * r + 0.587 * g + 0.114 * b).round() as u8
+        luma_from_bgr(bgra[idx], bgra[idx + 1], bgra[idx + 2])
     };
 
     // Horizontal check

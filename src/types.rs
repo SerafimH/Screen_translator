@@ -4,6 +4,14 @@ use std::fs;
 use std::path::Path;
 use tracing::warn;
 
+/// Computes standard Rec. 601 luma (Y) from 8-bit BGR color components.
+///
+/// Formula: `round(0.299 * R + 0.587 * G + 0.114 * B) as u8`
+#[inline(always)]
+pub fn luma_from_bgr(b: u8, g: u8, r: u8) -> u8 {
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as u8
+}
+
 /// Represents a 2D integer rectangle on screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenRect {
@@ -721,5 +729,17 @@ mod tests {
         assert_eq!(cfg_valid.deepl_api_key.as_deref(), Some("real-deepl-key:fx"));
         assert_eq!(cfg_valid.gemini_api_key.as_deref(), Some("AIzaSyValidGeminiKey123"));
         assert_eq!(cfg_valid.openai_api_key.as_deref(), Some("gsk_valid_openai_token_456"));
+    }
+
+    #[test]
+    fn test_luma_from_bgr() {
+        assert_eq!(luma_from_bgr(0, 0, 0), 0);
+        assert_eq!(luma_from_bgr(255, 255, 255), 255);
+        // Pure red: 0.299 * 255 = 76.245 -> 76
+        assert_eq!(luma_from_bgr(0, 0, 255), 76);
+        // Pure green: 0.587 * 255 = 149.685 -> 150
+        assert_eq!(luma_from_bgr(0, 255, 0), 150);
+        // Pure blue: 0.114 * 255 = 29.07 -> 29
+        assert_eq!(luma_from_bgr(255, 0, 0), 29);
     }
 }
