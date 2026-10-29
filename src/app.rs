@@ -281,8 +281,10 @@ pub fn spawn_cancellable_task<Fut>(task_slot: &Arc<Mutex<Option<JoinHandle<()>>>
 where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = slot_lock.take();
+    let prev = {
+        let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot_lock.take()
+    };
 
     let handle = tokio::spawn(async move {
         if let Some(prev) = prev {
@@ -292,7 +294,13 @@ where
         fut.await;
     });
 
-    *slot_lock = Some(handle);
+    let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(newer) = slot_lock.take() {
+        handle.abort();
+        *slot_lock = Some(newer);
+    } else {
+        *slot_lock = Some(handle);
+    }
 }
 
 impl AppState {
@@ -685,5 +693,25 @@ mod tests {
             !flag.load(Ordering::SeqCst),
             "Flag must be false at the end"
         );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cancellable_task_fast_finish_and_reentrancy() {
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let executed = Arc::new(AtomicBool::new(false));
+        let executed_clone = executed.clone();
+        let slot_clone = task_slot.clone();
+
+        // Task that immediately accesses task_slot to ensure no deadlock during execution
+        spawn_cancellable_task(&task_slot, async move {
+            let is_some = slot_clone.lock().unwrap().is_some();
+            let _ = is_some;
+            executed_clone.store(true, Ordering::SeqCst);
+        });
+
+        let handle = task_slot.lock().unwrap().take();
+        assert!(handle.is_some(), "Handle must be stored in slot");
+        handle.unwrap().await.unwrap();
+        assert!(executed.load(Ordering::SeqCst));
     }
 }
