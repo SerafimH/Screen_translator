@@ -180,7 +180,13 @@ impl TranslationProvider {
             Self::Gemini
         } else if lower.contains("openai") || lower.contains("groq") {
             Self::OpenAICompatible
+        } else if lower.contains("google") {
+            Self::Google
         } else {
+            warn!(
+                "Unknown translation provider '{}', falling back to Google",
+                s
+            );
             Self::Google
         }
     }
@@ -241,7 +247,10 @@ impl OcrMode {
             Self::Helper
         } else if lower.contains("auto") {
             Self::Auto
+        } else if lower.contains("winrt") {
+            Self::WinRt
         } else {
+            warn!("Unknown OCR engine '{}', falling back to WinRT", s);
             Self::WinRt
         }
     }
@@ -741,5 +750,24 @@ mod tests {
         assert_eq!(luma_from_bgr(0, 255, 0), 150);
         // Pure blue: 0.114 * 255 = 29.07 -> 29
         assert_eq!(luma_from_bgr(255, 0, 0), 29);
+    }
+
+    #[test]
+    fn test_from_str_loose_known_and_fallback() {
+        assert_eq!(TranslationProvider::from_str_loose("deepl"), TranslationProvider::DeepL);
+        assert_eq!(TranslationProvider::from_str_loose("gemini"), TranslationProvider::Gemini);
+        assert_eq!(TranslationProvider::from_str_loose("openai"), TranslationProvider::OpenAICompatible);
+        assert_eq!(TranslationProvider::from_str_loose("groq"), TranslationProvider::OpenAICompatible);
+        assert_eq!(TranslationProvider::from_str_loose("google"), TranslationProvider::Google);
+        // Unknown fallback to Google with warning
+        assert_eq!(TranslationProvider::from_str_loose("unknown_provider"), TranslationProvider::Google);
+
+        assert_eq!(OcrMode::from_str_loose("winrt"), OcrMode::WinRt);
+        assert_eq!(OcrMode::from_str_loose("helper"), OcrMode::Helper);
+        assert_eq!(OcrMode::from_str_loose("rapid"), OcrMode::Helper);
+        assert_eq!(OcrMode::from_str_loose("python"), OcrMode::Helper);
+        assert_eq!(OcrMode::from_str_loose("auto"), OcrMode::Auto);
+        // Unknown fallback to WinRt with warning
+        assert_eq!(OcrMode::from_str_loose("unknown_engine"), OcrMode::WinRt);
     }
 }

@@ -103,6 +103,21 @@ impl ContextManager {
     }
 }
 
+/// Matches `find_lower` against `source` starting at byte offset `start_idx` (case-insensitively).
+///
+/// # Contract
+/// - `find_lower` must already be in lowercase.
+/// - `start_idx` must be on a valid UTF-8 character boundary in `source`.
+/// - Returns `Some(match_len)` with the length of the match in bytes of the original `source` string,
+///   or `None` if no prefix of `&source[start_idx..]` case-folds to `find_lower`.
+///
+/// # Example
+/// ```ignore
+/// let s = "Hello world";
+/// assert_eq!(match_find_at(s, 0, "hello"), Some(5)); // "Hello" is 5 bytes in source
+/// assert_eq!(match_find_at(s, 6, "world"), Some(5)); // "world" is 5 bytes in source
+/// assert_eq!(match_find_at(s, 0, "world"), None);
+/// ```
 fn match_find_at(source: &str, start_idx: usize, find_lower: &str) -> Option<usize> {
     let tail = &source[start_idx..];
     let mut lower_buf = String::new();

@@ -474,7 +474,8 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 HOTKEY_CLEAR => {
                     let _ = state.event_tx.send(AppEvent::Clear);
-                    // Immediate synchronous UI reset for instant feedback; idempotent with respect to AppEvent::Clear.
+                    // Synchronous UI clearing here is intentional for immediate visual responsiveness;
+                    // it is completely idempotent with respect to AppEvent::Clear handled in the main app loop.
                     {
                         let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                         s.current_blocks.clear();
