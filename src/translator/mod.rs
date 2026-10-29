@@ -232,6 +232,32 @@ impl TranslationCache {
     }
 }
 
+/// Standard Base64 encoder for binary buffers (e.g. PNG images).
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARSET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARSET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Automatically redacts API keys, bearer tokens, and query parameters from logs and error strings.
 pub fn redact_secrets(input: &str) -> String {
     let mut out = input.to_string();
@@ -919,31 +945,7 @@ impl TranslatorService {
             GEMINI_MODEL, api_key
         );
 
-        let base64_image = {
-            const CHARSET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut out = String::new();
-            for chunk in png_bytes.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-                let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-                let triple = (b0 << 16) | (b1 << 8) | b2;
-
-                out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
-                out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-                if chunk.len() > 1 {
-                    out.push(CHARSET[((triple >> 6) & 0x3F) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-                if chunk.len() > 2 {
-                    out.push(CHARSET[(triple & 0x3F) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-            }
-            out
-        };
+        let base64_image = encode_base64(png_bytes);
 
         let prompt = format!(
             "Detect all speech bubbles, dialogue boxes, sound effects (SFX), and stylized game/manga text in this image. \
@@ -1009,31 +1011,7 @@ impl TranslatorService {
     ) -> Result<Vec<TranslationBlock>, String> {
         let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        let base64_image = {
-            const CHARSET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut out = String::new();
-            for chunk in png_bytes.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-                let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-                let triple = (b0 << 16) | (b1 << 8) | b2;
-
-                out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
-                out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-                if chunk.len() > 1 {
-                    out.push(CHARSET[((triple >> 6) & 0x3F) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-                if chunk.len() > 2 {
-                    out.push(CHARSET[(triple & 0x3F) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-            }
-            out
-        };
+        let base64_image = encode_base64(png_bytes);
 
         let prompt = format!(
             "Detect all text bubbles and SFX in this image. Translate to {}. \
@@ -1498,5 +1476,19 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0], ("two".to_string(), "два".to_string()));
         assert_eq!(hist[1], ("three".to_string(), "три".to_string()));
+    }
+
+    #[test]
+    fn test_encode_base64_known_vectors_and_padding() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
+        assert_eq!(encode_base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(encode_base64(b"Man"), "TWFu");
+        assert_eq!(encode_base64(b"Ma"), "TWE=");
+        assert_eq!(encode_base64(b"M"), "TQ==");
     }
 }
