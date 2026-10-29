@@ -1,6 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use tracing::error;
+use tracing::{error, warn};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC,
@@ -24,6 +25,13 @@ use crate::types::ScreenRect;
 pub const SIGNATURE_COLS: usize = 32;
 pub const SIGNATURE_ROWS: usize = 16;
 pub const DELTA_THRESHOLD: f32 = 3.5;
+
+static WINRT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of WinRT capture timeouts that have occurred.
+pub fn winrt_timeout_count() -> u64 {
+    WINRT_TIMEOUT_COUNT.load(Ordering::Relaxed)
+}
 
 /// Compact 32x16 Luma perceptual hash to detect genuine dialogue transitions
 /// while rejecting flickering cursors, animated particles, and subtle background noise.
@@ -293,16 +301,24 @@ impl ScreenCapture {
             (roi, (mon_x, mon_y), tx),
         );
 
-        let capture_thread = std::thread::spawn(move || {
-            let _ = WinrtSingleFrameCapture::start(settings);
-        });
+        let capture_control = WinrtSingleFrameCapture::start_free_threaded(settings)
+            .map_err(|e| format!("Failed to start WinRT capture: {e:?}"))?;
 
         match rx.recv_timeout(Duration::from_millis(600)) {
             Ok(frame) => {
-                let _ = capture_thread.join();
+                let _ = capture_control.wait();
                 Ok(frame)
             }
-            Err(_) => Err("WinRT capture timed out or unavailable, using GDI".to_string()),
+            Err(_) => {
+                let count = WINRT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(
+                    "WinRT capture timed out after 600ms (total timeouts: {count}), stopping capture thread and falling back to GDI"
+                );
+                if let Err(e) = capture_control.stop() {
+                    warn!("Failed to gracefully stop WinRT capture thread: {e:?}");
+                }
+                Err("WinRT capture timed out or unavailable, using GDI".to_string())
+            }
         }
     }
 
