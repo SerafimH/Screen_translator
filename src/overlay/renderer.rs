@@ -18,11 +18,12 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HDC,
-    HGDIOBJ, ReleaseDC, SelectObject,
+    HGDIOBJ, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::{Result, w};
 
+use crate::capture::ScreenDcGuard;
 use crate::types::{AppMode, ScreenRect, TranslationBlock};
 
 pub struct RenderScene<'a> {
@@ -34,18 +35,6 @@ pub struct RenderScene<'a> {
     pub selection_rect: Option<ScreenRect>,
     pub status_msg: Option<&'a str>,
     pub is_loading: bool,
-}
-
-pub struct ScreenDcGuard(pub HDC);
-
-impl Drop for ScreenDcGuard {
-    fn drop(&mut self) {
-        if !self.0.0.is_null() {
-            unsafe {
-                ReleaseDC(None, self.0);
-            }
-        }
-    }
 }
 
 pub struct MemDcGuard(pub HDC);
@@ -495,6 +484,11 @@ impl OverlayRenderer {
 
             // 5. UpdateLayeredWindow to present frame
             let hdc_screen = GetDC(None);
+            if hdc_screen.0.is_null() {
+                return Err(windows::core::Error::from_hresult(E_FAIL));
+            }
+            let _screen_guard = ScreenDcGuard(hdc_screen);
+
             let pt_dst = POINT {
                 x: self.origin_x,
                 y: self.origin_y,
@@ -522,8 +516,6 @@ impl OverlayRenderer {
                 Some(&blend),
                 ULW_ALPHA,
             );
-
-            ReleaseDC(None, hdc_screen);
 
             if let Err(e) = ulw_res {
                 tracing::error!("UpdateLayeredWindow error: {:?}", e);
