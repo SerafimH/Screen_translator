@@ -1,5 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
 use std::ffi::c_void;
 use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{

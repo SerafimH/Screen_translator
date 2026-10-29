@@ -1,5 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
 pub mod renderer;
 
 use std::sync::{Arc, Mutex};
@@ -386,7 +384,7 @@ impl OverlayManager {
     }
 }
 
-unsafe fn render_current_scene(state: &mut WindowThreadState) {
+fn render_current_scene(state: &mut WindowThreadState) {
     let shared = state
         .shared_state
         .lock()
@@ -426,14 +424,17 @@ unsafe extern "system" fn overlay_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let state_ptr = GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA)
-        as *mut WindowThreadState;
+    let state_ptr = unsafe {
+        GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA)
+    } as *mut WindowThreadState;
 
     if state_ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
-    let state = &mut *state_ptr;
+    // SAFETY: state_ptr was initialized from Box::into_raw during window creation and is non-null
+    // until WM_NCDESTROY frees it.
+    let state = unsafe { &mut *state_ptr };
 
     match msg {
         WM_NCHITTEST if state.mode == AppMode::SelectingRoi => LRESULT(HTCLIENT),
@@ -473,6 +474,7 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 HOTKEY_CLEAR => {
                     let _ = state.event_tx.send(AppEvent::Clear);
+                    // Immediate synchronous UI reset for instant feedback; idempotent with respect to AppEvent::Clear.
                     {
                         let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                         s.current_blocks.clear();
@@ -483,7 +485,7 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 HOTKEY_QUIT => {
                     let _ = state.event_tx.send(AppEvent::Quit);
-                    let _ = DestroyWindow(hwnd);
+                    let _ = unsafe { DestroyWindow(hwnd) };
                 }
                 _ => {}
             }
@@ -491,20 +493,20 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_SETCURSOR if state.mode == AppMode::SelectingRoi => {
-            if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
-                SetCursor(Some(cursor));
+            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
+                unsafe { SetCursor(Some(cursor)) };
                 return LRESULT(1);
             }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_LBUTTONDOWN if state.mode == AppMode::SelectingRoi => {
             let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
+            let _ = unsafe { GetCursorPos(&mut pt) };
             state.is_dragging = true;
             state.drag_start = pt;
             state.drag_current = pt;
-            SetCapture(hwnd);
+            unsafe { SetCapture(hwnd) };
 
             render_current_scene(state);
             LRESULT(0)
@@ -512,7 +514,7 @@ unsafe extern "system" fn overlay_wndproc(
 
         WM_MOUSEMOVE if state.mode == AppMode::SelectingRoi && state.is_dragging => {
             let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
+            let _ = unsafe { GetCursorPos(&mut pt) };
             state.drag_current = pt;
 
             render_current_scene(state);
@@ -521,7 +523,7 @@ unsafe extern "system" fn overlay_wndproc(
 
         WM_LBUTTONUP if state.mode == AppMode::SelectingRoi && state.is_dragging => {
             let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
+            let _ = unsafe { GetCursorPos(&mut pt) };
             state.drag_current = pt;
 
             let rect = ScreenRect::from_points(
@@ -565,94 +567,102 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_CLOSE => {
-            let _ = DestroyWindow(hwnd);
+            let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
 
         WM_DESTROY => {
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TRANSLATE);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE_AUTO);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_PROVIDER);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_OCR_MODE);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CLEAR);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_QUIT);
-            PostQuitMessage(0);
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_TRANSLATE) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE_AUTO) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_PROVIDER) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_OCR_MODE) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_CLEAR) };
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_QUIT) };
+            unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
 
         WM_NCDESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            drop(Box::from_raw(state_ptr));
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            // SAFETY: Clear GWLP_USERDATA before taking back ownership of WindowThreadState.
+            // Exactly one Box::from_raw occurs on final window destruction.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(state_ptr));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
 
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
-unsafe fn enter_selection_mode(state: &mut WindowThreadState) {
+fn enter_selection_mode(state: &mut WindowThreadState) {
     state.mode = AppMode::SelectingRoi;
     state.is_dragging = false;
 
     render_current_scene(state);
 
-    let ex_style = GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE);
+    let ex_style = unsafe { GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE) };
     let new_style = ex_style & !(WS_EX_TRANSPARENT.0 as isize) & !(WS_EX_NOACTIVATE.0 as isize);
-    SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style);
+    unsafe { SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style) };
 
-    let _ = SetWindowPos(
-        state.hwnd,
-        Some(HWND_TOPMOST),
-        state.virtual_x,
-        state.virtual_y,
-        state.virtual_w,
-        state.virtual_h,
-        SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_SHOWWINDOW.0),
-    );
+    let _ = unsafe {
+        SetWindowPos(
+            state.hwnd,
+            Some(HWND_TOPMOST),
+            state.virtual_x,
+            state.virtual_y,
+            state.virtual_w,
+            state.virtual_h,
+            SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_SHOWWINDOW.0),
+        )
+    };
 
-    let fg_hwnd = GetForegroundWindow();
-    let current_thread_id = GetCurrentThreadId();
+    let fg_hwnd = unsafe { GetForegroundWindow() };
+    let current_thread_id = unsafe { GetCurrentThreadId() };
     let fg_thread_id = if !fg_hwnd.0.is_null() {
-        GetWindowThreadProcessId(fg_hwnd, None)
+        unsafe { GetWindowThreadProcessId(fg_hwnd, None) }
     } else {
         0
     };
 
     if fg_thread_id != 0 && fg_thread_id != current_thread_id {
-        let _ = AttachThreadInput(current_thread_id, fg_thread_id, true);
-        let _ = SetForegroundWindow(state.hwnd);
-        let _ = SetFocus(Some(state.hwnd));
-        if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
-            SetCursor(Some(cursor));
+        let _ = unsafe { AttachThreadInput(current_thread_id, fg_thread_id, true) };
+        let _ = unsafe { SetForegroundWindow(state.hwnd) };
+        let _ = unsafe { SetFocus(Some(state.hwnd)) };
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
+            unsafe { SetCursor(Some(cursor)) };
         }
-        let _ = AttachThreadInput(current_thread_id, fg_thread_id, false);
+        let _ = unsafe { AttachThreadInput(current_thread_id, fg_thread_id, false) };
     } else {
-        let _ = SetForegroundWindow(state.hwnd);
-        let _ = SetFocus(Some(state.hwnd));
-        if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
-            SetCursor(Some(cursor));
+        let _ = unsafe { SetForegroundWindow(state.hwnd) };
+        let _ = unsafe { SetFocus(Some(state.hwnd)) };
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
+            unsafe { SetCursor(Some(cursor)) };
         }
     }
 }
 
-unsafe fn exit_selection_mode(state: &mut WindowThreadState) {
-    let _ = ReleaseCapture();
+fn exit_selection_mode(state: &mut WindowThreadState) {
+    let _ = unsafe { ReleaseCapture() };
     state.is_dragging = false;
     state.mode = AppMode::Normal;
 
-    let ex_style = GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE);
+    let ex_style = unsafe { GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE) };
     let new_style = ex_style | (WS_EX_TRANSPARENT.0 as isize) | (WS_EX_NOACTIVATE.0 as isize);
-    SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style);
-    let _ = SetWindowPos(
-        state.hwnd,
-        Some(HWND_TOPMOST),
-        state.virtual_x,
-        state.virtual_y,
-        state.virtual_w,
-        state.virtual_h,
-        SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
-    );
+    unsafe { SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style) };
+    let _ = unsafe {
+        SetWindowPos(
+            state.hwnd,
+            Some(HWND_TOPMOST),
+            state.virtual_x,
+            state.virtual_y,
+            state.virtual_w,
+            state.virtual_h,
+            SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
+        )
+    };
 }
 
 #[cfg(test)]
