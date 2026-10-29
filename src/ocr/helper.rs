@@ -60,21 +60,61 @@ pub fn assign_process_to_job(job: &JobObjectGuard, process: HANDLE) -> Result<()
     }
 }
 
-/// Strips ANSI terminal escape sequences (colors, cursor codes) from string.
+/// Strips ANSI terminal escape sequences (colors, cursor movements, OSC titles, etc.) from a string.
 pub fn strip_ansi_codes(s: &str) -> String {
+    #[derive(PartialEq)]
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
     let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
+    let mut state = State::Ground;
+
     for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c == 'm' || c == 'K' || c == 'H' || c == 'J' {
-                in_escape = false;
+        match state {
+            State::Ground => {
+                if c == '\x1b' {
+                    state = State::Escape;
+                } else {
+                    out.push(c);
+                }
             }
-        } else {
-            out.push(c);
+            State::Escape => match c {
+                '[' => state = State::Csi,
+                ']' => state = State::Osc,
+                '\x20'..='\x7e' => state = State::Ground,
+                '\x1b' => state = State::Escape,
+                _ => {
+                    state = State::Ground;
+                    out.push(c);
+                }
+            },
+            State::Csi => match c {
+                '\x40'..='\x7e' => state = State::Ground,
+                '\x20'..='\x3f' => {}
+                '\x1b' => state = State::Escape,
+                _ => {
+                    state = State::Ground;
+                    out.push(c);
+                }
+            },
+            State::Osc => match c {
+                '\x07' => state = State::Ground,
+                '\x1b' => state = State::OscEscape,
+                _ => {}
+            },
+            State::OscEscape => match c {
+                '\\' => state = State::Ground,
+                '\x1b' => state = State::OscEscape,
+                _ => state = State::Osc,
+            },
         }
     }
+
     out
 }
 
@@ -643,9 +683,44 @@ mod tests {
 
     #[test]
     fn test_strip_ansi_codes() {
+        // Colors
         let raw = "\x1b[32m[INFO] Hello World\x1b[0m";
-        let clean = strip_ansi_codes(raw);
-        assert_eq!(clean, "[INFO] Hello World");
+        assert_eq!(strip_ansi_codes(raw), "[INFO] Hello World");
+
+        let multi_color = "\x1b[1;31;42mColor Text\x1b[0m";
+        assert_eq!(strip_ansi_codes(multi_color), "Color Text");
+
+        // Cursor movements
+        let cursor = "\x1b[2J\x1b[HHome \x1b[10;20HMove \x1b[2KClear \x1b[1AUp";
+        assert_eq!(strip_ansi_codes(cursor), "Home Move Clear Up");
+
+        // OSC window title with BEL and ST
+        let osc_bel = "\x1b]0;Terminal Window Title\x07Visible Content";
+        assert_eq!(strip_ansi_codes(osc_bel), "Visible Content");
+
+        let osc_st = "\x1b]2;Another Window Title\x1b\\Visible ST Content";
+        assert_eq!(strip_ansi_codes(osc_st), "Visible ST Content");
+
+        // Two-character escape sequences
+        let two_char = "\x1bMReverse \x1b7Save \x1b8Restore";
+        assert_eq!(strip_ansi_codes(two_char), "Reverse Save Restore");
+
+        // Truncated escape sequence at end of string (must not panic)
+        let truncated1 = "Hello World\x1b";
+        assert_eq!(strip_ansi_codes(truncated1), "Hello World");
+
+        let truncated2 = "Hello World\x1b[";
+        assert_eq!(strip_ansi_codes(truncated2), "Hello World");
+
+        let truncated3 = "Hello World\x1b[31";
+        assert_eq!(strip_ansi_codes(truncated3), "Hello World");
+
+        let truncated4 = "Hello World\x1b]0;unfinished";
+        assert_eq!(strip_ansi_codes(truncated4), "Hello World");
+
+        // Plain string without ESC (unmodified)
+        let plain = "Simple plain text 123! Привет мир";
+        assert_eq!(strip_ansi_codes(plain), plain);
     }
 
     #[tokio::test]
