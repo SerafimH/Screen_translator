@@ -731,45 +731,18 @@ pub fn has_border_between(
 pub fn upscale_2x_catmull_rom(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
     let out_w = w * 2;
     let out_h = h * 2;
-    let mut dst = vec![0u8; (out_w * out_h * 4) as usize];
-
-    for y in 0..out_h {
-        let src_yf = (y as f32 + 0.5) * 0.5 - 0.5;
-        let y0 = (src_yf.floor() as i32).clamp(0, h as i32 - 1) as usize;
-        let y1 = (y0 + 1).min(h as usize - 1);
-        let wy = (src_yf - y0 as f32).clamp(0.0, 1.0);
-        let wy0 = 1.0 - wy;
-
-        for x in 0..out_w {
-            let src_xf = (x as f32 + 0.5) * 0.5 - 0.5;
-            let x0 = (src_xf.floor() as i32).clamp(0, w as i32 - 1) as usize;
-            let x1 = (x0 + 1).min(w as usize - 1);
-            let wx = (src_xf - x0 as f32).clamp(0.0, 1.0);
-            let wx0 = 1.0 - wx;
-
-            let idx00 = (y0 * w as usize + x0) * 4;
-            let idx01 = (y0 * w as usize + x1) * 4;
-            let idx10 = (y1 * w as usize + x0) * 4;
-            let idx11 = (y1 * w as usize + x1) * 4;
-
-            let out_idx = (y as usize * out_w as usize + x as usize) * 4;
-
-            for c in 0..4 {
-                let v00 = src[idx00 + c] as f32;
-                let v01 = src[idx01 + c] as f32;
-                let v10 = src[idx10 + c] as f32;
-                let v11 = src[idx11 + c] as f32;
-
-                let top = v00 * wx0 + v01 * wx;
-                let bottom = v10 * wx0 + v11 * wx;
-                let val = (top * wy0 + bottom * wy).round() as u8;
-
-                dst[out_idx + c] = val;
-            }
-        }
+    if w == 0 || h == 0 || src.len() < (w * h * 4) as usize {
+        return (Vec::new(), 0, 0);
     }
 
-    (dst, out_w, out_h)
+    if let Some(img) = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(w, h, &src[..(w * h * 4) as usize])
+    {
+        let resized =
+            image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::CatmullRom);
+        (resized.into_raw(), out_w, out_h)
+    } else {
+        (Vec::new(), 0, 0)
+    }
 }
 
 /// Adds pure white (255) margin padding so boundary letters are not cropped.
@@ -1205,5 +1178,56 @@ mod tests {
 
         // 300x100: 300*2 + 48 = 648 <= 2600 -> scale 2.0
         assert_eq!(calculate_manga_ocr_scale(300, 100, pad), 2.0);
+    }
+
+    #[test]
+    fn test_upscale_2x_catmull_rom_dimensions_and_solid() {
+        let w = 8u32;
+        let h = 6u32;
+        let solid_pixel = [120u8, 200u8, 50u8, 255u8];
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            src.extend_from_slice(&solid_pixel);
+        }
+
+        let (dst, out_w, out_h) = upscale_2x_catmull_rom(&src, w, h);
+        assert_eq!(out_w, w * 2);
+        assert_eq!(out_h, h * 2);
+        assert_eq!(dst.len(), (out_w * out_h * 4) as usize);
+
+        for chunk in dst.as_chunks::<4>().0 {
+            assert_eq!(chunk, &solid_pixel);
+        }
+    }
+
+    #[test]
+    fn test_upscale_2x_catmull_rom_differs_from_bilinear_on_sharp_edge() {
+        let w = 8u32;
+        let h = 8u32;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let val = if x < 4 { 0u8 } else { 255u8 };
+                src[idx] = val;
+                src[idx + 1] = val;
+                src[idx + 2] = val;
+                src[idx + 3] = 255;
+            }
+        }
+
+        let (dst_catmull, out_w, out_h) = upscale_2x_catmull_rom(&src, w, h);
+        assert_eq!(out_w, 16);
+        assert_eq!(out_h, 16);
+
+        let img = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(w, h, &src).unwrap();
+        let dst_bilinear =
+            image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::Triangle)
+                .into_raw();
+
+        assert_ne!(
+            dst_catmull, dst_bilinear,
+            "Catmull-Rom must differ from bilinear interpolation on sharp edges"
+        );
     }
 }
