@@ -606,6 +606,7 @@ unsafe extern "system" fn overlay_wndproc(
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI);
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE_AUTO);
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_PROVIDER);
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_OCR_MODE);
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CLEAR);
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_QUIT);
             PostQuitMessage(0);
