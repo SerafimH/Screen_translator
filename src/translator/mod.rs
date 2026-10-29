@@ -62,7 +62,11 @@ impl ContextManager {
         h.push_back((original, translated));
     }
 
+    /// Pre-processes text before sending it to the translation backend.
+    ///
+    /// Currently a no-op that returns the input text as-is.
     pub fn preprocess(&self, text: &str) -> String {
+        // TODO: pre-translation glossary substitution
         text.to_string()
     }
 
