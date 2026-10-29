@@ -520,8 +520,6 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_LBUTTONUP if state.mode == AppMode::SelectingRoi && state.is_dragging => {
-            let _ = ReleaseCapture();
-            state.is_dragging = false;
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             state.drag_current = pt;
@@ -533,21 +531,7 @@ unsafe extern "system" fn overlay_wndproc(
                 state.drag_current.y,
             );
 
-            state.mode = AppMode::Normal;
-
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style =
-                ex_style | (WS_EX_TRANSPARENT.0 as isize) | (WS_EX_NOACTIVATE.0 as isize);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                state.virtual_x,
-                state.virtual_y,
-                state.virtual_w,
-                state.virtual_h,
-                SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
-            );
+            exit_selection_mode(state);
 
             if rect.width > 20 && rect.height > 20 {
                 {
@@ -570,23 +554,7 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_KEYDOWN if state.mode == AppMode::SelectingRoi && wparam.0 == 0x1B => {
-            let _ = ReleaseCapture();
-            state.is_dragging = false;
-            state.mode = AppMode::Normal;
-
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style =
-                ex_style | (WS_EX_TRANSPARENT.0 as isize) | (WS_EX_NOACTIVATE.0 as isize);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                state.virtual_x,
-                state.virtual_y,
-                state.virtual_w,
-                state.virtual_h,
-                SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
-            );
+            exit_selection_mode(state);
 
             {
                 let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,6 +634,25 @@ unsafe fn enter_selection_mode(state: &mut WindowThreadState) {
             SetCursor(Some(cursor));
         }
     }
+}
+
+unsafe fn exit_selection_mode(state: &mut WindowThreadState) {
+    let _ = ReleaseCapture();
+    state.is_dragging = false;
+    state.mode = AppMode::Normal;
+
+    let ex_style = GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE);
+    let new_style = ex_style | (WS_EX_TRANSPARENT.0 as isize) | (WS_EX_NOACTIVATE.0 as isize);
+    SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style);
+    let _ = SetWindowPos(
+        state.hwnd,
+        Some(HWND_TOPMOST),
+        state.virtual_x,
+        state.virtual_y,
+        state.virtual_w,
+        state.virtual_h,
+        SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
+    );
 }
 
 #[cfg(test)]
