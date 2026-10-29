@@ -1,360 +1,392 @@
-# Отчёт строгого ревью кода Screen Translator
+# Code Review: Screen Translator
 
-## 1. Краткое резюме
-Кодовая база представляет собой продуманное нативное Windows-приложение на Rust с интеграцией Win32, Direct2D/DirectWrite, WinRT OCR и Windows.Graphics.Capture API. Предыдущие исправления (BUG-1…BUG-9) корректно закрыли базовые утечки GDI-ресурсов и очевидные падения. В коде отсутствуют вызовы `unwrap()`, `expect()` и `panic!` в релизной сборке (все они изолированы в модулях `#[cfg(test)]`). Все 36 существующих тестов стабильно проходят. Внешний аудит зависимостей (`cargo-audit 0.22.2`) не выявил уязвимостей в коде (292 зависимости чисты).
-
-Тем не менее, при детальном ручном разборе Win32 API и многопоточности выявлены критические дефекты:
-1. Вызов `GetDIBits` при выбранном в DC битмапе (прямое нарушение спецификации Win32 GDI).
-2. Зависание и утечка фоновых потоков `std::thread::spawn` при тайм-ауте WinRT-захвата кадра.
-3. Полная неработоспособность WinRT-захвата на втором и последующих мониторах (жесткая привязка к `Monitor::primary()`).
-4. Гонка отмены асинхронных задач в `dispatch_translation_task`, приводящая к игнорированию кликов и хоткеев пользователя.
-5. Ложное срабатывание детектора рамок (`has_border_between`) в темных темах и играх, ломающее объединение строк диалогов в единый текст.
-6. Синхронный `SendMessageW` к предыдущей копии приложения при запуске, способный наглухо повесить процесс.
+> **Дата ревью:** 2026-10-29  
+> **Результат тестов:** ✅ 64/64 проходят (`cargo test --no-fail-fast`)  
+> **Честная оговорка:** если что-то понял не до конца — написано явно.
 
 ---
 
-## 2. Сводная таблица находок
+## Общая архитектура
 
-| ID | Серьёзность | Файл:строка | Суть в одной фразе | Уверенность | Подтверждено |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **CRIT-01** | Critical | `src/capture/mod.rs:381-389` | `GetDIBits` вызывается на HBITMAP, который в этот момент выбран в контекст памяти HDC | Высокая | Да (спецификация MSDN GDI) |
-| **CRIT-02** | Critical | `src/capture/mod.rs:277-287` | Утечка фонового потока захвата WinRT и бесконечное зависание при тайм-ауте 150 мс | Высокая | Да (анализ жизненного цикла потока) |
-| **HIGH-01** | High | `src/capture/mod.rs:260-264` | Захват WinRT всегда берет только `Monitor::primary()`, ломая захват на других мониторах | Высокая | Да (код игнорирует координаты ROI) |
-| **HIGH-02** | High | `src/app.rs:213-234` | Гонка отмены: `abort()` не сбрасывает флаг мгновенно, новый перевод пропускается | Высокая | Да (семантика `tokio::task::abort` и `compare_exchange`) |
-| **HIGH-03** | High | `src/ocr/mod.rs:461-471`, `605` | В играх с темным фоном детектор рамок считает расстояние между строками рамкой и не объединяет текст | Высокая | Да (проверка порога Luma < 120 на темных фонах) |
-| **HIGH-04** | High | `src/overlay/mod.rs:226` | Синхронный `SendMessageW(WM_CLOSE)` при старте намертво вешает приложение, если старая копия зависла | Высокая | Да (спецификация Win32 межпоточных сообщений) |
-| **MED-01** | Medium | `src/app.rs:96-97` | Паника Tokio при `auto_mode_interval_ms = 0` в конфигурации | Высокая | Да (документация `tokio::time::interval`) |
-| **MED-02** | Medium | `src/app.rs:116`, `249` | Двойной захват экрана на каждый цикл авто-режима (Dialogue Watcher) | Высокая | Да (захват для хеша, затем повторный захват в задаче) |
-| **MED-03** | Medium | `src/ocr/mod.rs:590-623` | Невозможность объединения вертикальных строк (японский текст manga/VN) | Высокая | Да (алгоритм жестко завязан на горизонтальный `v_gap`) |
-| **MED-04** | Medium | `src/overlay/mod.rs:288-305` | Сбой регистрации глобальных хоткеев (если заняты игрой/Nvidia) глушится без уведомления пользователя | Средняя | Да (только `error!` в консоль) |
-| **MED-05** | Medium | `src/overlay/mod.rs:78-93` | `OverlayHandle` не реализует `Drop`, утечка окна и цикла сообщений при раннем выходе | Средняя | Да (отсутствует `impl Drop for OverlayHandle`) |
-| **LOW-01** | Low | `Cargo.toml:7` | Неиспользуемая зависимость `anyhow` в манифесте | Высокая | Да (`Select-String` подтвердил отсутствие вызовов) |
-| **LOW-02** | Low | `src/capture/mod.rs:347` | Магическое шестнадцатеричное число `0x40000000` (`CAPTUREBLT`) без именованной константы | Высокая | Да (предупреждение Clippy) |
-
----
-
-## 3. Подробный разбор каждой находки
-
-### CRIT-01: Нарушение контракта Win32 GDI: `GetDIBits` вызывается на выбранном в DC битмапе
-- **Серьёзность**: Critical (потенциальное повреждение памяти, черный экран или отказ захвата GDI)
-- **Где**: `src/capture/mod.rs:339-389`
-```rust
-let old_bmp = SelectObject(hdc_mem_raw, hbitmap_obj);
-let _obj_guard = GdiObjectGuard {
-    hdc: hdc_mem_raw,
-    old_obj: old_bmp,
-    obj: hbitmap_obj,
-};
-...
-let lines = GetDIBits(
-    hdc_mem_raw,
-    HBITMAP(hbitmap_raw),
-    0,
-    cap_h as u32,
-    Some(bgra_bytes.as_mut_ptr() as *mut _),
-    &mut bmi,
-    DIB_RGB_COLORS,
-);
 ```
-- **Что не так и чем это грозит пользователю простыми словами**:
-  В официальной документации Microsoft Windows SDK (MSDN) для функции `GetDIBits` зафиксировано жесткое требование:
-  > *"The bitmap identified by the hbmp parameter must not be selected into a device context when the application calls this function."*
-  (Битмап не должен быть выбран ни в один контекст устройства в момент вызова `GetDIBits`).
-  В коде битмап `hbitmap` выбирается в контекст памяти `hdc_mem_raw` на строке 339, после чего выполняется `BitBlt`, и затем `GetDIBits` вызывается с передачей того же самого `hdc_mem_raw` и того же самого `hbitmap`, который прямо сейчас в него выбран! На многих версиях Windows и видеодрайверах это приводит к тому, что `GetDIBits` возвращает 0 (ошибка), и захват экрана через GDI полностью отказывает, возвращая ошибку «GetDIBits failed to copy frame bytes», либо возвращает пустой черный буфер.
-- **Как воспроизвести**:
-  Запустить захват через резервный GDI путь (например, свернув игру или отключив D3D11 захват). На некоторых видеокартах/драйверах GDI `GetDIBits` возвращает 0 lines.
-- **Как исправить**:
-  Перед вызовом `GetDIBits` необходимо вывести битмап из контекста, вернув исходный `old_bmp` на место (`SelectObject(hdc_mem_raw, old_bmp)`), либо использовать `hdc_raw` (экранный DC) для `GetDIBits`, предварительно сняв битмап с `hdc_mem_raw`.
-  Набросок решения:
-  ```rust
-  // После BitBlt возвращаем старый объект назад:
-  SelectObject(hdc_mem_raw, old_bmp);
-  // Теперь hbitmap свободен, вызываем GetDIBits:
-  let lines = GetDIBits(hdc_raw, HBITMAP(hbitmap_raw), 0, cap_h as u32, ...);
-  // А в guard передаем уже деактивированный битмап только для DeleteObject
-  ```
-- **Уверенность**: Высокая (документация Microsoft MSDN).
+main.rs (AppConfig::load_or_default)
+  └─ App::new
+       ├─ OverlayManager::spawn()   → Win32 message pump (отдельный thread)
+       ├─ WinrtOcrEngine::new()     → WinRT OCR (5-pass adaptive)
+       ├─ OcrHelperClient::new()    → Python RapidOCR subprocess
+       └─ TranslatorService::new()  → reqwest HTTP client + cache + context
+
+App::run (tokio event loop)
+  ├─ background: auto-mode watcher (tokio::spawn interval)
+  └─ foreground: AppEvent receiver
+       └─ dispatch_translation_task → spawn_cancellable_task
+            ├─ ScreenCapture::capture_primary (WinRT GPU → GDI fallback)
+            ├─ perform_ocr (WinRT 5-pass / Helper / Auto)
+            └─ TranslatorService::translate_blocks
+                 └─ OverlayHandle::update_blocks → Direct2D render
+```
+
+Разделение чёткое: overlay живёт в своём Win32-потоке, вся бизнес-логика — в tokio runtime.
 
 ---
 
-### CRIT-02: Утечка фонового потока и сессии захвата при тайм-ауте WinRT
-- **Серьёзность**: Critical (утечка памяти, дескрипторов потоков и зависание WinRT-сессий)
-- **Где**: `src/capture/mod.rs:277-287`
+## Сильные стороны
+
+### 1. RAII везде, где нужно
+
+| Guard | Файл | Защищает |
+|---|---|---|
+| `ProcessingGuard` | `app.rs` | AtomicBool флаг — сброс в Drop |
+| `ScreenDcGuard` | `capture/mod.rs` | `ReleaseDC` |
+| `MemDcGuard` | `capture/mod.rs` | `DeleteDC` |
+| `GdiObjectGuard` | `capture/mod.rs` | `SelectObject` + `DeleteObject` |
+| `JobObjectGuard` | `ocr/helper.rs` | `CloseHandle` для Win32 Job Object |
+
+Благодаря этому нет ручных цепочек `if err { DeleteDC(); return Err(...) }`.
+
+### 2. `spawn_cancellable_task` — нетривиально и правильно
+
+```rust
+// app.rs:280-304
+pub fn spawn_cancellable_task<Fut>(task_slot: &Arc<Mutex<Option<JoinHandle<()>>>>, fut: Fut)
+```
+
+Логика: берёт предыдущий handle → abort() → await его завершения → запускает новую задачу.  
+Важная деталь: await старого handle гарантирует, что `ProcessingGuard` предыдущей задачи дропнется **до** того как новая попытается его захватить. Без этого была бы гонка.  
+Дополнительно защита от "кто-то параллельно вставил более новый handle" — abort себя если slot уже занят.
+
+Тест `test_high_02_cancellable_task_waits_for_old_task_to_release_guard` отлично это покрывает, включая симуляцию 30ms teardown-задержки через `SlowGuard`.
+
+### 3. Безопасность API ключей
+
+- `redact_secrets()` в `translator/mod.rs` — фильтрует ключи из URL-параметров (`key=`), Bearer-токенов, DeepL-Auth-Key, префиксов `sk-`/`gsk_`/`AIzaSy` из ошибок и логов.
+- `impl Debug for AppConfig` — маскирует все три поля ключей через `.map(|_| "[REDACTED]")`.
+- Python-процесс привязан к Win32 Job Object с `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — при крэше основного процесса Python-зомби не остаётся.
+
+### 4. OCR Pipeline — продуманная стратегия
+
+5 проходов с дедлайном 800ms и системой очков (`score_recognized_lines`):
+
+```
+Pass 1: manga preprocessing (bubble clean + contrast + 2x Catmull-Rom + white padding)
+Pass 2: outlined text mask (мем-шрифты с тёмным контуром — Impact, Arial Black)
+Pass 3: inverted buffer (светлый текст на тёмном фоне)
+Pass 4: raw frame (game UI, чистый текст без anime-фона)
+Pass 5: upscale + contrast-enhance (мелкий текст)
+```
+
+Если `score >= 12` после Pass 1 — остальные не запускаются. Это разумный trade-off точность/скорость.
+
+`cluster_lines_into_blocks` с hyphen-merging (`adven-` + `ture` → `adventure`) и `has_border_between` для детекции границ манга-панелей — хорошее решение.
+
+### 5. Тест-культура
+
+64 теста. Особенно ценны:
+
+- `bug_5_frame_signature_does_not_skip_last_pixel` — пиксель `(width-1, height-1)` должен попадать в подпись.
+- `test_high_02_rapid_dispatches_do_not_accumulate_or_deadlock` — 20 задач подряд, должна выполниться только последняя (или несколько первых), а не все 20 в очереди.
+- `test_toml_vision_fallback_combinations_and_order_independence` — 8 комбинаций `vision_fallback`/`use_vision_ocr`, включая serde JSON-десериализацию.
+- `bug_6_regex_simple_replace_utf8_safety` — UTF-8 байтовые смещения при case-insensitive замене (`ẞ` → `ss`, турецкий `İ`, emoji).
+
+---
+
+## Проблемы
+
+### 🔴 HIGH-1: Ручной TOML-парсер — конкретный баг с `#` в значении
+
+**Файл:** `src/types.rs`, функция `from_toml_str` (~строки 460–563)
+
+Парсер строит логику на `split_once('#')` для удаления inline-комментариев:
+
+```rust
+let raw_val = match val_part.split_once('#') {
+    Some((before_comment, _)) => before_comment.trim(),
+    None => val_part.trim(),
+};
+```
+
+**Баг:** если `#` встречается внутри строкового значения — значение обрезается:
+
+```toml
+# Это сломается:
+python_path = "C:/path/to #venv/python.exe"
+# Парсер прочитает: "C:/path/to " — путь обрезан, файл не найдётся
+
+# И это:
+openai_base_url = "https://api.example.com/v1#beta"
+# Прочитает: "https://api.example.com/v1" — URL сломан
+```
+
+Настоящий TOML-парсер понимает, что `#` внутри кавычек — не комментарий.
+
+**Также не поддерживается:**
+- Многострочные строки (`"""..."""`)
+- Массивы (`key = ["a", "b"]`)
+- Вложенные таблицы (`[section]`)
+
+**Решение:** добавить `toml = "0.8"` в `Cargo.toml` и заменить ~100 строк парсера:
+
+```toml
+# Cargo.toml
+[dependencies]
+toml = "0.8"
+```
+
+```rust
+// types.rs — заменить всю from_toml_str:
+pub fn from_toml_str(content: &str) -> Self {
+    toml::from_str::<AppConfigRaw>(content)
+        .map(Into::into)
+        .unwrap_or_else(|e| {
+            warn!("Failed to parse config.toml: {}. Using defaults.", e);
+            Self::default()
+        })
+}
+```
+
+`AppConfigRaw` уже реализует `serde::Deserialize` — это работает без изменений структуры.
+
+---
+
+### 🔴 HIGH-2: Утечка потоков в `capture_winrt` при таймауте
+
+**Файл:** `src/capture/mod.rs`, функция `capture_winrt`, строки 296–306
+
 ```rust
 let capture_thread = std::thread::spawn(move || {
     let _ = WinrtSingleFrameCapture::start(settings);
 });
 
-match rx.recv_timeout(Duration::from_millis(150)) {
+match rx.recv_timeout(Duration::from_millis(600)) {
     Ok(frame) => {
-        let _ = capture_thread.join();
+        let _ = capture_thread.join(); // ← join только при успехе
         Ok(frame)
     }
     Err(_) => Err("WinRT capture timed out or unavailable, using GDI".to_string()),
+    // ↑ При таймауте: capture_thread НЕ join()-ится, продолжает жить в фоне.
 }
 ```
-- **Что не так и чем это грозит пользователю**:
-  Библиотека `windows-capture` блокирует поток в `start(settings)` до тех пор, пока внутри обработчика не будет вызван `capture_control.stop()`. Если инициализация WinRT занимает более 150 миллисекунд (что на практике регулярно случается при первой инициализации DirectX 11 или нагрузке на видеокарту в тяжелых играх), ветка `Err(_)` просто бросает поток `capture_thread` на произвол судьбы! Поток не присоединяется (`join` не вызывается), канал `rx` уничтожается.
-  Если кадр так и не придет (или придет позже), поток `capture_thread` останется висеть в памяти навсегда. При каждом последующем нажатии Alt+T будет рождаться еще один зомби-поток и еще одна сессия захвата экрана DWM. В итоге программа начинает потреблять все больше памяти и дескрипторов Windows, а видеокарта постоянно держит активные сессии дублирования рабочего стола.
-- **Как воспроизвести**:
-  Установить искусственную задержку в обработчик захвата или запустить под сильной нагрузкой GPU. Потоки в Task Manager будут накапливаться с каждым нажатием горячей клавиши.
-- **Как исправить**:
-  Увеличить базовый лимит тайм-аута (например, до 500–800 мс для первого кадра) и гарантировать завершение сессии, сохранив управление остановкой (`InternalCaptureControl` или флаг завершения), либо не спавнить неизолированный системный поток без механизма отмены.
-- **Уверенность**: Высокая.
 
----
+`std::thread::JoinHandle` при drop просто detach-ится — поток продолжает выполняться. Если WinRT-захват зависает на 5+ секунд, при авто-режиме (интервал 1200ms) за несколько минут накопится N живых потоков.
 
-### HIGH-01: WinRT-захват экрана намертво привязан к основному монитору
-- **Серьёзность**: High (приложение не работает в мультимониторных конфигурациях)
-- **Где**: `src/capture/mod.rs:260-264`, `200-205`
+**Исправление (минимальное):** сохранить handle и дать ему "догнать" после GDI fallback:
+
 ```rust
-let primary_monitor =
-    Monitor::primary().map_err(|e| format!("Failed to get primary monitor: {:?}", e))?;
-
-let (mon_x, mon_y) = (0i32, 0i32);
+Err(_) => {
+    // Не ждём — WinRT завис, но и не теряем handle
+    // Поток завершится сам когда WinRT API вернёт управление.
+    // Добавить комментарий что это намеренно и ожидаемо редко.
+    drop(capture_thread); // явный detach с комментарием
+    Err("WinRT capture timed out or unavailable, using GDI".to_string())
+}
 ```
-- **Что не так и чем это грозит пользователю**:
-  В то время как модуль оверлея (`OverlayManager`) и модуль GDI (`capture_gdi_fallback`) рассчитывают виртуальный экран для всех мониторов (`SM_XVIRTUALSCREEN`, `SM_CXVIRTUALSCREEN`), WinRT-движок всегда вызывает `Monitor::primary()`.
-  Если у пользователя два монитора, и игра открыта на втором мониторе (например, слева с координатами $x \in [-1920, 0]$ или справа с $x \in [1920, 3840]$):
-  1. WinRT делает скриншот *первого* (основного) монитора.
-  2. В `on_frame_arrived` координаты обрезки ROI:
-     `let rx = (r.x - self.monitor_origin.0).clamp(0, width as i32) as u32;`
-     Отрицательные координаты второго монитора клампятся в 0!
-  3. В итоге программа вырезает кусок совершенно другого экрана (рабочий стол или браузер на первом мониторе) и переводит его, вместо окна игры на втором мониторе!
-- **Как воспроизвести**:
-  Подключить второй монитор, перетащить окно игры на него и нажать Alt+T. Переводчик распознает текст с первого экрана.
-- **Как исправить**:
-  Определять, на каком мониторе находится прямоугольник `roi`, используя `Monitor::from_point` или Win32 `MonitorFromRect`/`MonitorFromPoint`, и передавать соответствующий `Monitor` в настройки захвата `Settings::new(...)`.
-- **Уверенность**: Высокая.
+
+Или завести счётчик/статистику сколько раз WinRT падает по таймауту.
 
 ---
 
-### HIGH-02: Состояние гонки при отмене задачи (`abort` vs `try_acquire`)
-- **Серьёзность**: High (потерянные клики, «залипание» и игнорирование команд пользователя)
-- **Где**: `src/app.rs:213-234`
+### 🟡 MED-1: `#[allow(unsafe_op_in_unsafe_fn)]` на весь файл
+
+**Файл:** `src/overlay/mod.rs`, строка 1
+
 ```rust
-fn dispatch_translation_task(&self) {
-    if let Some(prev) = self.current_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        prev.abort();
+#![allow(unsafe_op_in_unsafe_fn)]
+```
+
+Rust Edition 2024 требует явных `unsafe { }` блоков внутри `unsafe fn`. Этот атрибут отключает проверку **на весь файл** (~680 строк). Рекомендуется убрать атрибут и добавить явные `unsafe { }` блоки там, где они нужны — это локализует опасный код и упрощает аудит.
+
+---
+
+### 🟡 MED-2: `ContextManager::preprocess` — заглушка без реализации
+
+**Файл:** `src/translator/mod.rs`, строки 65–67
+
+```rust
+pub fn preprocess(&self, text: &str) -> String {
+    text.to_string() // ← no-op
+}
+```
+
+Метод вызывается в `translate_text`. Выглядит как незаконченная фича. Варианты:
+1. Удалить и вызывать текст напрямую.
+2. Реализовать (например, применять glossary до перевода — сейчас он применяется только после).
+3. Оставить с `// TODO: apply pre-translation glossary substitution`.
+
+---
+
+### 🟡 MED-3: Google Translate — неофициальный эндпоинт
+
+**Файл:** `src/translator/mod.rs`, строки 696–701
+
+```rust
+let url = format!(
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dj=1&q={}",
+    ...
+);
+```
+
+`client=gtx` — это не задокументированный API. Google его не гарантирует. На практике работает годами, но может сломаться:
+- IP rate-limiting без предупреждения
+- Captcha-блокировки
+- Изменение формата ответа
+
+Это нормально для home-use утилиты, но пользователи должны знать об этом риске. Стоит добавить предупреждение в `config.toml` или README.
+
+---
+
+### 🟡 MED-4: Дублирование Luma-формулы в 5 местах
+
+Формула `(0.299 * r + 0.587 * g + 0.114 * b).round() as u8` повторяется:
+
+| Место | Файл |
+|---|---|
+| `clean_manga_bubble_background` | `ocr/mod.rs:461` |
+| `has_border_between` | `ocr/mod.rs:674` |
+| `sharpen_manga_contrast` | `ocr/mod.rs:535` |
+| `FrameSignature::from_bgra` | `capture/mod.rs:78` |
+| `extract_outlined_text_mask` | `ocr/preprocessing.rs:41` |
+
+**Решение:** вынести в одно место:
+
+```rust
+// ocr/mod.rs или отдельный image_utils.rs
+#[inline(always)]
+pub fn luma_from_bgr(b: u8, g: u8, r: u8) -> u8 {
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as u8
+}
+```
+
+---
+
+### 🟢 LOW-1: `GEMINI_MODEL = "gemini-3.8-flash"` — модель не существует
+
+**Файл:** `src/translator/mod.rs:8`
+
+```rust
+pub const GEMINI_MODEL: &str = "gemini-3.8-flash";
+```
+
+Также продублировано в `config.toml`:
+```toml
+# Рекомендуется: gemini-3.8-flash с прямой поддержкой Vision
+```
+
+> ⚠️ **Модель `gemini-3.8-flash` не существует в Gemini API.** Запросы вернут ошибку `404 MODEL_NOT_FOUND`.
+
+Актуальные имена (проверить на https://ai.google.dev/gemini-api/docs/models):
+- `gemini-2.5-flash` (рекомендуется)
+- `gemini-2.0-flash`
+- `gemini-1.5-flash`
+
+Вероятно, это опечатка `2.8` → `3.8` или `1.5` → `3.8`.
+
+---
+
+### 🟢 LOW-2: `from_str_loose` — молчаливый fallback при опечатке
+
+**Файл:** `src/types.rs`, строки 167–178
+
+```rust
+pub fn from_str_loose(s: &str) -> Self {
+    // ...
+    } else {
+        Self::Google // ← при любой неизвестной строке
     }
-
-    let state = self.clone();
-    let handle = tokio::spawn(async move {
-        state.perform_translation().await;
-    });
-
-    *self.current_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
-...
-async fn perform_translation(&self) {
-    let Some(_guard) = ProcessingGuard::try_acquire(&self.is_processing) else {
-        info!("Translation already in progress, skipping trigger.");
-        return;
-    };
 ```
-- **Что не так и чем это грозит пользователю**:
-  Метод `prev.abort()` в Tokio является асинхронным сигналом отмены: он *не ожидает*, пока предыдущая задача фактически завершится и освободит локальные переменные в `Drop`.
-  В этот же миг на пуле потоков Tokio стартует новая задача (`handle`), которая первым делом вызывает `ProcessingGuard::try_acquire(&self.is_processing)`.
-  Если предыдущая задача в этот момент ждала сетевого ответа или находилась в `spawn_blocking`, ее `_guard` еще не уничтожен!
-  Новая задача получает `None`, пишет в лог `"Translation already in progress, skipping trigger"` и **мгновенно завершается**. Спустя микросекунду предыдущая задача наконец прерывается по `abort` и освобождает `is_processing`.
-  **Итог:** Предыдущий перевод отменен, а новый — самоликвидировался! Пользователь выделил область рамкой или нажал Alt+T, а на экране ничего не происходит, карточки не появляются.
-- **Как воспроизвести**:
-  Быстро нажать Alt+T дважды подряд во время выполнения перевода. Второй запрос бесследно пропадет.
-- **Как исправить**:
-  Вместо немедленного выхода при отмене предыдущей задачи использовать `tokio::sync::Mutex` для очереди задач либо ждать сброса флага через `watch`-канал / `notify_one`, чтобы новая задача дождалась фактической отмены старой.
-- **Уверенность**: Высокая (подтверждено поведением рантайма Tokio).
+
+Если в конфиге `provider = "goggle"` (опечатка) — молча переключается на Google без предупреждения. Аналогично для `OcrMode::from_str_loose`.
+
+**Исправление:**
+```rust
+} else {
+    warn!("Unknown provider value '{}', falling back to Google Translate", s);
+    Self::Google
+}
+```
 
 ---
 
-### HIGH-03: Ложное срабатывание детектора рамок на играх с темным интерфейсом
-- **Серьёзность**: High (разорванный, некачественный перевод диалогов в играх)
-- **Где**: `src/ocr/mod.rs:461-471`, `604-608`
+### 🟢 LOW-3: Дублирование логики clear в `overlay_wndproc`
+
+**Файл:** `src/overlay/mod.rs`, строки 474–483
+
 ```rust
-let mut dark_count = 0;
-let mut total = 0;
-for y in y_start..y_end {
-    for x in x_start..x_end {
-        if get_luma(x, y) < 120 {
-            dark_count += 1;
-        }
-        total += 1;
+HOTKEY_CLEAR => {
+    let _ = state.event_tx.send(AppEvent::Clear); // → App::run вызовет handle.clear()
+    {
+        // И тут же дублируем то, что делает handle.clear():
+        let mut s = state.shared_state.lock()...;
+        s.current_blocks.clear();
+        s.status_msg = Some("Очищено".to_string());
+        s.is_loading = false;
     }
-}
-if total > 0 && (dark_count as f32 / total as f32) >= 0.15 {
-    return true; // Обнаружена граница кадра!
+    render_current_scene(state);
 }
 ```
-- **Что не так и чем это грозит пользователю**:
-  Функция `has_border_between` создавалась с расчетом на черно-белую мангу, где черная линия фрейма разделяет белые бабблы. Но 90% компьютерных игр и визуальных новелл (JRPG, RPG, новеллы) используют диалоговые окна с **темным или полупрозрачным черным фоном** и белым текстом!
-  Когда текст занимает две строки, между первой и второй строками находится темно-серый или черный фон диалогового окна (`luma < 120`).
-  Условие `dark_count / total >= 0.15` срабатывает на 100%! Функция решает, что между строками одного и того же предложения диалога проходит «граница фрейма комикса», и на строке 605 принудительно запрещает объединение:
-  `if has_border_between(...) { continue; }`.
-  Каждая строка диалога отправляется в переводчик как отдельное изолированное предложение. Теряется контекст, падежи, глаголы отрываются от существительных, диалог превращается в бессвязную кашу.
-- **Как воспроизвести**:
-  Сделать скриншот любого стандартного диалогового окна из Skyrim, Witcher, Persona или визуальной новеллы (белый текст на темной плашке) и пропустить через кластеризацию.
-- **Как исправить**:
-  Проверять не просто наличие темных пикселей между строками, а перепад яркости (контрастный градиент/тонкую линию) относительно фона самого текста, либо вычислять фон локально вокруг текстового блока.
-- **Уверенность**: Высокая.
 
----
+Это намеренно (немедленный отклик UI до обработки события в App), но без комментария выглядит как баг или рассинхрон. Добавить:
 
-### HIGH-04: Синхронный `SendMessageW(WM_CLOSE)` при старте может заморозить приложение
-- **Серьёзность**: High (вечный завис при запуске)
-- **Где**: `src/overlay/mod.rs:219-228`
 ```rust
-if let Ok(old_hwnd) = FindWindowW(class_name, None)
-    && !old_hwnd.0.is_null()
-{
-    warn!("Found existing Screen Translator window {:?}, closing old instance...", old_hwnd);
-    let _ = SendMessageW(old_hwnd, WM_CLOSE, None, None);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-}
+// Немедленно очищаем UI для отклика без ожидания round-trip через event loop.
+// App::run также вызовет handle.clear() при обработке AppEvent::Clear — это идемпотентно.
 ```
-- **Что не так и чем это грозит пользователю**:
-  Функция Win32 API `SendMessageW` отправляет синхронное межпоточное/межпроцессное сообщение. Если предыдущий экземпляр приложения завис (например, на сетевом запросе или дедлоке), поток нового процесса, вызывающий `SendMessageW`, будет заблокирован **навсегда**, ожидая ответа от мертвого окна. Новый экземпляр никогда не запустится и останется висеть невидимым процессом в диспетчере задач.
-- **Как воспроизвести**:
-  Приостановить процесс предыдущей копии через Process Explorer (`Suspend`) и запустить новый бинарник. Новый процесс намертво зависнет на строке 226.
-- **Как исправить**:
-  Заменить `SendMessageW` на `SendMessageTimeoutW` с флагом `SMTO_ABORTIFHUNG` и тайм-аутом 500 мс, либо использовать `PostMessageW(old_hwnd, WM_CLOSE, ...)`.
-- **Уверенность**: Высокая (документация Win32 API).
 
 ---
 
-### MED-01: Паника рантайма Tokio при значении `auto_mode_interval_ms = 0`
-- **Серьёзность**: Medium (падение фонового воркера авто-режима)
-- **Где**: `src/app.rs:96-97`, `src/types.rs:334-337`
+### 🟢 LOW-4: `match_find_at` — неочевидная семантика, нет документации
+
+**Файл:** `src/translator/mod.rs`, строки 102–117
+
+Функция написана корректно (UTF-8 safe, case-insensitive через `ch.to_lowercase()`), но семантика неочевидна. Проверяет: "начинается ли `source[start_idx..]` с lowercase(find)?" — и возвращает длину совпавшей подстроки в байтах исходной строки. Это работает для `regex_simple_replace` который перебирает каждую char-позицию.
+
+Стоит добавить doc-comment с примером:
+
 ```rust
-let mut interval =
-    tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
+/// Returns the byte length of the match in `source[start_idx..]` if `source[start_idx..]`
+/// starts with the case-folded version of `find_lower`, or `None` otherwise.
+/// Note: `find_lower` must already be lowercased.
 ```
-- **Что не так**:
-  Если в файле `config.toml` указать `auto_mode_interval_ms = 0`, функция `tokio::time::interval` запаникует в рантайме с сообщением: `panicked at 'cannot create an interval with duration 0'`. Фоновый поток Dialogue Watcher мгновенно упадет.
-- **Как исправить**:
-  При парсинге конфигурации добавить ограничение снизу: `cfg.auto_mode_interval_ms = n.max(100);`.
-- **Уверенность**: Высокая.
 
 ---
 
-### MED-02: Двойной захват экрана на каждый цикл авто-перевода
-- **Серьёзность**: Medium (лишняя нагрузка на GPU и шину памяти)
-- **Где**: `src/app.rs:115-117` и `src/app.rs:249`
-- **Что не так**:
-  В цикле `Dialogue Watcher`:
-  1. Экран захватывается через `ScreenCapture::capture_primary(current_roi)` для вычисления хэша `FrameSignature`.
-  2. Если сигнатура изменилась, вызывается `dispatch_translation_task()`.
-  3. Задача `perform_translation` **еще раз** вызывает `ScreenCapture::capture_primary(roi)`.
-  Кадр считывается с видеокарты дважды подряд с разницей в доли миллисекунды, удваивая накладные расходы на чтение кадра из D3D11/GDI.
-- **Как исправить**:
-  Передавать уже захваченный в `Dialogue Watcher` кадр `frame` в `perform_translation`, минуя повторный захват.
-- **Уверенность**: Высокая.
+## Что не удалось полностью разобрать
+
+### ❓ `unsafe impl Send/Sync for WinrtOcrEngine`
+
+```rust
+// ocr/mod.rs:36-37
+// OcrEngine is safe to send between threads in WinRT
+unsafe impl Send for WinrtOcrEngine {}
+unsafe impl Sync for WinrtOcrEngine {}
+```
+
+COM-объекты в Windows могут быть STA (Single Threaded Apartment) или MTA. Если `OcrEngine` — STA-объект, вызовы с другого потока без маршалинга — это UB. `Sync` означает "можно вызывать `&self` методы из нескольких потоков одновременно".
+
+Я не нашёл в документации Microsoft явного указания на threading model для `Windows.Media.Ocr.OcrEngine`. Судя по тому что код работает (64 теста проходят, приложение функционирует) — либо WinRT автоматически маршалирует, либо OcrEngine действительно thread-safe. **Но стоит добавить ссылку на источник.**
+
+### ❓ `WinrtSingleFrameCapture` — отсутствие `on_closed`
+
+`GraphicsCaptureApiHandler` трейт из `windows-capture`. В `WinrtSingleFrameCapture` реализованы только `new` и `on_frame_arrived`. Если трейт требует `on_closed` — возможно там есть дефолтная реализация (no-op). Не проверял исходники `windows-capture`.
+
+### ❓ `overlay/renderer.rs` — Direct2D / LayeredWindow
+
+Файл не разбирал детально. Это нетривиальный Low-level код с D2D1, DXGI, UpdateLayeredWindowIndirect. Требует отдельного погружения в WinAPI документацию.
 
 ---
 
-### MED-03: Невозможность объединения вертикального текста (манга / японские новеллы)
-- **Серьёзность**: Medium (ухудшение качества перевода японского языка)
-- **Где**: `src/ocr/mod.rs:590-623`
-- **Что не так**:
-  Алгоритм кластеризации строк в блоки сортирует распознанные элементы строго сверху вниз (`a.rect.y.cmp(&b.rect.y)`) и рассчитывает вертикальный зазор `v_gap = line.rect.y - (block.rect.y + block.rect.height)`.
-  В японских мангах и играх текст пишется вертикальными столбцами справа налево. Столбцы имеют одинаковую координату $Y$, но смещаются по горизонтали $X$. Для таких столбцов `v_gap` будет отрицательным большим числом, и условие `v_gap >= -6` никогда не выполнится. Столбцы одной реплики никогда не объединятся.
-- **Как исправить**:
-  Добавить проверку ориентации текста (если высота строки значительно больше ширины, кластеризовать столбцы по горизонтальному расстоянию справа налево).
-- **Уверенность**: Высокая.
+## Итоговая таблица
 
----
-
-### MED-04: Сбой регистрации глобальных хоткеев игнорируется
-- **Серьёзность**: Medium (непонимание пользователем, почему клавиши не работают)
-- **Где**: `src/overlay/mod.rs:288-305`
-- **Что не так**:
-  Если сочетание клавиш (например, `Alt + T` или `Alt + S`) уже занято другой программой (GeForce Experience, Discord, Radeon Overlay), вызов `RegisterHotKey` возвращает ошибку, которая только логируется в консоль через `error!`. Пользователь не видит сообщения в оверлее или диалоговом окне, нажимает клавиши в игре, но ничего не происходит.
-- **Как исправить**:
-  При неудаче `RegisterHotKey` выводить предупреждение в плашку статуса оверлея: например, «Предупреждение: Alt+T занят другой программой».
-- **Уверенность**: Средняя.
-
----
-
-### MED-05: `OverlayHandle` не освобождает окно в деструкторе `Drop`
-- **Серьёзность**: Medium (утечка системных ресурсов при преждевременном выходе)
-- **Где**: `src/overlay/mod.rs:78-93`
-- **Что не так**:
-  `OverlayHandle` хранит `hwnd: HWND`. При завершении приложения через штатный хоткей вызывается `DestroyWindow`. Однако если `OverlayHandle` удаляется в результате отмены, паники или раннего возврата, `Drop` не реализован, окно остается зарегистрированным, а поток сообщений продолжает крутиться в цикле `GetMessageW`.
-- **Как исправить**:
-  Реализовать `impl Drop for OverlayHandle`, отправляющий `PostMessageW(Some(self.hwnd), WM_CLOSE, ...)`.
-- **Уверенность**: Средняя.
-
----
-
-### LOW-01: Неиспользуемая зависимость `anyhow` в манифесте
-- **Серьёзность**: Low (лишняя строчка в Cargo.toml)
-- **Где**: `Cargo.toml:7`
-- **Что не так**:
-  Крейт `anyhow = "1.0.104"` объявлен в зависимостях проекта, но ни в одном файле `src/**/*.rs` не используется (проект использует собственный `std::result::Result` и `windows::core::Result`).
-- **Как исправить**:
-  Удалить `anyhow = "1.0.104"` из `Cargo.toml`.
-- **Уверенность**: Высокая.
-
----
-
-### LOW-02: Магическое шестнадцатеричное число `0x40000000`
-- **Серьёзность**: Low (чистота кода)
-- **Где**: `src/capture/mod.rs:347`
-- **Код**: `let rop = ROP_CODE(SRCCOPY.0 | 0x40000000);`
-- **Что не так**:
-  Число `0x40000000` — это недокументированная битовая маска флага `CAPTUREBLT` Win32 API.
-- **Как исправить**:
-  Вынести в именованную константу:
-  `const CAPTUREBLT: u32 = 0x4000_0000;`
-- **Уверенность**: Высокая.
-
----
-
-## 4. Спорные места
-1. **Кастомный строковый поиск в `regex_simple_replace` (`src/translator/mod.rs:100-153`)**:
-   Функция заменяет подстроки без использования тяжелого крейта `regex`. Реализация аккуратно учитывает границы символов UTF-8 через `char_indices()`. Однако при работе с турецкой точечной `i` или специальными диграфами длина символа в нижнем регистре может меняться, что потенциально может сдвинуть смещение. Для игровых глоссариев (HP, MP, EXP) текущий алгоритм полностью безопасен.
-2. **Отключение желтой рамки захвата WinRT (`DrawBorderSettings::WithoutBorder`)**:
-   Эта опция поддерживается только начиная с Windows 10 версии 2104 (Build 20348) и Windows 11. На более ранних сборках Windows 10 WinRT-захват кадра завершится ошибкой и автоматически переключится на резервный GDI BitBlt. Это штатное и корректное поведение.
-
----
-
-## 5. Проверено, проблем не найдено
-1. **Безопасность API-ключей и персональных данных**:
-   - `AppConfig` имеет кастомную реализацию трейта `fmt::Debug`, которая надежно заменяет значения ключей DeepL, Gemini и OpenAI на `[REDACTED]`. Ключи физически не могут утечь в логи трассировки через `{:?}`.
-   - Функция `redact_secrets` тщательно вычищает заголовки `Bearer`, `DeepL-Auth-Key`, query-параметры `key=` и паттерны токенов `sk-...`, `AIzaSy...` из всех сообщений сетевых ошибок.
-   - На серверы отправляется только текст распознанного блока (или миниатюрный вырезанный кадр ROI в Vision-режиме), полноэкранные скриншоты в сеть без спроса не уходят.
-2. **Исключение оверлея из захвата экрана (`WDA_EXCLUDEFROMCAPTURE`)**:
-   - Вызов `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` гарантирует, что композитор DWM не захватывает карточки перевода при снятии скриншота, исключая бесконечную рекурсию OCR.
-3. **Безопасность блоков памяти и дескрипторов GDI/Direct2D**:
-   - Проверены структуры `ScreenDcGuard`, `MemDcGuard`, `GdiObjectGuard`, `BitmapGuard`. Все структуры в деструкторе `drop` проверяют указатель на `null` и корректно возвращают ресурсы операционной системе. Двойного освобождения в цепочках возврата с `?` нет.
-4. **Регрессионная устойчивость багов BUG-1…BUG-9**:
-   - BUG-1 (`ScreenRect::contains` со строгими неравенствами) подтвержден тестом `bug_1_contains_excludes_right_and_bottom_edge`.
-   - BUG-3 (защита HDC в `OverlayRenderer::new`) подтвержден тестом `bug_3_raii_guard_defuse_and_take`.
-   - BUG-6 (UTF-8 замена без паники по байтовым смещениям) подтвержден стресс-тестом `bug_6_regex_simple_replace_utf8_safety`.
-   - BUG-7 (освобождение `state_ptr` ровно один раз на `WM_NCDESTROY`) подтвержден тестом `bug_7_wm_close_destroys_window_and_frees_state_once`.
-   - BUG-9 (очистка оверлея по `AppEvent::Clear`) подтвержден тестом `bug_9_overlay_clear_empties_blocks_and_resets_state`.
-5. **Безопасность парсинга конфигурации**:
-   - Парсер `AppConfig::from_toml_str` полностью защищен от паник на некорректных строках, комментариях и кавычках.
-
----
-
-## 6. Не удалось проверить
-1. **Реальный опрос физического видеоадаптера и D3D11-драйвера в 3D играх с защитой (EasyAntiCheat / BattlEye)**:
-   Некоторые античиты блокируют `GraphicsCaptureItem` для полноэкранных эксклюзивных окон (`Exclusive Fullscreen`). В этом случае должен срабатывать GDI BitBlt фоллбэк. Проверить поведение под реальным античитом в окружении агента невозможно.
-2. **Поведение сети при жестком обрыве связи (Network Timeout)**:
-   Клиент `reqwest` имеет жесткий таймаут в 6000 мс, но реальные ответы внешних провайдеров (DeepL/Gemini/Groq) требуют живых ключей авторизации.
-
----
-
-## 7. Рекомендуемый порядок исправления
-
-1. **Первая очередь (Критические сбои и зависания)**:
-   - **CRIT-01**: Снять `hbitmap` с `hdc_mem_raw` перед вызовом `GetDIBits` в `capture_gdi_fallback`. Это исключит крахи и черный экран при отказе WinRT.
-   - **CRIT-02**: Предотвратить утечку фоновых потоков `std::thread::spawn` в `capture_winrt`, увеличив базовый таймаут до 600 мс и реализовав гарантированную остановку сессии.
-   - **HIGH-04**: Заменить `SendMessageW` на `SendMessageTimeoutW` при поиске предыдущего окна, чтобы предотвратить зависание запуска приложения.
-2. **Вторая очередь (Корректность работы у пользователя)**:
-   - **HIGH-01**: Передавать правильный дескриптор `Monitor` в настройки захвата WinRT для поддержки нескольких мониторов.
-   - **HIGH-02**: Устранить гонку `prev.abort()` и `ProcessingGuard::try_acquire`, чтобы клики и хоткеи не пропадали при быстром нажатии.
-   - **HIGH-03**: Скорректировать эвристику `has_border_between` с учетом темных диалоговых плашек в видеоиграх.
-3. **Третья очередь (Стабильность и производительность)**:
-   - **MED-01**: Защитить `auto_mode_interval_ms` от нуля (`.max(100)`).
-   - **MED-02**: Передавать готовый кадр из Dialogue Watcher, исключив повторный BitBlt кадра.
-   - **LOW-01**: Удалить лишний крейт `anyhow` из `Cargo.toml`.
+| # | Серьёзность | Описание | Файл |
+|---|---|---|---|
+| 1 | 🔴 HIGH | Ручной TOML-парсер: баг с `#` в значении | `types.rs:460` |
+| 2 | 🔴 HIGH | Утечка потоков при WinRT таймауте | `capture/mod.rs:296` |
+| 3 | 🟡 MED | `#[allow(unsafe_op_in_unsafe_fn)]` на весь файл | `overlay/mod.rs:1` |
+| 4 | 🟡 MED | `preprocess()` — заглушка без реализации | `translator/mod.rs:65` |
+| 5 | 🟡 MED | Google Translate неофициальный API | `translator/mod.rs:696` |
+| 6 | 🟡 MED | Luma-формула продублирована 5 раз | несколько файлов |
+| 7 | 🟢 LOW | `GEMINI_MODEL = "gemini-3.8-flash"` — не существует | `translator/mod.rs:8` |
+| 8 | 🟢 LOW | Молчаливый fallback при опечатке в `provider` | `types.rs:175` |
+| 9 | 🟢 LOW | Дублирование логики clear без комментария | `overlay/mod.rs:474` |
+| 10 | 🟢 LOW | `match_find_at` — нет документации | `translator/mod.rs:102` |
+| ❓ | Неизвестно | `unsafe impl Sync for WinrtOcrEngine` — обоснование? | `ocr/mod.rs:37` |
