@@ -735,9 +735,18 @@ mod tests {
             openai_api_key = "gsk_valid_openai_token_456"
         "#;
         let cfg_valid = AppConfig::from_toml_str(toml_valid);
-        assert_eq!(cfg_valid.deepl_api_key.as_deref(), Some("real-deepl-key:fx"));
-        assert_eq!(cfg_valid.gemini_api_key.as_deref(), Some("AIzaSyValidGeminiKey123"));
-        assert_eq!(cfg_valid.openai_api_key.as_deref(), Some("gsk_valid_openai_token_456"));
+        assert_eq!(
+            cfg_valid.deepl_api_key.as_deref(),
+            Some("real-deepl-key:fx")
+        );
+        assert_eq!(
+            cfg_valid.gemini_api_key.as_deref(),
+            Some("AIzaSyValidGeminiKey123")
+        );
+        assert_eq!(
+            cfg_valid.openai_api_key.as_deref(),
+            Some("gsk_valid_openai_token_456")
+        );
     }
 
     #[test]
@@ -754,13 +763,31 @@ mod tests {
 
     #[test]
     fn test_from_str_loose_known_and_fallback() {
-        assert_eq!(TranslationProvider::from_str_loose("deepl"), TranslationProvider::DeepL);
-        assert_eq!(TranslationProvider::from_str_loose("gemini"), TranslationProvider::Gemini);
-        assert_eq!(TranslationProvider::from_str_loose("openai"), TranslationProvider::OpenAICompatible);
-        assert_eq!(TranslationProvider::from_str_loose("groq"), TranslationProvider::OpenAICompatible);
-        assert_eq!(TranslationProvider::from_str_loose("google"), TranslationProvider::Google);
+        assert_eq!(
+            TranslationProvider::from_str_loose("deepl"),
+            TranslationProvider::DeepL
+        );
+        assert_eq!(
+            TranslationProvider::from_str_loose("gemini"),
+            TranslationProvider::Gemini
+        );
+        assert_eq!(
+            TranslationProvider::from_str_loose("openai"),
+            TranslationProvider::OpenAICompatible
+        );
+        assert_eq!(
+            TranslationProvider::from_str_loose("groq"),
+            TranslationProvider::OpenAICompatible
+        );
+        assert_eq!(
+            TranslationProvider::from_str_loose("google"),
+            TranslationProvider::Google
+        );
         // Unknown fallback to Google with warning
-        assert_eq!(TranslationProvider::from_str_loose("unknown_provider"), TranslationProvider::Google);
+        assert_eq!(
+            TranslationProvider::from_str_loose("unknown_provider"),
+            TranslationProvider::Google
+        );
 
         assert_eq!(OcrMode::from_str_loose("winrt"), OcrMode::WinRt);
         assert_eq!(OcrMode::from_str_loose("helper"), OcrMode::Helper);

@@ -458,9 +458,7 @@ pub fn clean_manga_bubble_background(buf: &mut [u8], width: u32, height: u32) {
     let mut visited = vec![false; w * h];
     let mut queue = VecDeque::new();
 
-    let get_luma = |b: &[u8], idx: usize| -> u8 {
-        luma_from_bgr(b[idx], b[idx + 1], b[idx + 2])
-    };
+    let get_luma = |b: &[u8], idx: usize| -> u8 { luma_from_bgr(b[idx], b[idx + 1], b[idx + 2]) };
 
     // Initialize BFS with boundary pixels having Luma <= 205 (frame spikes and speedlines)
     for x in 0..w {
