@@ -154,34 +154,81 @@ fn regex_simple_replace(source: &str, find: &str, replace: &str) -> Result<Strin
     Ok(out)
 }
 
-/// Thread-safe in-memory cache for translated phrases.
+struct CacheEntry {
+    value: String,
+    last_access: u64,
+}
+
+struct CacheInner {
+    map: HashMap<String, CacheEntry>,
+    clock: u64,
+}
+
+/// Thread-safe in-memory LRU cache for translated phrases.
 pub struct TranslationCache {
-    entries: Mutex<HashMap<String, String>>,
+    inner: Mutex<CacheInner>,
     max_size: usize,
 }
 
 impl TranslationCache {
     pub fn new(max_size: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::with_capacity(max_size)),
+            inner: Mutex::new(CacheInner {
+                map: HashMap::with_capacity(max_size),
+                clock: 0,
+            }),
             max_size,
         }
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        let cache = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(key).cloned()
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.map.contains_key(key) {
+            inner.clock = inner.clock.wrapping_add(1);
+            let clock = inner.clock;
+            let entry = inner.map.get_mut(key).unwrap();
+            entry.last_access = clock;
+            Some(entry.value.clone())
+        } else {
+            None
+        }
     }
 
     pub fn insert(&self, key: String, val: String) {
-        let mut cache = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= self.max_size {
-            let keys_to_remove: Vec<String> = cache.keys().take(50).cloned().collect();
-            for k in keys_to_remove {
-                cache.remove(&k);
+        if self.max_size == 0 {
+            return;
+        }
+
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.clock = inner.clock.wrapping_add(1);
+        let access = inner.clock;
+
+        if let Some(entry) = inner.map.get_mut(&key) {
+            entry.value = val;
+            entry.last_access = access;
+            return;
+        }
+
+        while inner.map.len() >= self.max_size {
+            if let Some(oldest_key) = inner
+                .map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(k, _)| k.clone())
+            {
+                inner.map.remove(&oldest_key);
+            } else {
+                break;
             }
         }
-        cache.insert(key, val);
+
+        inner.map.insert(
+            key,
+            CacheEntry {
+                value: val,
+                last_access: access,
+            },
+        );
     }
 }
 
@@ -1261,6 +1308,44 @@ mod tests {
         cache.insert("key1".to_string(), "val1".to_string());
         assert_eq!(cache.get("key1"), Some("val1".to_string()));
         assert_eq!(cache.get("key2"), None);
+    }
+
+    #[test]
+    fn test_translation_cache_lru_eviction() {
+        let cache = TranslationCache::new(3);
+        cache.insert("k1".to_string(), "v1".to_string());
+        cache.insert("k2".to_string(), "v2".to_string());
+        cache.insert("k3".to_string(), "v3".to_string());
+
+        // Access k1 so it becomes more recently used than k2 and k3
+        assert_eq!(cache.get("k1"), Some("v1".to_string()));
+
+        // Insert k4: should evict k2 (least recently used)
+        cache.insert("k4".to_string(), "v4".to_string());
+
+        assert_eq!(cache.get("k2"), None, "k2 should have been evicted by LRU");
+        assert_eq!(
+            cache.get("k1"),
+            Some("v1".to_string()),
+            "k1 was protected by get"
+        );
+        assert_eq!(cache.get("k3"), Some("v3".to_string()));
+        assert_eq!(cache.get("k4"), Some("v4".to_string()));
+
+        // Now access k3
+        assert_eq!(cache.get("k3"), Some("v3".to_string()));
+
+        // At this point:
+        // k1 last_access = 4
+        // k4 last_access = 5
+        // k3 last_access = 6
+        // Inserting k5 should evict k1 (least recently used among k1, k4, k3)
+        cache.insert("k5".to_string(), "v5".to_string());
+
+        assert_eq!(cache.get("k1"), None, "k1 should have been evicted");
+        assert_eq!(cache.get("k3"), Some("v3".to_string()));
+        assert_eq!(cache.get("k4"), Some("v4".to_string()));
+        assert_eq!(cache.get("k5"), Some("v5".to_string()));
     }
 
     #[test]
