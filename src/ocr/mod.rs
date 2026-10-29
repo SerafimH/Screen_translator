@@ -32,7 +32,11 @@ pub struct WinrtOcrEngine {
     language_tag: String,
 }
 
-// OcrEngine is safe to send between threads in WinRT
+// SAFETY: The underlying WinRT runtime class `Windows.Media.Ocr.OcrEngine` has Agile
+// marshaling behavior (implements IAgileObject in Windows Metadata), for which the `windows`
+// crate explicitly provides `unsafe impl Send for OcrEngine {}` and `unsafe impl Sync for OcrEngine {}`
+// (see `windows` v0.62.2, `src/Windows/Media/Ocr/mod.rs:153-154`). Since all fields of `WinrtOcrEngine`
+// (`engine: OcrEngine` and `language_tag: String`) are `Send + Sync`, implementing Send and Sync is sound.
 unsafe impl Send for WinrtOcrEngine {}
 unsafe impl Sync for WinrtOcrEngine {}
 
