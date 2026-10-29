@@ -38,12 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    [Alt + S]  Interactive Selection (Drag box on screen)");
     println!("    [Alt + A]  Toggle Auto-Translate Mode (Dialogue Watcher)");
     println!("    [Alt + P]  Cycle Engine (Google -> DeepL -> Gemini -> Groq)");
+    println!("    [Alt + O]  Cycle OCR Engine (WinRT -> RapidOCR -> Auto)");
     println!("    [Alt + C]  Clear Translated Text Cards");
     println!("    [Alt + Q]  Quit Application");
     println!("============================================================");
 
     let config = AppConfig::load_or_default();
     println!("  Active Engine:   {}", config.provider.display_name());
+    println!("  OCR Mode:        {}", config.ocr_engine.display_name());
     println!(
         "  Languages:       {} -> {}",
         config.source_lang, config.target_lang

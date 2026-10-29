@@ -36,6 +36,7 @@ pub const HOTKEY_TOGGLE_AUTO: i32 = 103;
 pub const HOTKEY_CLEAR: i32 = 104;
 pub const HOTKEY_QUIT: i32 = 105;
 pub const HOTKEY_CYCLE_PROVIDER: i32 = 106;
+pub const HOTKEY_CYCLE_OCR_MODE: i32 = 107;
 
 pub const WM_APP_ENTER_SELECTION: u32 = WM_APP + 1;
 pub const WM_APP_UPDATE_STATE: u32 = WM_APP + 2;
@@ -49,6 +50,7 @@ pub enum AppEvent {
     RoiSelected(ScreenRect),
     ToggleAutoMode,
     CycleProvider,
+    CycleOcrMode,
     Clear,
     Quit,
 }
@@ -313,6 +315,9 @@ impl OverlayManager {
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_CYCLE_PROVIDER, mod_flags, 0x50) {
                     error!("Failed to register Alt+P (Cycle Provider): {:?}", e);
                 }
+                if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_CYCLE_OCR_MODE, mod_flags, 0x4F) {
+                    error!("Failed to register Alt+O (Cycle OCR Mode): {:?}", e);
+                }
                 if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_CLEAR, mod_flags, 0x43) {
                     error!("Failed to register Alt+C (Clear): {:?}", e);
                 }
@@ -462,6 +467,9 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 HOTKEY_CYCLE_PROVIDER => {
                     let _ = state.event_tx.send(AppEvent::CycleProvider);
+                }
+                HOTKEY_CYCLE_OCR_MODE => {
+                    let _ = state.event_tx.send(AppEvent::CycleOcrMode);
                 }
                 HOTKEY_CLEAR => {
                     let _ = state.event_tx.send(AppEvent::Clear);

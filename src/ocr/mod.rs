@@ -1,4 +1,7 @@
+pub mod helper;
 pub mod preprocessing;
+
+pub use helper::OcrHelperClient;
 
 use image::{ImageBuffer, Rgba};
 use std::collections::VecDeque;
@@ -120,6 +123,32 @@ impl WinrtOcrEngine {
             }
         }
         false
+    }
+
+    /// Executes only Pass 1 (standard manga preprocessing) for quick candidate evaluation.
+    pub async fn recognize_pass_1(
+        &self,
+        frame: &CapturedFrame,
+    ) -> Result<Vec<RecognizedLine>, String> {
+        if frame.width == 0 || frame.height == 0 || frame.bgra_bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (prep, _) = prepare_ocr_image(frame);
+        let remap = RemapParams {
+            pad: prep.pad,
+            scale: prep.scale,
+            offset_x: frame.offset_x,
+            offset_y: frame.offset_y,
+        };
+
+        let pass_params = OcrPassParams {
+            bgra_bytes: &prep.bgra_bytes,
+            width: prep.width,
+            height: prep.height,
+            remap,
+        };
+        self.run_ocr_pass(pass_params).await
     }
 
     /// Recognizes text in the captured frame using an adaptive multi-pass OCR strategy:

@@ -6,10 +6,13 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::capture::{CapturedFrame, FrameSignature, ScreenCapture};
-use crate::ocr::{WinrtOcrEngine, is_ocr_garbage};
+use crate::ocr::{
+    OcrHelperClient, WinrtOcrEngine, cluster_lines_into_blocks, is_ocr_garbage,
+    score_recognized_lines,
+};
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
-use crate::types::{AppConfig, ScreenRect, TranslationProvider};
+use crate::types::{AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationProvider};
 
 /// RAII Guard that ensures `is_processing` is unconditionally reset to false upon completion or error.
 #[derive(Debug)]
@@ -59,10 +62,12 @@ struct AppState {
     config: Arc<Mutex<AppConfig>>,
     overlay: OverlayHandle,
     ocr: Arc<WinrtOcrEngine>,
+    helper_ocr: Arc<OcrHelperClient>,
     translator: Arc<TranslatorService>,
     active_roi: Arc<Mutex<Option<ScreenRect>>>,
     auto_mode: Arc<AtomicBool>,
     is_processing: Arc<AtomicBool>,
+    last_signature: Arc<Mutex<Option<FrameSignature>>>,
     current_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -79,18 +84,22 @@ impl App {
         let ocr = Arc::new(
             WinrtOcrEngine::new().map_err(|e| format!("Failed to init OCR engine: {}", e))?,
         );
+        let config_arc = Arc::new(Mutex::new(config.clone()));
+        let helper_ocr = OcrHelperClient::new(config_arc.clone());
         let translator = Arc::new(TranslatorService::new());
 
         overlay.set_provider_name(config.provider.display_name().to_string());
 
         let state = AppState {
-            config: Arc::new(Mutex::new(config)),
+            config: config_arc,
             overlay,
             ocr,
+            helper_ocr,
             translator,
             active_roi: Arc::new(Mutex::new(None)),
             auto_mode: Arc::new(AtomicBool::new(false)),
             is_processing: Arc::new(AtomicBool::new(false)),
+            last_signature: Arc::new(Mutex::new(None)),
             current_task: Arc::new(Mutex::new(None)),
         };
 
@@ -100,13 +109,12 @@ impl App {
     pub async fn run(mut self) {
         info!("Screen Translator application running.");
         info!(
-            "Hotkeys: Alt+T (Translate), Alt+S (Select ROI), Alt+A (Auto), Alt+P (Engine), Alt+C (Clear), Alt+Q (Quit)"
+            "Hotkeys: Alt+T (Translate), Alt+S (Select ROI), Alt+A (Auto), Alt+P (Engine), Alt+O (OCR Mode), Alt+C (Clear), Alt+Q (Quit)"
         );
 
         // Spawn background Dialogue Watcher (Auto-Mode)
         let auto_state = self.state.clone();
         tokio::spawn(async move {
-            let mut last_signature = FrameSignature::default();
             let interval_ms = {
                 let cfg = auto_state.config.lock().unwrap_or_else(|e| e.into_inner());
                 cfg.auto_mode_interval_ms.max(100)
@@ -141,10 +149,18 @@ impl App {
                 };
 
                 let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
-                if !sig.has_changed(&last_signature) {
-                    continue;
+                {
+                    let mut last_sig_lock = auto_state
+                        .last_signature
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(prev) = last_sig_lock.as_ref()
+                        && !sig.has_changed(prev)
+                    {
+                        continue;
+                    }
+                    *last_sig_lock = Some(sig);
                 }
-                last_signature = sig;
 
                 let task_state = auto_state.clone();
                 task_state.dispatch_translation_task(Some(frame));
@@ -198,6 +214,39 @@ impl App {
                         .overlay
                         .set_provider_name(new_provider.display_name().to_string());
                     let status = format!("Движок: {}", new_provider.display_name());
+                    info!("{}", status);
+                    self.state.overlay.set_loading(false, Some(status));
+                }
+
+                AppEvent::CycleOcrMode => {
+                    // Abort previous in-flight task on OCR mode switch
+                    if let Some(prev) = self
+                        .state
+                        .current_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        prev.abort();
+                    }
+
+                    // Reset FrameSignature so dialogue watcher immediately processes new frame if needed
+                    *self
+                        .state
+                        .last_signature
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+
+                    // Clear overlay cards
+                    self.state.overlay.clear();
+
+                    let new_mode = {
+                        let mut cfg = self.state.config.lock().unwrap_or_else(|e| e.into_inner());
+                        cfg.ocr_engine = cfg.ocr_engine.next();
+                        cfg.ocr_engine
+                    };
+
+                    let status = format!("Режим OCR: {}", new_mode.display_name());
                     info!("{}", status);
                     self.state.overlay.set_loading(false, Some(status));
                 }
@@ -303,16 +352,12 @@ impl AppState {
             }
         };
 
-        self.overlay.set_loading(
-            true,
-            Some("Распознавание текста (WinRT OCR)...".to_string()),
-        );
         info!(
-            "Captured {}x{} frame. Running OCR...",
-            frame.width, frame.height
+            "Captured {}x{} frame. Running OCR (mode: {:?})...",
+            frame.width, frame.height, cfg.ocr_engine
         );
 
-        let blocks = match self.ocr.recognize(&frame).await {
+        let blocks = match self.perform_ocr(&frame, &cfg).await {
             Ok(b) => b,
             Err(e) => {
                 error!("OCR error: {}", e);
@@ -387,6 +432,82 @@ impl AppState {
         info!("{}", status);
 
         self.overlay.update_blocks(translations, Some(status));
+    }
+
+    async fn perform_ocr(
+        &self,
+        frame: &CapturedFrame,
+        cfg: &AppConfig,
+    ) -> Result<Vec<OcrBlock>, String> {
+        match cfg.ocr_engine {
+            OcrMode::WinRt => {
+                self.overlay.set_loading(
+                    true,
+                    Some("Распознавание текста (WinRT OCR)...".to_string()),
+                );
+                self.ocr.recognize(frame).await
+            }
+            OcrMode::Helper => {
+                self.overlay
+                    .set_loading(true, Some("Распознавание текста (RapidOCR)...".to_string()));
+                match self.helper_ocr.recognize(frame, &cfg.ocr_lang).await {
+                    Ok(blocks) => Ok(blocks),
+                    Err(err) => {
+                        warn!("RapidOCR helper failed: {}. Falling back to WinRT...", err);
+                        self.overlay.set_loading(
+                            true,
+                            Some("RapidOCR недоступен, откат на WinRT OCR...".to_string()),
+                        );
+                        self.ocr.recognize(frame).await
+                    }
+                }
+            }
+            OcrMode::Auto => {
+                self.overlay.set_loading(
+                    true,
+                    Some("Распознавание (Auto: WinRT Pass 1)...".to_string()),
+                );
+                let pass1_lines = self.ocr.recognize_pass_1(frame).await.unwrap_or_default();
+                let pass1_score = score_recognized_lines(&pass1_lines);
+
+                if pass1_score >= 12 && !pass1_lines.is_empty() {
+                    info!(
+                        "Auto mode: WinRT Pass 1 succeeded with high score ({})",
+                        pass1_score
+                    );
+                    let blocks = cluster_lines_into_blocks(
+                        pass1_lines,
+                        Some((&frame.bgra_bytes, frame.width, frame.height)),
+                    );
+                    Ok(blocks)
+                } else {
+                    info!(
+                        "Auto mode: WinRT Pass 1 score is low ({}), trying RapidOCR helper...",
+                        pass1_score
+                    );
+                    self.overlay
+                        .set_loading(true, Some("Auto: пробую RapidOCR помощник...".to_string()));
+                    match self.helper_ocr.recognize(frame, &cfg.ocr_lang).await {
+                        Ok(blocks)
+                            if !blocks.is_empty()
+                                && blocks.iter().any(|b| !is_ocr_garbage(&b.text)) =>
+                        {
+                            info!(
+                                "Auto mode: RapidOCR helper succeeded with {} blocks",
+                                blocks.len()
+                            );
+                            Ok(blocks)
+                        }
+                        _ => {
+                            info!(
+                                "Auto mode: RapidOCR yielded no text, falling back to full WinRT multi-pass..."
+                            );
+                            self.ocr.recognize(frame).await
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

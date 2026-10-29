@@ -189,10 +189,76 @@ impl fmt::Debug for TranslationProvider {
     }
 }
 
+/// OCR Engine mode selection
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OcrMode {
+    #[default]
+    #[serde(rename = "winrt")]
+    WinRt,
+    #[serde(rename = "helper")]
+    Helper,
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+impl OcrMode {
+    pub fn next(&self) -> Self {
+        match self {
+            Self::WinRt => Self::Helper,
+            Self::Helper => Self::Auto,
+            Self::Auto => Self::WinRt,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::WinRt => "WinRT OCR (Windows)",
+            Self::Helper => "RapidOCR (Помощник)",
+            Self::Auto => "Авто (WinRT -> RapidOCR)",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WinRt => "winrt",
+            Self::Helper => "helper",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        let lower = s.trim().to_lowercase();
+        if lower.contains("helper") || lower.contains("rapid") || lower.contains("python") {
+            Self::Helper
+        } else if lower.contains("auto") {
+            Self::Auto
+        } else {
+            Self::WinRt
+        }
+    }
+}
+
+impl fmt::Display for OcrMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+impl fmt::Debug for OcrMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Configuration settings for Screen Translator
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub provider: TranslationProvider,
+    pub ocr_engine: OcrMode,
+    pub python_path: String,
+    pub helper_timeout_ms: u64,
+    pub helper_min_score: f32,
+    pub ocr_lang: String,
     pub source_lang: String,
     pub target_lang: String,
     pub context_history_size: usize,
@@ -213,6 +279,11 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             provider: TranslationProvider::Google,
+            ocr_engine: OcrMode::WinRt,
+            python_path: "ocr_helper/.venv/Scripts/python.exe".to_string(),
+            helper_timeout_ms: 5000,
+            helper_min_score: 0.5,
+            ocr_lang: "en".to_string(),
             source_lang: "en".to_string(),
             target_lang: "ru".to_string(),
             context_history_size: 5,
@@ -235,6 +306,11 @@ impl fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppConfig")
             .field("provider", &self.provider)
+            .field("ocr_engine", &self.ocr_engine)
+            .field("python_path", &self.python_path)
+            .field("helper_timeout_ms", &self.helper_timeout_ms)
+            .field("helper_min_score", &self.helper_min_score)
+            .field("ocr_lang", &self.ocr_lang)
             .field("source_lang", &self.source_lang)
             .field("target_lang", &self.target_lang)
             .field("context_history_size", &self.context_history_size)
@@ -302,6 +378,19 @@ impl AppConfig {
 
             match key {
                 "provider" => cfg.provider = TranslationProvider::from_str_loose(val_unquoted),
+                "ocr_engine" => cfg.ocr_engine = OcrMode::from_str_loose(val_unquoted),
+                "python_path" => cfg.python_path = val_unquoted.to_string(),
+                "helper_timeout_ms" => {
+                    if let Ok(n) = val_unquoted.parse() {
+                        cfg.helper_timeout_ms = n;
+                    }
+                }
+                "helper_min_score" => {
+                    if let Ok(f) = val_unquoted.parse() {
+                        cfg.helper_min_score = f;
+                    }
+                }
+                "ocr_lang" => cfg.ocr_lang = val_unquoted.to_string(),
                 "source_lang" => cfg.source_lang = val_unquoted.to_string(),
                 "target_lang" => cfg.target_lang = val_unquoted.to_string(),
                 "context_history_size" => {
@@ -480,5 +569,29 @@ mod tests {
         let toml_garbage = "auto_mode_interval_ms = not_a_number\n";
         let cfg_garbage = AppConfig::from_toml_str(toml_garbage);
         assert!(cfg_garbage.auto_mode_interval_ms >= 100);
+    }
+
+    #[test]
+    fn test_ocr_mode_cycle() {
+        assert_eq!(OcrMode::WinRt.next(), OcrMode::Helper);
+        assert_eq!(OcrMode::Helper.next(), OcrMode::Auto);
+        assert_eq!(OcrMode::Auto.next(), OcrMode::WinRt);
+    }
+
+    #[test]
+    fn test_ocr_helper_config_keys_parsing() {
+        let toml = r#"
+            ocr_engine = "helper"
+            python_path = "custom/python.exe"
+            helper_timeout_ms = 8000
+            helper_min_score = 0.65
+            ocr_lang = "en"
+        "#;
+        let cfg = AppConfig::from_toml_str(toml);
+        assert_eq!(cfg.ocr_engine, OcrMode::Helper);
+        assert_eq!(cfg.python_path, "custom/python.exe");
+        assert_eq!(cfg.helper_timeout_ms, 8000);
+        assert_eq!(cfg.helper_min_score, 0.65);
+        assert_eq!(cfg.ocr_lang, "en");
     }
 }
