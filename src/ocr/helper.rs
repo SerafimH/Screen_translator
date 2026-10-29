@@ -443,16 +443,29 @@ impl OcrHelperClient {
         };
 
         // Write request header + raw RGB bytes
-        let write_res = async {
+        let write_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             session.stdin.write_all(&header_bytes).await?;
             session.stdin.write_all(&raw_rgb).await?;
             session.stdin.flush().await?;
             tokio::io::Result::Ok(())
-        };
+        })
+        .await;
 
-        if let Err(e) = tokio::time::timeout(Duration::from_millis(timeout_ms), write_res).await {
-            self.handle_failure("write timeout or error", session_guard);
-            return Err(format!("Failed to write to OCR helper: {:?}", e));
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("IO error writing to OCR helper: {}", e);
+                self.handle_failure("IO error writing to stdin", session_guard);
+                return Err(format!("IO error writing to OCR helper: {}", e));
+            }
+            Err(_) => {
+                error!("Timed out writing to OCR helper after {} ms", timeout_ms);
+                self.handle_failure("write timed out", session_guard);
+                return Err(format!(
+                    "OCR helper write timed out after {} ms",
+                    timeout_ms
+                ));
+            }
         }
 
         // Read single line JSON response
@@ -633,5 +646,29 @@ mod tests {
         let raw = "\x1b[32m[INFO] Hello World\x1b[0m";
         let clean = strip_ansi_codes(raw);
         assert_eq!(clean, "[INFO] Hello World");
+    }
+
+    #[tokio::test]
+    async fn test_handle_failure_marks_session_broken() {
+        let config = Arc::new(Mutex::new(AppConfig::default()));
+        let client = Arc::new(OcrHelperClient {
+            session: tokio::sync::Mutex::new(None),
+            config,
+            is_ready: Arc::new(AtomicBool::new(true)),
+            is_available: Arc::new(AtomicBool::new(true)),
+            has_warned: Arc::new(AtomicBool::new(false)),
+            restart_attempted: Arc::new(AtomicBool::new(false)),
+            next_id: AtomicU64::new(1),
+        });
+
+        assert!(client.is_ready());
+
+        let guard = client.session.lock().await;
+        client.handle_failure("test failure", guard);
+
+        assert!(!client.is_ready());
+        assert!(!client.is_available.load(Ordering::SeqCst));
+        assert!(!client.is_ready.load(Ordering::SeqCst));
+        assert!(client.session.lock().await.is_none());
     }
 }
