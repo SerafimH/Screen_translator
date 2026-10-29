@@ -333,6 +333,18 @@ impl From<AppConfigRaw> for AppConfig {
     fn from(raw: AppConfigRaw) -> Self {
         let vision_fallback =
             resolve_vision_fallback(raw.vision_fallback, raw.use_vision_ocr, false);
+        let deepl_api_key = raw.deepl_api_key.filter(|k| {
+            let trimmed = k.trim();
+            !trimmed.is_empty() && trimmed != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
+        });
+        let gemini_api_key = raw.gemini_api_key.filter(|k| {
+            let trimmed = k.trim();
+            !trimmed.is_empty() && trimmed != "AIzaSy..."
+        });
+        let openai_api_key = raw.openai_api_key.filter(|k| {
+            let trimmed = k.trim();
+            !trimmed.is_empty() && trimmed != "gsk_..."
+        });
         Self {
             provider: raw.provider,
             ocr_engine: raw.ocr_engine,
@@ -344,12 +356,12 @@ impl From<AppConfigRaw> for AppConfig {
             target_lang: raw.target_lang,
             context_history_size: raw.context_history_size,
             vision_fallback,
-            deepl_api_key: raw.deepl_api_key,
-            gemini_api_key: raw.gemini_api_key,
-            openai_api_key: raw.openai_api_key,
+            deepl_api_key,
+            gemini_api_key,
+            openai_api_key,
             openai_base_url: raw.openai_base_url,
             openai_model: raw.openai_model,
-            auto_mode_interval_ms: raw.auto_mode_interval_ms,
+            auto_mode_interval_ms: raw.auto_mode_interval_ms.max(100),
             font_size: raw.font_size,
             font_family: raw.font_family,
             overlay_bg_alpha: raw.overlay_bg_alpha,
@@ -456,110 +468,15 @@ impl AppConfig {
         Self::default()
     }
 
-    /// Parses a simple TOML string into `AppConfig`.
+    /// Parses a TOML string into `AppConfig`, falling back to defaults on parse error.
     pub fn from_toml_str(content: &str) -> Self {
-        let mut cfg = Self::default();
-        let mut parsed_vision_fallback: Option<bool> = None;
-        let mut parsed_use_vision_ocr: Option<bool> = None;
-
-        for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Split line at first '='
-            let Some((key_part, val_part)) = line.split_once('=') else {
-                continue;
-            };
-
-            let key = key_part.trim();
-            // Strip trailing comments
-            let raw_val = match val_part.split_once('#') {
-                Some((before_comment, _)) => before_comment.trim(),
-                None => val_part.trim(),
-            };
-
-            let val_unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
-
-            match key {
-                "provider" => cfg.provider = TranslationProvider::from_str_loose(val_unquoted),
-                "ocr_engine" => cfg.ocr_engine = OcrMode::from_str_loose(val_unquoted),
-                "python_path" => cfg.python_path = val_unquoted.to_string(),
-                "helper_timeout_ms" => {
-                    if let Ok(n) = val_unquoted.parse() {
-                        cfg.helper_timeout_ms = n;
-                    }
-                }
-                "helper_min_score" => {
-                    if let Ok(f) = val_unquoted.parse() {
-                        cfg.helper_min_score = f;
-                    }
-                }
-                "ocr_lang" => cfg.ocr_lang = val_unquoted.to_string(),
-                "source_lang" => cfg.source_lang = val_unquoted.to_string(),
-                "target_lang" => cfg.target_lang = val_unquoted.to_string(),
-                "context_history_size" => {
-                    if let Ok(n) = val_unquoted.parse() {
-                        cfg.context_history_size = n;
-                    }
-                }
-                "use_vision_ocr" => {
-                    if let Ok(b) = val_unquoted.parse() {
-                        parsed_use_vision_ocr = Some(b);
-                    }
-                }
-                "vision_fallback" => {
-                    if let Ok(b) = val_unquoted.parse() {
-                        parsed_vision_fallback = Some(b);
-                    }
-                }
-                "deepl_api_key" => {
-                    if !val_unquoted.is_empty()
-                        && val_unquoted != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
-                    {
-                        cfg.deepl_api_key = Some(val_unquoted.to_string());
-                    }
-                }
-                "gemini_api_key" => {
-                    if !val_unquoted.is_empty() && val_unquoted != "AIzaSy..." {
-                        cfg.gemini_api_key = Some(val_unquoted.to_string());
-                    }
-                }
-                "openai_api_key" => {
-                    if !val_unquoted.is_empty() && val_unquoted != "gsk_..." {
-                        cfg.openai_api_key = Some(val_unquoted.to_string());
-                    }
-                }
-                "openai_base_url" => cfg.openai_base_url = val_unquoted.to_string(),
-                "openai_model" => cfg.openai_model = val_unquoted.to_string(),
-                "auto_mode_interval_ms" => {
-                    if let Ok(n) = val_unquoted.parse::<u64>() {
-                        cfg.auto_mode_interval_ms = n.max(100);
-                    }
-                }
-                "font_size" => {
-                    if let Ok(n) = val_unquoted.parse() {
-                        cfg.font_size = n;
-                    }
-                }
-                "font_family" => cfg.font_family = val_unquoted.to_string(),
-                "overlay_bg_alpha" => {
-                    if let Ok(n) = val_unquoted.parse() {
-                        cfg.overlay_bg_alpha = n;
-                    }
-                }
-                _ => {}
+        match toml::from_str::<AppConfigRaw>(content) {
+            Ok(raw) => Self::from(raw),
+            Err(e) => {
+                warn!("Failed to parse config TOML: {e}, falling back to defaults");
+                Self::default()
             }
         }
-
-        cfg.vision_fallback = resolve_vision_fallback(
-            parsed_vision_fallback,
-            parsed_use_vision_ocr,
-            cfg.vision_fallback,
-        );
-
-        cfg
     }
 }
 
@@ -768,5 +685,41 @@ mod tests {
         let json_both = r#"{"vision_fallback": true, "use_vision_ocr": false}"#;
         let cfg_serde: AppConfig = serde_json::from_str(json_both).unwrap();
         assert!(cfg_serde.vision_fallback);
+    }
+
+    #[test]
+    fn test_toml_hash_in_quotes_and_inline_comments() {
+        let toml = r#"
+            python_path = "C:/env #1/python.exe"
+            openai_base_url = "https://api.example.com/v1#fragment" # trailing comment
+            auto_mode_interval_ms = 500 # interval comment
+        "#;
+        let cfg = AppConfig::from_toml_str(toml);
+        assert_eq!(cfg.python_path, "C:/env #1/python.exe");
+        assert_eq!(cfg.openai_base_url, "https://api.example.com/v1#fragment");
+        assert_eq!(cfg.auto_mode_interval_ms, 500);
+    }
+
+    #[test]
+    fn test_toml_placeholder_keys_filtered_and_valid_preserved() {
+        let toml_placeholders = r#"
+            deepl_api_key = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
+            gemini_api_key = "AIzaSy..."
+            openai_api_key = "gsk_..."
+        "#;
+        let cfg_placeholders = AppConfig::from_toml_str(toml_placeholders);
+        assert_eq!(cfg_placeholders.deepl_api_key, None);
+        assert_eq!(cfg_placeholders.gemini_api_key, None);
+        assert_eq!(cfg_placeholders.openai_api_key, None);
+
+        let toml_valid = r#"
+            deepl_api_key = "real-deepl-key:fx"
+            gemini_api_key = "AIzaSyValidGeminiKey123"
+            openai_api_key = "gsk_valid_openai_token_456"
+        "#;
+        let cfg_valid = AppConfig::from_toml_str(toml_valid);
+        assert_eq!(cfg_valid.deepl_api_key.as_deref(), Some("real-deepl-key:fx"));
+        assert_eq!(cfg_valid.gemini_api_key.as_deref(), Some("AIzaSyValidGeminiKey123"));
+        assert_eq!(cfg_valid.openai_api_key.as_deref(), Some("gsk_valid_openai_token_456"));
     }
 }
