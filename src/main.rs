@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("------------------------------------------------------------");
     println!("  CONTROLS & SHORTCUTS:");
     println!("    [Alt + T]  Translate Screen / Active Dialogue Box");
+    println!("    [Shift]    Translate Word / Sentence under Mouse Cursor");
     println!("    [Alt + S]  Interactive Selection (Drag box on screen)");
     println!("    [Alt + A]  Toggle Auto-Translate Mode (Dialogue Watcher)");
     println!("    [Alt + P]  Cycle Engine (Google -> DeepL -> Gemini -> Groq)");

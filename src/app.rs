@@ -4,6 +4,7 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+use windows::Win32::Foundation::POINT;
 
 use crate::capture::{CapturedFrame, FrameSignature, ScreenCapture};
 use crate::ocr::{
@@ -12,7 +13,10 @@ use crate::ocr::{
 };
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
-use crate::types::{AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationProvider};
+use crate::types::{
+    AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationBlock, TranslationProvider,
+    find_text_under_cursor,
+};
 
 /// RAII Guard that ensures `is_processing` is unconditionally reset to false upon completion or error.
 #[derive(Debug)]
@@ -265,6 +269,23 @@ impl App {
                     info!("Overlay cleared.");
                 }
 
+                AppEvent::TranslateUnderCursor(pt) => {
+                    self.state.dispatch_cursor_translation_task(pt);
+                }
+
+                AppEvent::ShiftReleased => {
+                    if let Some(prev) = self
+                        .state
+                        .current_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        prev.abort();
+                    }
+                    self.state.overlay.clear_blocks();
+                }
+
                 AppEvent::Quit => {
                     info!("Quitting application.");
                     break;
@@ -304,6 +325,193 @@ where
 }
 
 impl AppState {
+    fn dispatch_cursor_translation_task(&self, pt: POINT) {
+        let state = self.clone();
+        spawn_cancellable_task(&self.current_task, async move {
+            state.perform_cursor_translation(pt).await;
+        });
+    }
+
+    async fn perform_cursor_translation(&self, pt: POINT) {
+        let Some(_guard) = ProcessingGuard::acquire_or_wait(
+            &self.is_processing,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        else {
+            info!("Translation already in progress, skipping cursor Shift trigger.");
+            return;
+        };
+
+        let start_time = Instant::now();
+        let cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        // If an active ROI was manually selected and contains the cursor, capture that ROI;
+        // otherwise, capture a focused region (800x240) centered on the cursor clamped to non-negative desktop coordinates.
+        let active = *self.active_roi.lock().unwrap_or_else(|e| e.into_inner());
+        let capture_roi = if let Some(roi) = active.filter(|r| r.contains(pt.x, pt.y)) {
+            roi
+        } else {
+            let cap_x = (pt.x - 400).max(0);
+            let cap_y = (pt.y - 120).max(0);
+            ScreenRect::new(cap_x, cap_y, 800, 240)
+        };
+
+        self.overlay
+            .set_loading(true, Some("Поиск текста под курсором...".to_string()));
+
+        let capture_res =
+            tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(Some(capture_roi))).await;
+
+        let frame = match capture_res {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                warn!("Capture failed for cursor translation: {}", e);
+                self.overlay
+                    .set_loading(false, Some(format!("Ошибка захвата: {}", e)));
+                return;
+            }
+            Err(e) => {
+                warn!("Capture thread failed: {:?}", e);
+                self.overlay
+                    .set_loading(false, Some("Ошибка потока захвата".to_string()));
+                return;
+            }
+        };
+
+        let blocks = match self.perform_ocr(&frame, &cfg).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("OCR error during cursor translation: {}", e);
+                self.overlay
+                    .set_loading(false, Some(format!("Ошибка OCR: {}", e)));
+                return;
+            }
+        };
+
+        if !crate::overlay::is_shift_held() {
+            info!("Shift was released before OCR finished, aborting cursor translation.");
+            self.overlay.set_loading(false, None);
+            return;
+        }
+
+        let Some(target) = find_text_under_cursor(&blocks, pt.x, pt.y) else {
+            info!("No text found under cursor at ({}, {})", pt.x, pt.y);
+            self.overlay.set_loading(false, None);
+            return;
+        };
+
+        let is_multi_word = target
+            .word_text
+            .as_ref()
+            .map(|w| w.to_lowercase() != target.sentence_text.to_lowercase())
+            .unwrap_or(false)
+            && target.sentence_text.split_whitespace().count() > 1;
+
+        let translation_block = if is_multi_word {
+            let word = target.word_text.as_ref().unwrap();
+            let word_fut = self.translator.lookup_word_details(
+                word,
+                &cfg.source_lang,
+                &cfg.target_lang,
+                &cfg,
+            );
+            let sentence_fut = self.translator.translate_text(
+                &target.sentence_text,
+                &cfg.source_lang,
+                &cfg.target_lang,
+                &cfg,
+            );
+            let (details, sentence_res) = tokio::join!(word_fut, sentence_fut);
+
+            let sentence_trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
+
+            let mut card_text = format!("Слово: {} → {}", word, details.primary);
+            if !details.synonyms.is_empty() {
+                card_text.push_str(&format!(" ({})", details.synonyms.join(", ")));
+            }
+
+            if !details.examples.is_empty() {
+                card_text.push_str("\n\nПримеры:");
+                for ex in &details.examples {
+                    card_text.push_str(&format!("\n• {}", ex));
+                }
+            }
+
+            card_text.push_str("\n\nВ контексте предложения:\n«");
+            card_text.push_str(&target.sentence_text);
+            card_text.push_str("»\n→ «");
+            card_text.push_str(&sentence_trans);
+            card_text.push('»');
+
+            let card_w = target.sentence_rect.width.max(420);
+            TranslationBlock {
+                original_text: format!("{} ({})", word, target.sentence_text),
+                translated_text: card_text,
+                rect: ScreenRect::new(
+                    target.sentence_rect.x,
+                    target.sentence_rect.y,
+                    card_w,
+                    target.sentence_rect.height,
+                ),
+            }
+        } else {
+            let word_or_line = target
+                .word_text
+                .as_ref()
+                .unwrap_or(&target.sentence_text);
+
+            let details = self
+                .translator
+                .lookup_word_details(
+                    word_or_line,
+                    &cfg.source_lang,
+                    &cfg.target_lang,
+                    &cfg,
+                )
+                .await;
+
+            let mut card_text = format!("Слово: {} → {}", word_or_line, details.primary);
+            if !details.synonyms.is_empty() {
+                card_text.push_str(&format!(" ({})", details.synonyms.join(", ")));
+            }
+            if !details.examples.is_empty() {
+                card_text.push_str("\n\nПримеры:");
+                for ex in &details.examples {
+                    card_text.push_str(&format!("\n• {}", ex));
+                }
+            }
+
+            let card_w = target
+                .word_rect
+                .map(|r| r.width)
+                .unwrap_or(target.sentence_rect.width)
+                .max(360);
+            let base_rect = target.word_rect.unwrap_or(target.sentence_rect);
+
+            TranslationBlock {
+                original_text: word_or_line.clone(),
+                translated_text: card_text,
+                rect: ScreenRect::new(base_rect.x, base_rect.y, card_w, base_rect.height),
+            }
+        };
+
+        if !crate::overlay::is_shift_held() {
+            info!("Shift was released before translation finished, skipping card display.");
+            self.overlay.set_loading(false, None);
+            return;
+        }
+
+        let elapsed = start_time.elapsed().as_millis();
+        let status = format!("Перевод под курсором за {} мс", elapsed);
+        info!("{}", status);
+        self.overlay.update_blocks(vec![translation_block], Some(status));
+    }
+
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
         let state = self.clone();
         spawn_cancellable_task(&self.current_task, async move {

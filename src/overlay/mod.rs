@@ -1,5 +1,6 @@
 pub mod renderer;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info, warn};
@@ -7,21 +8,23 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
-    UnregisterHotKey,
+    GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture,
+    SetCapture, SetFocus, UnregisterHotKey, VK_CONTROL, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RSHIFT,
+    VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GWL_EXSTYLE,
-    GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_CROSS, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SET_WINDOW_POS_FLAGS, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SMTO_ABORTIFHUNG, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SendMessageTimeoutW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+    GWL_EXSTYLE, GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT,
+    LLKHF_ALTDOWN, LLKHF_UP, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG, SW_SHOW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetCursor, SetForegroundWindow,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    TranslateMessage, UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Result, w};
 
@@ -42,6 +45,64 @@ pub const WM_APP_CLEAR: u32 = WM_APP + 3;
 
 const HTCLIENT: isize = 1;
 
+static HOOK_TX: Mutex<Option<UnboundedSender<AppEvent>>> = Mutex::new(None);
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+
+pub fn is_shift_held() -> bool {
+    SHIFT_HELD.load(Ordering::SeqCst)
+}
+
+unsafe extern "system" fn low_level_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 && lparam.0 != 0 {
+        let msg = wparam.0 as u32;
+        let kbd = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let is_shift = kbd.vkCode == VK_SHIFT.0 as u32
+            || kbd.vkCode == VK_LSHIFT.0 as u32
+            || kbd.vkCode == VK_RSHIFT.0 as u32;
+
+        if is_shift {
+            let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            let is_key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP || kbd.flags.contains(LLKHF_UP);
+
+            if is_key_down && !kbd.flags.contains(LLKHF_UP) {
+                // Ignore Shift if Alt, Ctrl, or Windows key is down (e.g. Alt+Shift / Ctrl+Shift layout switch)
+                let alt_down = kbd.flags.contains(LLKHF_ALTDOWN)
+                    || (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
+                let ctrl_down =
+                    (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+                let win_down = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as u16 & 0x8000) != 0
+                    || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } as u16 & 0x8000) != 0;
+
+                if !alt_down && !ctrl_down && !win_down {
+                    if !SHIFT_HELD.swap(true, Ordering::SeqCst) {
+                        let mut pt = POINT::default();
+                        let _ = unsafe { GetCursorPos(&mut pt) };
+                        if let Ok(guard) = HOOK_TX.lock() {
+                            if let Some(tx) = guard.as_ref() {
+                                let _ = tx.send(AppEvent::TranslateUnderCursor(pt));
+                            }
+                        }
+                    }
+                }
+            } else if is_key_up {
+                if SHIFT_HELD.swap(false, Ordering::SeqCst) {
+                    if let Ok(guard) = HOOK_TX.lock() {
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.send(AppEvent::ShiftReleased);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     TriggerTranslate,
@@ -51,6 +112,8 @@ pub enum AppEvent {
     CycleOcrMode,
     Clear,
     Quit,
+    TranslateUnderCursor(POINT),
+    ShiftReleased,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +234,17 @@ impl OverlayHandle {
             let _ = PostMessageW(Some(self.hwnd), WM_APP_CLEAR, WPARAM(0), LPARAM(0));
         }
     }
+
+    pub fn clear_blocks(&self) {
+        {
+            let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.current_blocks.clear();
+            s.is_loading = false;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_CLEAR, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 struct WindowThreadState {
@@ -189,6 +263,8 @@ struct WindowThreadState {
     shared_state: Arc<Mutex<OverlaySharedState>>,
     // Channel to send events to App
     event_tx: UnboundedSender<AppEvent>,
+    // Low-level keyboard hook handle for Shift word/sentence translation
+    keyboard_hook: HHOOK,
 }
 
 pub struct OverlayManager;
@@ -337,6 +413,20 @@ impl OverlayManager {
                         }
                     };
 
+                *HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(event_tx.clone());
+                let keyboard_hook = match SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(low_level_keyboard_proc),
+                    Some(hinstance.into()),
+                    0,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Failed to install Shift keyboard hook: {:?}", e);
+                        HHOOK(core::ptr::null_mut())
+                    }
+                };
+
                 let state = Box::new(WindowThreadState {
                     hwnd,
                     renderer,
@@ -350,6 +440,7 @@ impl OverlayManager {
                     drag_current: POINT { x: 0, y: 0 },
                     shared_state: shared_for_thread,
                     event_tx,
+                    keyboard_hook,
                 });
 
                 let state_ptr = Box::into_raw(state);
@@ -573,6 +664,9 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_DESTROY => {
+            if !state.keyboard_hook.is_invalid() {
+                let _ = unsafe { UnhookWindowsHookEx(state.keyboard_hook) };
+            }
             let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_TRANSLATE) };
             let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI) };
             let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE_AUTO) };
@@ -585,6 +679,9 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_NCDESTROY => {
+            // Clear global hook sender on window destruction
+            *HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
             // SAFETY: Clear GWLP_USERDATA before taking back ownership of WindowThreadState.
             // Exactly one Box::from_raw occurs on final window destruction.
             unsafe {

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
@@ -494,6 +495,34 @@ pub fn clean_russian_punctuation(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Strips HTML tags (e.g. <b>, </b>) and unescapes basic HTML entities.
+pub fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(c);
+        }
+    }
+    out.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+/// Rich translation details for a standalone word, including dictionary synonyms and usage examples.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WordDetails {
+    pub primary: String,
+    pub synonyms: Vec<String>,
+    pub examples: Vec<String>,
+}
+
 /// Parses normalized vision box coordinate array JSON into `TranslationBlock` instances.
 pub fn parse_vision_blocks_json_with_box_2d(
     json_str: &str,
@@ -632,6 +661,7 @@ impl Default for TranslatorService {
 impl TranslatorService {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .timeout(std::time::Duration::from_millis(6000))
             .build()
             .unwrap_or_default();
@@ -1123,6 +1153,176 @@ impl TranslatorService {
         Ok(final_text)
     }
 
+    /// Looks up rich translation details for a word, utilizing Google dictionary API when available with caching.
+    pub async fn lookup_word_details(
+        &self,
+        word: &str,
+        source_lang: &str,
+        target_lang: &str,
+        config: &AppConfig,
+    ) -> WordDetails {
+        let clean = clean_ocr_noise(word);
+        let trimmed_punct = clean.trim().trim_matches(|c: char| !c.is_alphanumeric());
+        let normalized = if !trimmed_punct.is_empty() {
+            trimmed_punct
+        } else {
+            clean.trim()
+        };
+        if normalized.is_empty() {
+            return WordDetails::default();
+        }
+
+        let cache_key = format!(
+            "dict:{}:{}:{}:{}",
+            config.provider.as_str(),
+            source_lang,
+            target_lang,
+            normalized.to_lowercase()
+        );
+
+        if let Some(cached_json) = self.cache.get(&cache_key) {
+            if let Ok(details) = serde_json::from_str::<WordDetails>(&cached_json) {
+                return details;
+            }
+        }
+
+        let mut details = if config.provider == TranslationProvider::Google {
+            self.lookup_google_dict(normalized, source_lang, target_lang)
+                .await
+                .unwrap_or_default()
+        } else {
+            WordDetails::default()
+        };
+
+        if details.primary.is_empty() {
+            let fallback_trans = self
+                .translate_text(normalized, source_lang, target_lang, config)
+                .await
+                .unwrap_or_else(|_| normalized.to_string());
+            details.primary = fallback_trans;
+        }
+
+        if let Ok(serialized) = serde_json::to_string(&details) {
+            self.cache.insert(cache_key, serialized);
+        }
+
+        details
+    }
+
+    /// Queries Google Translate GTX API with dictionary (dt=bd) and examples (dt=ex/dt=md).
+    pub async fn lookup_google_dict(
+        &self,
+        word: &str,
+        source_lang: &str,
+        target_lang: &str,
+    ) -> Result<WordDetails, String> {
+        let url = format!(
+            "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dt=bd&dt=ex&dt=md&dj=1&q={}",
+            source_lang,
+            target_lang,
+            urlencoding::encode(word)
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .send()
+            .await
+            .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| redact_secrets(&format!("JSON parsing error: {:?}", e)))?;
+
+        let mut primary = String::new();
+        if let Some(sentences) = json.get("sentences").and_then(|v| v.as_array()) {
+            for s in sentences {
+                if let Some(piece) = s.get("trans").and_then(|v| v.as_str()) {
+                    primary.push_str(piece);
+                }
+            }
+        }
+
+        let mut synonyms = Vec::new();
+        if let Some(dict) = json.get("dict").and_then(|v| v.as_array()) {
+            for group in dict {
+                if let Some(terms) = group.get("terms").and_then(|v| v.as_array()) {
+                    for t in terms {
+                        if let Some(term_str) = t.as_str() {
+                            let trimmed = term_str.trim();
+                            if !trimmed.is_empty()
+                                && trimmed.to_lowercase() != primary.trim().to_lowercase()
+                                && !synonyms.contains(&trimmed.to_string())
+                            {
+                                synonyms.push(trimmed.to_string());
+                                if synonyms.len() >= 4 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if synonyms.len() >= 4 {
+                    break;
+                }
+            }
+        }
+
+        let mut examples = Vec::new();
+        if let Some(definitions) = json.get("definitions").and_then(|v| v.as_array()) {
+            for def_group in definitions {
+                if let Some(entry) = def_group.get("entry").and_then(|v| v.as_array()) {
+                    for e in entry {
+                        if let Some(ex) = e.get("example").and_then(|v| v.as_str()) {
+                            let clean_ex = strip_html_tags(ex).trim().to_string();
+                            if !clean_ex.is_empty() && !examples.contains(&clean_ex) {
+                                examples.push(clean_ex);
+                                if examples.len() >= 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if examples.len() >= 2 {
+                    break;
+                }
+            }
+        }
+
+        if examples.len() < 2 {
+            if let Some(ex_obj) = json
+                .get("examples")
+                .and_then(|v| v.get("example"))
+                .and_then(|v| v.as_array())
+            {
+                for item in ex_obj {
+                    if let Some(txt) = item.get("text").and_then(|v| v.as_str()) {
+                        let clean_ex = strip_html_tags(txt).trim().to_string();
+                        if !clean_ex.is_empty() && !examples.contains(&clean_ex) {
+                            examples.push(clean_ex);
+                            if examples.len() >= 2 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if primary.is_empty() {
+            return Err("No translation found".to_string());
+        }
+
+        Ok(WordDetails {
+            primary,
+            synonyms,
+            examples,
+        })
+    }
+
     /// Translates a batch of OCR blocks using batching or parallel JoinSet dispatch.
     pub async fn translate_blocks(
         &self,
@@ -1509,5 +1709,14 @@ mod tests {
         assert_eq!(encode_base64(b"Man"), "TWFu");
         assert_eq!(encode_base64(b"Ma"), "TWE=");
         assert_eq!(encode_base64(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn test_strip_html_tags() {
+        assert_eq!(
+            strip_html_tags("let me see <b>now</b>, &quot;yes&quot; &amp; &lt;ok&gt;"),
+            "let me see now, \"yes\" & <ok>"
+        );
+        assert_eq!(strip_html_tags("plain text"), "plain text");
     }
 }

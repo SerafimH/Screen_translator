@@ -123,6 +123,101 @@ pub struct TranslationBlock {
     pub rect: ScreenRect,
 }
 
+/// The detected text target (word and/or sentence) located directly under or near the mouse cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextUnderCursor {
+    pub word_text: Option<String>,
+    pub word_rect: Option<ScreenRect>,
+    pub sentence_text: String,
+    pub sentence_rect: ScreenRect,
+}
+
+/// Identifies the word or sentence under the cursor given recognized OCR blocks.
+pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<TextUnderCursor> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let dist_to_rect = |r: &ScreenRect, x: i32, y: i32| -> i64 {
+        let dx = if x < r.x {
+            r.x - x
+        } else if x >= r.x + r.width {
+            x - (r.x + r.width - 1)
+        } else {
+            0
+        };
+        let dy = if y < r.y {
+            r.y - y
+        } else if y >= r.y + r.height {
+            y - (r.y + r.height - 1)
+        } else {
+            0
+        };
+        ((dx * dx + dy * dy) as f64).sqrt().round() as i64
+    };
+
+    const MAX_DISTANCE: i64 = 40;
+
+    let mut best_word_match: Option<(&RecognizedWord, &RecognizedLine, i64)> = None;
+    let mut best_line_match: Option<(&RecognizedLine, i64)> = None;
+
+    for block in blocks {
+        for line in &block.lines {
+            let l_dist = dist_to_rect(&line.rect, px, py);
+            if l_dist <= MAX_DISTANCE {
+                if let Some((_, best_d)) = best_line_match {
+                    if l_dist < best_d {
+                        best_line_match = Some((line, l_dist));
+                    }
+                } else {
+                    best_line_match = Some((line, l_dist));
+                }
+            }
+
+            for word in &line.words {
+                let w_dist = dist_to_rect(&word.rect, px, py);
+                if w_dist <= MAX_DISTANCE {
+                    if let Some((_, _, best_d)) = best_word_match {
+                        if w_dist < best_d {
+                            best_word_match = Some((word, line, w_dist));
+                        }
+                    } else {
+                        best_word_match = Some((word, line, w_dist));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((word, line, _)) = best_word_match {
+        let w_text = word.text.trim();
+        let s_text = line.text.trim();
+        Some(TextUnderCursor {
+            word_text: if !w_text.is_empty() {
+                Some(w_text.to_string())
+            } else {
+                None
+            },
+            word_rect: Some(word.rect),
+            sentence_text: s_text.to_string(),
+            sentence_rect: line.rect,
+        })
+    } else if let Some((line, _)) = best_line_match {
+        let s_text = line.text.trim();
+        if s_text.is_empty() {
+            return None;
+        }
+        Some(TextUnderCursor {
+            word_text: None,
+            word_rect: None,
+            sentence_text: s_text.to_string(),
+            sentence_rect: line.rect,
+        })
+    } else {
+        None
+    }
+}
+
 /// Status of the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -796,5 +891,48 @@ mod tests {
         assert_eq!(OcrMode::from_str_loose("auto"), OcrMode::Auto);
         // Unknown fallback to WinRt with warning
         assert_eq!(OcrMode::from_str_loose("unknown_engine"), OcrMode::WinRt);
+    }
+
+    #[test]
+    fn test_find_text_under_cursor_word_and_sentence() {
+        let block = OcrBlock {
+            text: "Hello world".to_string(),
+            rect: ScreenRect::new(100, 100, 200, 30),
+            lines: vec![RecognizedLine {
+                text: "Hello world".to_string(),
+                rect: ScreenRect::new(100, 100, 200, 30),
+                words: vec![
+                    RecognizedWord {
+                        text: "Hello".to_string(),
+                        rect: ScreenRect::new(100, 100, 90, 30),
+                    },
+                    RecognizedWord {
+                        text: "world".to_string(),
+                        rect: ScreenRect::new(200, 100, 100, 30),
+                    },
+                ],
+            }],
+        };
+        let blocks = vec![block];
+
+        // Cursor inside "Hello"
+        let target1 = find_text_under_cursor(&blocks, 120, 115).expect("Target must be found");
+        assert_eq!(target1.word_text.as_deref(), Some("Hello"));
+        assert_eq!(target1.sentence_text, "Hello world");
+        assert_eq!(target1.word_rect, Some(ScreenRect::new(100, 100, 90, 30)));
+        assert_eq!(target1.sentence_rect, ScreenRect::new(100, 100, 200, 30));
+
+        // Cursor inside "world"
+        let target2 = find_text_under_cursor(&blocks, 250, 115).expect("Target must be found");
+        assert_eq!(target2.word_text.as_deref(), Some("world"));
+        assert_eq!(target2.sentence_text, "Hello world");
+
+        // Cursor in margin (near line/words within 40px)
+        let target_near = find_text_under_cursor(&blocks, 100, 90).expect("Near target must be found");
+        assert_eq!(target_near.word_text.as_deref(), Some("Hello"));
+
+        // Cursor far outside
+        let target_miss = find_text_under_cursor(&blocks, 500, 500);
+        assert!(target_miss.is_none());
     }
 }
