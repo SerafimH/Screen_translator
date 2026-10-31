@@ -86,7 +86,8 @@ impl App {
             OverlayManager::spawn().map_err(|e| format!("Failed to spawn overlay: {:?}", e))?;
 
         let ocr = Arc::new(
-            WinrtOcrEngine::new().map_err(|e| format!("Failed to init OCR engine: {}", e))?,
+            WinrtOcrEngine::new(&config.ocr_lang)
+                .map_err(|e| format!("Failed to init OCR engine: {}", e))?,
         );
         let config_arc = Arc::new(Mutex::new(config.clone()));
         let helper_ocr = OcrHelperClient::new(config_arc.clone());

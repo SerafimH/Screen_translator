@@ -127,6 +127,32 @@ fn match_find_at(source: &str, start_idx: usize, find_lower: &str) -> Option<usi
             lower_buf.push(lc);
         }
         if lower_buf == find_lower {
+            // Check word boundaries for terms starting/ending with alphanumeric characters
+            let find_first_alpha = find_lower
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphanumeric());
+            if find_first_alpha && start_idx > 0 {
+                if let Some(prev_ch) = source[..start_idx].chars().next_back() {
+                    if prev_ch.is_alphanumeric() {
+                        return None;
+                    }
+                }
+            }
+
+            let match_end = start_idx + offset + ch.len_utf8();
+            let find_last_alpha = find_lower
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_alphanumeric());
+            if find_last_alpha && match_end < source.len() {
+                if let Some(next_ch) = source[match_end..].chars().next() {
+                    if next_ch.is_alphanumeric() {
+                        return None;
+                    }
+                }
+            }
+
             return Some(offset + ch.len_utf8());
         }
         if lower_buf.len() >= find_lower.len() {
@@ -372,9 +398,8 @@ pub fn clean_ocr_noise(text: &str) -> String {
             false
         };
 
-        if ch == '0' && (prev_alpha || next_alpha) {
-            let is_upper = (prev_alpha && chars[i - 1].is_uppercase())
-                || (next_alpha && chars[i + 1].is_uppercase());
+        if ch == '0' && prev_alpha && next_alpha {
+            let is_upper = chars[i - 1].is_uppercase() || chars[i + 1].is_uppercase();
             out_chars.push(if is_upper { 'O' } else { 'o' });
         } else if ch == '|' && (prev_alpha || next_alpha || i == 0) {
             out_chars.push('I');
@@ -1474,6 +1499,9 @@ mod tests {
 
         let lower_errors = "c0me p1ayer";
         assert_eq!(clean_ocr_noise(lower_errors), "come player");
+
+        // Game stats: digits next to letters must NOT convert '0' into 'O'/'o'
+        assert_eq!(clean_ocr_noise("100HP 50G 10s 50m"), "100HP 50G 10s 50m");
     }
 
     #[test]
@@ -1639,8 +1667,8 @@ mod tests {
     #[test]
     fn bug_6_regex_simple_replace_utf8_safety() {
         // German capital sharp S "ẞ" (3 bytes) becomes lowercase "ß" (2 bytes)
-        let res = regex_simple_replace("ẞAB", "AB", "CD");
-        assert_eq!(res.unwrap(), "ẞCD");
+        let res = regex_simple_replace("ẞ AB", "AB", "CD");
+        assert_eq!(res.unwrap(), "ẞ CD");
 
         // Turkish "İ" (2 bytes in UTF-8, lowercase 'i' is 1 byte)
         let res2 = regex_simple_replace("İ test", "test", "passed");
@@ -1652,6 +1680,24 @@ mod tests {
 
         let res4 = regex_simple_replace("ゲーム OVER", "over", "終了");
         assert_eq!(res4.unwrap(), "ゲーム 終了");
+
+        // Word boundary checks: substring inside unrelated word must NOT match
+        assert_eq!(
+            regex_simple_replace("Champion Simple Defeat Default Silver", "MP", "XX").unwrap(),
+            "Champion Simple Defeat Default Silver"
+        );
+        assert_eq!(
+            regex_simple_replace("Champion Simple Defeat Default Silver", "DEF", "ЗАЩ").unwrap(),
+            "Champion Simple Defeat Default Silver"
+        );
+        assert_eq!(
+            regex_simple_replace("Champion Simple Defeat Default Silver", "Lv", "Ур.").unwrap(),
+            "Champion Simple Defeat Default Silver"
+        );
+        assert_eq!(
+            regex_simple_replace("100 MP and Simple 50 mp!", "mp", "Мана").unwrap(),
+            "100 Мана and Simple 50 Мана!"
+        );
 
         // Edge cases: empty strings, repeated matches, case insensitive
         assert_eq!(regex_simple_replace("", "test", "replacement").unwrap(), "");

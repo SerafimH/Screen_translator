@@ -79,7 +79,7 @@ pub fn score_recognized_lines(lines: &[RecognizedLine]) -> usize {
 }
 
 impl WinrtOcrEngine {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(target_lang: &str) -> Result<Self, String> {
         if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
             && let Ok(size) = langs.Size()
             && size == 0
@@ -90,8 +90,33 @@ impl WinrtOcrEngine {
             );
         }
 
-        let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-            .map_err(|e| format!("Failed to create WinRT OcrEngine: {:?}", e))?;
+        let mut matched_lang = None;
+        let target_lower = target_lang.trim().to_lowercase();
+        if !target_lower.is_empty() {
+            if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
+                && let Ok(size) = langs.Size()
+            {
+                for i in 0..size {
+                    if let Ok(lang) = langs.GetAt(i)
+                        && let Ok(tag) = lang.LanguageTag()
+                    {
+                        let tag_str = tag.to_string().to_lowercase();
+                        if tag_str == target_lower || tag_str.starts_with(&target_lower) {
+                            matched_lang = Some(lang);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let engine = if let Some(lang) = matched_lang {
+            OcrEngine::TryCreateFromLanguage(&lang)
+                .map_err(|e| format!("Failed to create WinRT OcrEngine for '{}': {:?}", target_lang, e))?
+        } else {
+            OcrEngine::TryCreateFromUserProfileLanguages()
+                .map_err(|e| format!("Failed to create WinRT OcrEngine: {:?}", e))?
+        };
         let lang = engine
             .RecognizerLanguage()
             .map_err(|e| format!("Failed to get RecognizerLanguage: {:?}", e))?
@@ -201,7 +226,7 @@ impl WinrtOcrEngine {
         let mut best_score = first_score;
 
         // If first pass found quality text, do not waste time on extra passes
-        if best_score < 12 {
+        if best_score < 25 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
 
             // Pass 2: Outlined text mask (meme font filter)
@@ -455,10 +480,37 @@ pub fn clean_manga_bubble_background(buf: &mut [u8], width: u32, height: u32) {
 
     let w = width as usize;
     let h = height as usize;
-    let mut visited = vec![false; w * h];
-    let mut queue = VecDeque::new();
 
     let get_luma = |b: &[u8], idx: usize| -> u8 { luma_from_bgr(b[idx], b[idx + 1], b[idx + 2]) };
+
+    // Check perimeter brightness: only manga speech bubbles on bright backgrounds should be cleaned.
+    // Dark game screens or dark UI boxes must never be flooded with white.
+    let mut light_border_count = 0usize;
+    let total_border = 2 * w + 2 * (h.saturating_sub(2));
+
+    for x in 0..w {
+        if get_luma(buf, x * 4) > 205 {
+            light_border_count += 1;
+        }
+        if get_luma(buf, ((h - 1) * w + x) * 4) > 205 {
+            light_border_count += 1;
+        }
+    }
+    for y in 1..h - 1 {
+        if get_luma(buf, (y * w) * 4) > 205 {
+            light_border_count += 1;
+        }
+        if get_luma(buf, (y * w + w - 1) * 4) > 205 {
+            light_border_count += 1;
+        }
+    }
+
+    if light_border_count * 2 < total_border {
+        return;
+    }
+
+    let mut visited = vec![false; w * h];
+    let mut queue = VecDeque::new();
 
     // Initialize BFS with boundary pixels having Luma <= 205 (frame spikes and speedlines)
     for x in 0..w {
@@ -667,6 +719,41 @@ pub fn has_border_between(
         luma_from_bgr(bgra[idx], bgra[idx + 1], bgra[idx + 2])
     };
 
+    let sample_bg = |r: &ScreenRect| -> f32 {
+        let xs = [r.x, r.x + r.width / 2, (r.x + r.width - 1).max(r.x)];
+        let ys = [r.y, r.y + r.height / 2, (r.y + r.height - 1).max(r.y)];
+        let mut sum = 0u32;
+        let mut count = 0u32;
+        for &y in &ys {
+            for &x in &xs {
+                sum += get_luma(x, y) as u32;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            sum as f32 / count as f32
+        } else {
+            255.0
+        }
+    };
+
+    let bg1 = sample_bg(r1);
+    let bg2 = sample_bg(r2);
+
+    if (bg1 - bg2).abs() > 60.0 {
+        return true;
+    }
+
+    let bg_luma = (bg1 + bg2) / 2.0;
+
+    let is_separator = |l: u8| -> bool {
+        if bg_luma >= 150.0 {
+            (bg_luma - l as f32) >= 50.0 && l < 120
+        } else {
+            (l as f32 - bg_luma) >= 50.0 && l > 150
+        }
+    };
+
     // Horizontal check
     if r1.x + r1.width <= r2.x || r2.x + r2.width <= r1.x {
         let (left, right) = if r1.x < r2.x { (r1, r2) } else { (r2, r1) };
@@ -676,17 +763,17 @@ pub fn has_border_between(
         let y_end = (left.y + left.height).min(right.y + right.height);
 
         if x_end > x_start && y_end > y_start {
-            let mut dark_count = 0;
+            let mut sep_count = 0;
             let mut total = 0;
             for y in y_start..y_end {
                 for x in x_start..x_end {
-                    if get_luma(x, y) < 120 {
-                        dark_count += 1;
+                    if is_separator(get_luma(x, y)) {
+                        sep_count += 1;
                     }
                     total += 1;
                 }
             }
-            if total > 0 && (dark_count as f32 / total as f32) >= 0.15 {
+            if total > 0 && (sep_count as f32 / total as f32) >= 0.15 {
                 return true;
             }
         }
@@ -701,17 +788,17 @@ pub fn has_border_between(
         let x_end = (top.x + top.width).min(bottom.x + bottom.width);
 
         if y_end > y_start && x_end > x_start {
-            let mut dark_count = 0;
+            let mut sep_count = 0;
             let mut total = 0;
             for y in y_start..y_end {
                 for x in x_start..x_end {
-                    if get_luma(x, y) < 120 {
-                        dark_count += 1;
+                    if is_separator(get_luma(x, y)) {
+                        sep_count += 1;
                     }
                     total += 1;
                 }
             }
-            if total > 0 && (dark_count as f32 / total as f32) >= 0.15 {
+            if total > 0 && (sep_count as f32 / total as f32) >= 0.15 {
                 return true;
             }
         }
@@ -944,6 +1031,24 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_manga_bubble_background_skips_dark_screen() {
+        let w = 20;
+        let h = 20;
+        let mut buf = vec![30u8; (w * h * 4) as usize];
+        // Put white dialogue text in the center
+        let text_idx = ((10 * w + 10) * 4) as usize;
+        buf[text_idx] = 255;
+        buf[text_idx + 1] = 255;
+        buf[text_idx + 2] = 255;
+
+        clean_manga_bubble_background(&mut buf, w as u32, h as u32);
+
+        // Dark background should remain untouched (not turned white 255)
+        assert_eq!(buf[0], 30);
+        assert_eq!(buf[text_idx], 255);
+    }
+
+    #[test]
     fn test_has_border_between_detects_dark_boundary() {
         let w = 100;
         let h = 50;
@@ -980,6 +1085,24 @@ mod tests {
         let border_detected =
             has_border_between(&bgra, w as u32, h as u32, &bubble_left, &bubble_right);
         assert!(!border_detected);
+    }
+
+    #[test]
+    fn test_has_border_between_dark_background_no_false_positive() {
+        let w = 100;
+        let h = 50;
+        // Dark background (e.g. dark RPG dialogue box or night scene)
+        let bgra = vec![30u8; (w * h * 4) as usize];
+
+        let line_top = ScreenRect::new(10, 5, 80, 15);
+        let line_bottom = ScreenRect::new(10, 25, 80, 15);
+
+        let border_detected =
+            has_border_between(&bgra, w as u32, h as u32, &line_top, &line_bottom);
+        assert!(
+            !border_detected,
+            "Dialogue lines on dark background should NOT be treated as separated by panel border"
+        );
     }
 
     #[test]
@@ -1035,7 +1158,7 @@ mod tests {
             offset_y: 0,
         };
 
-        let engine = WinrtOcrEngine::new().expect("Failed to initialize WinrtOcrEngine");
+        let engine = WinrtOcrEngine::new("en").expect("Failed to initialize WinrtOcrEngine");
         let blocks = engine
             .recognize(&frame)
             .await
@@ -1145,7 +1268,7 @@ mod tests {
             offset_y: 0,
         };
 
-        let engine = WinrtOcrEngine::new().unwrap();
+        let engine = WinrtOcrEngine::new("en").unwrap();
         let blocks = engine.recognize(&frame).await.unwrap();
         println!("Full screen blocks: {}", blocks.len());
         for b in &blocks {
