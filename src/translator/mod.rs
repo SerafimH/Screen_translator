@@ -410,9 +410,8 @@ pub fn clean_ocr_noise(text: &str) -> String {
         };
 
         if ch == '0' && is_letter_o {
-            let pi = prev_non_zero.unwrap();
             let ni = next_non_zero.unwrap();
-            let is_upper = chars[pi].is_uppercase() || chars[ni].is_uppercase();
+            let is_upper = chars[ni].is_uppercase();
             out_chars.push(if is_upper { 'O' } else { 'o' });
         } else if ch == '|' && (prev_alpha || next_alpha || i == 0) {
             out_chars.push('I');
@@ -707,6 +706,24 @@ pub fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Resolves the vision model name for OpenAI/Groq compatible providers with intelligent defaults.
+pub fn resolve_openai_vision_model<'a>(
+    explicit_model: Option<&'a str>,
+    base_url: &str,
+    text_model: &'a str,
+) -> &'a str {
+    if let Some(explicit) = explicit_model {
+        return explicit;
+    }
+    if base_url.contains("groq.com") && !text_model.contains("vision") {
+        "llama-3.2-11b-vision-preview"
+    } else if base_url.contains("openai.com") && !text_model.contains("gpt-4") {
+        "gpt-4o-mini"
+    } else {
+        text_model
+    }
 }
 
 #[derive(Clone)]
@@ -1036,19 +1053,11 @@ impl TranslatorService {
             frame.height as i32,
         );
 
-        let openai_vision_model = config.openai_vision_model.as_deref().unwrap_or_else(|| {
-            if config.openai_base_url.contains("groq.com")
-                && !config.openai_model.contains("vision")
-            {
-                "llama-3.2-11b-vision-preview"
-            } else if config.openai_base_url.contains("openai.com")
-                && !config.openai_model.contains("gpt-4")
-            {
-                "gpt-4o-mini"
-            } else {
-                &config.openai_model
-            }
-        });
+        let openai_vision_model = resolve_openai_vision_model(
+            config.openai_vision_model.as_deref(),
+            &config.openai_base_url,
+            &config.openai_model,
+        );
 
         if config.provider == TranslationProvider::Gemini
             && let Some(key) = &config.gemini_api_key
@@ -1592,6 +1601,10 @@ mod tests {
         assert_eq!(clean_ocr_noise("B00M!"), "BOOM!");
         assert_eq!(clean_ocr_noise("f00l"), "fool");
         assert_eq!(clean_ocr_noise("S00N"), "SOON");
+
+        // Title-case words with scanned zeros must become lowercase inside
+        assert_eq!(clean_ocr_noise("S00n"), "Soon");
+        assert_eq!(clean_ocr_noise("C0me"), "Come");
     }
 
     #[test]
@@ -1876,6 +1889,46 @@ mod tests {
         assert_eq!(
             urlencode("1 + 1 = 2 & ok?"),
             "1%20%2B%201%20%3D%202%20%26%20ok%3F"
+        );
+    }
+
+    #[test]
+    fn test_resolve_openai_vision_model() {
+        assert_eq!(
+            resolve_openai_vision_model(
+                Some("custom-vision-v1"),
+                "https://api.groq.com/openai/v1",
+                "llama-text"
+            ),
+            "custom-vision-v1"
+        );
+        assert_eq!(
+            resolve_openai_vision_model(
+                None,
+                "https://api.groq.com/openai/v1",
+                "meta-llama/llama-4-scout-17b-16e-instruct"
+            ),
+            "llama-3.2-11b-vision-preview"
+        );
+        assert_eq!(
+            resolve_openai_vision_model(
+                None,
+                "https://api.groq.com/openai/v1",
+                "llama-3.2-90b-vision-preview"
+            ),
+            "llama-3.2-90b-vision-preview"
+        );
+        assert_eq!(
+            resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-3.5-turbo"),
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-4o"),
+            "gpt-4o"
+        );
+        assert_eq!(
+            resolve_openai_vision_model(None, "http://localhost:11434/v1", "llava:latest"),
+            "llava:latest"
         );
     }
 }
