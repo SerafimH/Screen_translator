@@ -35,7 +35,6 @@ impl ContextManager {
         mgr.add_glossary_term("MP", "MP", Some("Mana points".to_string()));
         mgr.add_glossary_term("EXP", "Опыт", Some("Experience points".to_string()));
         mgr.add_glossary_term("Lv", "Ур.", Some("Level".to_string()));
-        mgr.add_glossary_term("LV", "Ур.", Some("Level".to_string()));
         mgr.add_glossary_term("ATK", "АТК", Some("Attack power".to_string()));
         mgr.add_glossary_term("DEF", "ЗАЩ", Some("Defense power".to_string()));
         mgr.add_glossary_term("NPC", "NPC", Some("Non-player character".to_string()));
@@ -74,12 +73,14 @@ impl ContextManager {
     pub fn postprocess(&self, translated: &str) -> String {
         let g = self.glossary.lock().unwrap_or_else(|e| e.into_inner());
         let mut result = translated.to_string();
+        let mut lower_result = result.to_lowercase();
 
         for (lower_key, entry) in g.iter() {
-            if result.to_lowercase().contains(lower_key)
+            if lower_result.contains(lower_key)
                 && let Ok(re) = regex_simple_replace(&result, &entry.original, &entry.replacement)
             {
                 result = re;
+                lower_result = result.to_lowercase();
             }
         }
 
@@ -398,8 +399,20 @@ pub fn clean_ocr_noise(text: &str) -> String {
             false
         };
 
-        if ch == '0' && prev_alpha && next_alpha {
-            let is_upper = chars[i - 1].is_uppercase() || chars[i + 1].is_uppercase();
+        let prev_non_zero = chars[..i].iter().rposition(|&c| c != '0');
+        let next_non_zero = chars[i + 1..]
+            .iter()
+            .position(|&c| c != '0')
+            .map(|p| i + 1 + p);
+        let is_letter_o = match (prev_non_zero, next_non_zero) {
+            (Some(pi), Some(ni)) => chars[pi].is_alphabetic() && chars[ni].is_alphabetic(),
+            _ => false,
+        };
+
+        if ch == '0' && is_letter_o {
+            let pi = prev_non_zero.unwrap();
+            let ni = next_non_zero.unwrap();
+            let is_upper = chars[pi].is_uppercase() || chars[ni].is_uppercase();
             out_chars.push(if is_upper { 'O' } else { 'o' });
         } else if ch == '|' && (prev_alpha || next_alpha || i == 0) {
             out_chars.push('I');
@@ -499,9 +512,7 @@ pub fn clean_russian_punctuation(text: &str) -> String {
         (" ;", ";"),
     ];
     for (bad, good) in bad_pairs {
-        while s.contains(bad) {
-            s = s.replace(bad, good);
-        }
+        s = s.replace(bad, good);
     }
 
     let mut out = String::new();
@@ -670,6 +681,34 @@ pub fn bgra_to_png(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
     Ok(png_bytes)
 }
 
+/// Normalizes target language code for DeepL API (e.g. deprecated "EN" -> "EN-US").
+pub fn deepl_target_lang(target_lang: &str) -> String {
+    let upper = target_lang.to_uppercase();
+    if upper == "EN" {
+        "EN-US".to_string()
+    } else if upper == "PT" {
+        "PT-PT".to_string()
+    } else {
+        upper
+    }
+}
+
+/// Percent-encodes a string for safe inclusion in URL query components (RFC 3986).
+pub fn urlencode(s: &str) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX_CHARS[(b >> 4) as usize] as char);
+            out.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct TranslatorService {
     client: reqwest::Client,
@@ -685,6 +724,10 @@ impl Default for TranslatorService {
 
 impl TranslatorService {
     pub fn new() -> Self {
+        Self::with_history_size(20)
+    }
+
+    pub fn with_history_size(max_history: usize) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .timeout(std::time::Duration::from_millis(6000))
@@ -693,7 +736,7 @@ impl TranslatorService {
 
         Self {
             client,
-            context: Arc::new(ContextManager::new(20)),
+            context: Arc::new(ContextManager::new(max_history)),
             cache: Arc::new(TranslationCache::new(500)),
         }
     }
@@ -735,7 +778,8 @@ impl TranslatorService {
             }
             TranslationProvider::Gemini => {
                 if let Some(key) = &config.gemini_api_key {
-                    self.translate_gemini(clean, source_lang, target_lang, key)
+                    let ctx = self.context.format_history_context();
+                    self.translate_gemini(clean, source_lang, target_lang, key, &ctx)
                         .await
                 } else {
                     warn!("Gemini API key not provided, falling back to Google");
@@ -744,6 +788,7 @@ impl TranslatorService {
             }
             TranslationProvider::OpenAICompatible => {
                 if let Some(key) = &config.openai_api_key {
+                    let ctx = self.context.format_history_context();
                     self.translate_openai(
                         clean,
                         source_lang,
@@ -751,6 +796,7 @@ impl TranslatorService {
                         &config.openai_base_url,
                         key,
                         &config.openai_model,
+                        &ctx,
                     )
                     .await
                 } else {
@@ -769,9 +815,9 @@ impl TranslatorService {
     ) -> Result<String, String> {
         let url = format!(
             "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dj=1&q={}",
-            source_lang,
-            target_lang,
-            urlencoding::encode(text)
+            urlencode(source_lang),
+            urlencode(target_lang),
+            urlencode(text)
         );
 
         let resp = self
@@ -818,7 +864,7 @@ impl TranslatorService {
 
         let mut body = serde_json::json!({
             "text": [text],
-            "target_lang": target_lang.to_uppercase(),
+            "target_lang": deepl_target_lang(target_lang),
         });
 
         if !source_lang.is_empty() && source_lang != "auto" {
@@ -865,17 +911,22 @@ impl TranslatorService {
         source_lang: &str,
         target_lang: &str,
         api_key: &str,
+        context: &str,
     ) -> Result<String, String> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             GEMINI_MODEL, api_key
         );
 
-        let system_instruction = format!(
+        let mut system_instruction = format!(
             "You are an expert game, manga, and visual novel translator. Translate the text from {} to {}. \
             Preserve emotion, tone, and slang. Output ONLY the translated text without explanations or quotes.",
             source_lang, target_lang
         );
+        if !context.is_empty() {
+            system_instruction.push_str("\nRecent dialogue context for reference:\n");
+            system_instruction.push_str(context);
+        }
 
         let body = serde_json::json!({
             "contents": [{
@@ -922,13 +973,18 @@ impl TranslatorService {
         base_url: &str,
         api_key: &str,
         model: &str,
+        context: &str,
     ) -> Result<String, String> {
         let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        let system_prompt = format!(
+        let mut system_prompt = format!(
             "You are an expert game and manga translator. Translate from {} to {}. Output ONLY translation.",
             source_lang, target_lang
         );
+        if !context.is_empty() {
+            system_prompt.push_str("\nRecent dialogue context for reference:\n");
+            system_prompt.push_str(context);
+        }
 
         let body = serde_json::json!({
             "model": model,
@@ -942,6 +998,7 @@ impl TranslatorService {
         let resp = self
             .client
             .post(&endpoint)
+            .timeout(std::time::Duration::from_secs(15))
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -979,31 +1036,55 @@ impl TranslatorService {
             frame.height as i32,
         );
 
-        match config.provider {
-            TranslationProvider::Gemini => {
-                let Some(key) = &config.gemini_api_key else {
-                    return Err("Gemini API key is required for Vision OCR".to_string());
-                };
-                self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi)
-                    .await
+        let openai_vision_model = config.openai_vision_model.as_deref().unwrap_or_else(|| {
+            if config.openai_base_url.contains("groq.com")
+                && !config.openai_model.contains("vision")
+            {
+                "llama-3.2-11b-vision-preview"
+            } else if config.openai_base_url.contains("openai.com")
+                && !config.openai_model.contains("gpt-4")
+            {
+                "gpt-4o-mini"
+            } else {
+                &config.openai_model
             }
-            TranslationProvider::OpenAICompatible => {
-                let Some(key) = &config.openai_api_key else {
-                    return Err("OpenAI/Groq API key is required for Vision OCR".to_string());
-                };
-                self.translate_openai_vision(
-                    &png_bytes,
-                    &config.target_lang,
-                    &config.openai_base_url,
-                    key,
-                    &config.openai_model,
-                    &roi,
-                )
+        });
+
+        if config.provider == TranslationProvider::Gemini
+            && let Some(key) = &config.gemini_api_key
+        {
+            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi)
                 .await
-            }
-            _ => Err(
-                "Direct vision translation is supported on Gemini and OpenAI providers".to_string(),
-            ),
+        } else if config.provider == TranslationProvider::OpenAICompatible
+            && let Some(key) = &config.openai_api_key
+        {
+            self.translate_openai_vision(
+                &png_bytes,
+                &config.target_lang,
+                &config.openai_base_url,
+                key,
+                openai_vision_model,
+                &roi,
+            )
+            .await
+        } else if let Some(key) = &config.gemini_api_key {
+            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi)
+                .await
+        } else if let Some(key) = &config.openai_api_key {
+            self.translate_openai_vision(
+                &png_bytes,
+                &config.target_lang,
+                &config.openai_base_url,
+                key,
+                openai_vision_model,
+                &roi,
+            )
+            .await
+        } else {
+            Err(
+                "Vision OCR fallback requires a configured Gemini or OpenAI/Groq API key"
+                    .to_string(),
+            )
         }
     }
 
@@ -1047,6 +1128,7 @@ impl TranslatorService {
         let resp = self
             .client
             .post(&url)
+            .timeout(std::time::Duration::from_secs(15))
             .json(&body)
             .send()
             .await
@@ -1113,6 +1195,7 @@ impl TranslatorService {
         let resp = self
             .client
             .post(&endpoint)
+            .timeout(std::time::Duration::from_secs(15))
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -1243,15 +1326,14 @@ impl TranslatorService {
     ) -> Result<WordDetails, String> {
         let url = format!(
             "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dt=bd&dt=ex&dt=md&dj=1&q={}",
-            source_lang,
-            target_lang,
-            urlencoding::encode(word)
+            urlencode(source_lang),
+            urlencode(target_lang),
+            urlencode(word)
         );
 
         let resp = self
             .client
             .get(&url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
@@ -1437,6 +1519,7 @@ impl TranslatorService {
 
         // 3. Fallback: parallel per-block translation
         let mut join_set = tokio::task::JoinSet::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
 
         for (idx, block) in blocks.iter().enumerate() {
             let this = self.clone();
@@ -1444,8 +1527,10 @@ impl TranslatorService {
             let clean_text = cleaned_texts[idx].clone();
             let rect = block.rect;
             let cfg = config.clone();
+            let sem = semaphore.clone();
 
             join_set.spawn(async move {
+                let _permit = sem.acquire().await.ok();
                 let res = this
                     .translate_text(&clean_text, &cfg.source_lang, &cfg.target_lang, &cfg)
                     .await;
@@ -1502,6 +1587,11 @@ mod tests {
 
         // Game stats: digits next to letters must NOT convert '0' into 'O'/'o'
         assert_eq!(clean_ocr_noise("100HP 50G 10s 50m"), "100HP 50G 10s 50m");
+
+        // Consecutive zeros in words must convert to 'O'/'o'
+        assert_eq!(clean_ocr_noise("B00M!"), "BOOM!");
+        assert_eq!(clean_ocr_noise("f00l"), "fool");
+        assert_eq!(clean_ocr_noise("S00N"), "SOON");
     }
 
     #[test]
@@ -1764,5 +1854,28 @@ mod tests {
             "let me see now, \"yes\" & <ok>"
         );
         assert_eq!(strip_html_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_deepl_target_lang_normalization() {
+        assert_eq!(deepl_target_lang("en"), "EN-US");
+        assert_eq!(deepl_target_lang("EN"), "EN-US");
+        assert_eq!(deepl_target_lang("en-gb"), "EN-GB");
+        assert_eq!(deepl_target_lang("pt"), "PT-PT");
+        assert_eq!(deepl_target_lang("PT"), "PT-PT");
+        assert_eq!(deepl_target_lang("pt-br"), "PT-BR");
+        assert_eq!(deepl_target_lang("ru"), "RU");
+        assert_eq!(deepl_target_lang("JA"), "JA");
+    }
+
+    #[test]
+    fn test_urlencode() {
+        assert_eq!(urlencode("hello world"), "hello%20world");
+        assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(urlencode("Привет"), "%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82");
+        assert_eq!(
+            urlencode("1 + 1 = 2 & ok?"),
+            "1%20%2B%201%20%3D%202%20%26%20ok%3F"
+        );
     }
 }

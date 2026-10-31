@@ -272,13 +272,18 @@ pub struct OverlayManager;
 impl OverlayManager {
     /// Launches the Win32 transparent overlay window on a dedicated message pump thread.
     /// Closes any previous instance window and applies WS_EX_LAYERED + WDA_EXCLUDEFROMCAPTURE.
-    pub fn spawn() -> Result<(OverlayHandle, UnboundedReceiver<AppEvent>)> {
+    pub fn spawn(
+        config: &crate::types::AppConfig,
+    ) -> Result<(OverlayHandle, UnboundedReceiver<AppEvent>)> {
         let (event_tx, event_rx) = unbounded_channel();
         let (init_tx, init_rx) =
             std::sync::mpsc::channel::<std::result::Result<isize, windows::core::Error>>();
 
         let shared_state = Arc::new(Mutex::new(OverlaySharedState::default()));
         let shared_for_thread = shared_state.clone();
+        let font_family = config.font_family.clone();
+        let font_size = config.font_size as f32;
+        let bg_alpha = config.overlay_bg_alpha as f32 / 255.0;
 
         std::thread::spawn(move || {
             unsafe {
@@ -404,14 +409,21 @@ impl OverlayManager {
                     s.status_msg = Some(msg);
                 }
 
-                let renderer =
-                    match OverlayRenderer::new(virtual_x, virtual_y, virtual_w, virtual_h) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let _ = init_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                let renderer = match OverlayRenderer::new(
+                    virtual_x,
+                    virtual_y,
+                    virtual_w,
+                    virtual_h,
+                    &font_family,
+                    font_size,
+                    bg_alpha,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
 
                 *HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(event_tx.clone());
                 let keyboard_hook = match SetWindowsHookExW(
@@ -772,7 +784,8 @@ mod tests {
     #[cfg(windows)]
     fn bug_7_wm_close_destroys_window_and_frees_state_once() {
         // Spawn overlay window thread
-        let (overlay, _rx) = OverlayManager::spawn().expect("Failed to spawn overlay");
+        let (overlay, _rx) = OverlayManager::spawn(&crate::types::AppConfig::default())
+            .expect("Failed to spawn overlay");
         assert!(!overlay.hwnd.0.is_null(), "Overlay HWND must be valid");
 
         // Send WM_CLOSE to window.

@@ -62,6 +62,7 @@ vision_fallback = false
 # openai_api_key = "gsk_..."
 openai_base_url = "https://api.groq.com/openai/v1"
 openai_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+# openai_vision_model = "llama-3.2-11b-vision-preview"
 
 # ------------------------------------------------------------------------------
 # Настройки интерфейса и авто-режима

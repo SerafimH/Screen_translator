@@ -77,6 +77,35 @@ impl Drop for BitmapGuard {
     }
 }
 
+pub struct D2dDrawGuard<'a> {
+    rt: &'a ID2D1DCRenderTarget,
+    active: bool,
+}
+
+impl<'a> D2dDrawGuard<'a> {
+    pub fn new(rt: &'a ID2D1DCRenderTarget) -> Self {
+        unsafe {
+            rt.BeginDraw();
+        }
+        Self { rt, active: true }
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.active = false;
+        unsafe { self.rt.EndDraw(None, None) }
+    }
+}
+
+impl<'a> Drop for D2dDrawGuard<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = self.rt.EndDraw(None, None);
+            }
+        }
+    }
+}
+
 pub struct OverlayRenderer {
     origin_x: i32,
     origin_y: i32,
@@ -84,6 +113,7 @@ pub struct OverlayRenderer {
     height: i32,
     hdc_mem: HDC,
     hbitmap: HGDIOBJ,
+    old_bitmap: HGDIOBJ,
     _bits_ptr: *mut c_void,
     dc_rt: ID2D1DCRenderTarget,
     dwrite_factory: IDWriteFactory,
@@ -103,7 +133,15 @@ pub struct OverlayRenderer {
 }
 
 impl OverlayRenderer {
-    pub fn new(origin_x: i32, origin_y: i32, width: i32, height: i32) -> Result<Self> {
+    pub fn new(
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+        font_family: &str,
+        font_size: f32,
+        overlay_bg_alpha: f32,
+    ) -> Result<Self> {
         unsafe {
             // 1. Create 32-bit ARGB DIB Section and memory DC.
             //    hdc_screen, hdc_mem and hbitmap are protected by RAII guards so they are
@@ -144,7 +182,7 @@ impl OverlayRenderer {
             )?;
             let mut bitmap_guard = BitmapGuard(hbitmap.into());
 
-            SelectObject(hdc_mem_raw, bitmap_guard.0);
+            let old_bitmap = SelectObject(hdc_mem_raw, bitmap_guard.0);
             // hdc_screen can now be released early, before Direct2D initialization.
             drop(_screen_guard);
 
@@ -171,13 +209,21 @@ impl OverlayRenderer {
             let dc_rt = d2d_factory.CreateDCRenderTarget(&rt_props)?;
 
             // 4. Create Text Formats
+            let family_wide: Vec<u16> = font_family
+                .encode_utf16()
+                .chain(core::iter::once(0))
+                .collect();
+            let family_pcwstr = windows::core::PCWSTR(family_wide.as_ptr());
+            let card_font_size = font_size.max(8.0);
+            let hud_font_size = (card_font_size * 0.8).max(10.0);
+
             let text_format_card = dwrite_factory.CreateTextFormat(
-                w!("Segoe UI"),
+                family_pcwstr,
                 None,
                 DWRITE_FONT_WEIGHT_SEMI_BOLD,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                15.5,
+                card_font_size,
                 w!("ru-ru"),
             )?;
             let _ = text_format_card.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
@@ -185,22 +231,23 @@ impl OverlayRenderer {
             let _ = text_format_card.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 
             let text_format_hud = dwrite_factory.CreateTextFormat(
-                w!("Segoe UI"),
+                family_pcwstr,
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                12.5,
+                hud_font_size,
                 w!("ru-ru"),
             )?;
 
             // 5. Create Solid Brushes
+            let bg_alpha = overlay_bg_alpha.clamp(0.05, 1.0);
             let brush_card_bg = dc_rt.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: 0.08,
                     g: 0.09,
                     b: 0.13,
-                    a: 0.92,
+                    a: bg_alpha,
                 },
                 None,
             )?;
@@ -228,7 +275,7 @@ impl OverlayRenderer {
                     r: 0.05,
                     g: 0.06,
                     b: 0.09,
-                    a: 0.92,
+                    a: bg_alpha,
                 },
                 None,
             )?;
@@ -309,6 +356,7 @@ impl OverlayRenderer {
                 height,
                 hdc_mem,
                 hbitmap,
+                old_bitmap,
                 _bits_ptr: bits_ptr,
                 dc_rt,
                 dwrite_factory,
@@ -340,7 +388,7 @@ impl OverlayRenderer {
             };
 
             self.dc_rt.BindDC(self.hdc_mem, &bind_rect)?;
-            self.dc_rt.BeginDraw();
+            let draw_guard = D2dDrawGuard::new(&self.dc_rt);
 
             // Clear to transparent premultiplied alpha
             self.dc_rt.Clear(Some(&D2D1_COLOR_F {
@@ -477,7 +525,7 @@ impl OverlayRenderer {
             // 4. Draw HUD status badge
             self.draw_hud(scene)?;
 
-            if let Err(e) = self.dc_rt.EndDraw(None, None) {
+            if let Err(e) = draw_guard.finish() {
                 tracing::error!("Direct2D EndDraw error: {:?}", e);
                 return Err(e);
             }
@@ -528,7 +576,7 @@ impl OverlayRenderer {
 
     fn draw_hud(&self, scene: &RenderScene<'_>) -> Result<()> {
         unsafe {
-            let hud_w = 920.0;
+            let hud_w = (self.width as f32 - 40.0).min(920.0).max(300.0);
             let hud_h = 36.0;
             let hud_x = ((self.width as f32) - hud_w) / 2.0;
             let hud_y = 12.0;
@@ -614,6 +662,7 @@ impl OverlayRenderer {
 impl Drop for OverlayRenderer {
     fn drop(&mut self) {
         unsafe {
+            let _ = SelectObject(self.hdc_mem, self.old_bitmap);
             let _ = DeleteDC(self.hdc_mem);
             let _ = DeleteObject(self.hbitmap);
         }
@@ -655,7 +704,7 @@ mod tests {
     fn bug_3_smoke_overlay_renderer_lifecycle() {
         // Smoke test verifying that OverlayRenderer::new allocates DC and Direct2D resources,
         // and its Drop cleanly releases all GDI/D2D resources without crashing or leaking.
-        let renderer_res = OverlayRenderer::new(0, 0, 200, 150);
+        let renderer_res = OverlayRenderer::new(0, 0, 200, 150, "Segoe UI", 15.5, 0.92);
         assert!(
             renderer_res.is_ok(),
             "OverlayRenderer::new should succeed in desktop environment"

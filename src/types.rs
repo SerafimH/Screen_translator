@@ -9,7 +9,7 @@ use tracing::warn;
 /// Formula: `round(0.299 * R + 0.587 * G + 0.114 * B) as u8`
 #[inline(always)]
 pub fn luma_from_bgr(b: u8, g: u8, r: u8) -> u8 {
-    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as u8
+    ((r as u32 * 19595 + g as u32 * 38470 + b as u32 * 7471 + 32768) >> 16) as u8
 }
 
 /// Represents a 2D integer rectangle on screen coordinates.
@@ -382,6 +382,7 @@ pub struct AppConfig {
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
     pub openai_model: String,
+    pub openai_vision_model: Option<String>,
     pub auto_mode_interval_ms: u64,
     pub font_size: i32,
     pub font_family: String,
@@ -407,6 +408,7 @@ struct AppConfigRaw {
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
     pub openai_model: String,
+    pub openai_vision_model: Option<String>,
     pub auto_mode_interval_ms: u64,
     pub font_size: i32,
     pub font_family: String,
@@ -433,6 +435,7 @@ impl Default for AppConfigRaw {
             openai_api_key: def.openai_api_key,
             openai_base_url: def.openai_base_url,
             openai_model: def.openai_model,
+            openai_vision_model: def.openai_vision_model,
             auto_mode_interval_ms: def.auto_mode_interval_ms,
             font_size: def.font_size,
             font_family: def.font_family,
@@ -473,6 +476,7 @@ impl From<AppConfigRaw> for AppConfig {
             openai_api_key,
             openai_base_url: raw.openai_base_url,
             openai_model: raw.openai_model,
+            openai_vision_model: raw.openai_vision_model,
             auto_mode_interval_ms: raw.auto_mode_interval_ms.max(100),
             font_size: raw.font_size,
             font_family: raw.font_family,
@@ -523,6 +527,7 @@ impl Default for AppConfig {
             openai_api_key: None,
             openai_base_url: "https://api.groq.com/openai/v1".to_string(),
             openai_model: "meta-llama/llama-4-scout-17b-16e-instruct".to_string(),
+            openai_vision_model: None,
             auto_mode_interval_ms: 1200,
             font_size: 16,
             font_family: "Segoe UI".to_string(),
@@ -558,6 +563,7 @@ impl fmt::Debug for AppConfig {
             )
             .field("openai_base_url", &self.openai_base_url)
             .field("openai_model", &self.openai_model)
+            .field("openai_vision_model", &self.openai_vision_model)
             .field("auto_mode_interval_ms", &self.auto_mode_interval_ms)
             .field("font_size", &self.font_size)
             .field("font_family", &self.font_family)
@@ -928,7 +934,8 @@ mod tests {
         assert_eq!(target2.sentence_text, "Hello world");
 
         // Cursor in margin (near line/words within 40px)
-        let target_near = find_text_under_cursor(&blocks, 100, 90).expect("Near target must be found");
+        let target_near =
+            find_text_under_cursor(&blocks, 100, 90).expect("Near target must be found");
         assert_eq!(target_near.word_text.as_deref(), Some("Hello"));
 
         // Cursor far outside

@@ -111,8 +111,12 @@ impl WinrtOcrEngine {
         }
 
         let engine = if let Some(lang) = matched_lang {
-            OcrEngine::TryCreateFromLanguage(&lang)
-                .map_err(|e| format!("Failed to create WinRT OcrEngine for '{}': {:?}", target_lang, e))?
+            OcrEngine::TryCreateFromLanguage(&lang).map_err(|e| {
+                format!(
+                    "Failed to create WinRT OcrEngine for '{}': {:?}",
+                    target_lang, e
+                )
+            })?
         } else {
             OcrEngine::TryCreateFromUserProfileLanguages()
                 .map_err(|e| format!("Failed to create WinRT OcrEngine: {:?}", e))?
@@ -356,7 +360,13 @@ impl WinrtOcrEngine {
         // 2. Cluster recognized lines into coherent paragraphs and speech bubbles
         let blocks = cluster_lines_into_blocks(
             best_lines,
-            Some((&frame.bgra_bytes, frame.width, frame.height)),
+            Some((
+                &frame.bgra_bytes,
+                frame.width,
+                frame.height,
+                frame.offset_x,
+                frame.offset_y,
+            )),
         );
         Ok(blocks)
     }
@@ -701,9 +711,16 @@ pub fn has_border_between(
     bgra: &[u8],
     width: u32,
     height: u32,
+    offset_x: i32,
+    offset_y: i32,
     r1: &ScreenRect,
     r2: &ScreenRect,
 ) -> bool {
+    let r1_local = r1.to_local(offset_x, offset_y);
+    let r2_local = r2.to_local(offset_x, offset_y);
+    let r1 = &r1_local;
+    let r2 = &r2_local;
+
     if width == 0 || height == 0 || bgra.len() < (width * height * 4) as usize {
         return false;
     }
@@ -720,12 +737,20 @@ pub fn has_border_between(
     };
 
     let sample_bg = |r: &ScreenRect| -> f32 {
-        let xs = [r.x, r.x + r.width / 2, (r.x + r.width - 1).max(r.x)];
-        let ys = [r.y, r.y + r.height / 2, (r.y + r.height - 1).max(r.y)];
+        let pts = [
+            (r.x, r.y - 2),
+            (r.x + r.width / 2, r.y - 2),
+            ((r.x + r.width - 1).max(r.x), r.y - 2),
+            (r.x, r.y + r.height + 1),
+            (r.x + r.width / 2, r.y + r.height + 1),
+            ((r.x + r.width - 1).max(r.x), r.y + r.height + 1),
+            (r.x - 2, r.y + r.height / 2),
+            (r.x + r.width + 1, r.y + r.height / 2),
+        ];
         let mut sum = 0u32;
         let mut count = 0u32;
-        for &y in &ys {
-            for &x in &xs {
+        for &(x, y) in &pts {
+            if x >= 0 && x < w && y >= 0 && y < h {
                 sum += get_luma(x, y) as u32;
                 count += 1;
             }
@@ -857,7 +882,7 @@ pub fn create_inverted_buffer(buf: &[u8]) -> Vec<u8> {
 /// taking line barriers and hyphenated wrap into account.
 pub fn cluster_lines_into_blocks(
     mut lines: Vec<RecognizedLine>,
-    frame_bgra: Option<(&[u8], u32, u32)>,
+    frame_bgra: Option<(&[u8], u32, u32, i32, i32)>,
 ) -> Vec<OcrBlock> {
     if lines.is_empty() {
         return Vec::new();
@@ -881,8 +906,8 @@ pub fn cluster_lines_into_blocks(
 
         for block in blocks.iter_mut() {
             // Prohibit merge if a visual panel barrier separates them
-            if let Some((bgra, w, h)) = frame_bgra
-                && has_border_between(bgra, w, h, &block.rect, &line.rect)
+            if let Some((bgra, w, h, off_x, off_y)) = frame_bgra
+                && has_border_between(bgra, w, h, off_x, off_y, &block.rect, &line.rect)
             {
                 continue;
             }
@@ -1068,7 +1093,7 @@ mod tests {
         let bubble_right = ScreenRect::new(60, 10, 30, 30);
 
         let border_detected =
-            has_border_between(&bgra, w as u32, h as u32, &bubble_left, &bubble_right);
+            has_border_between(&bgra, w as u32, h as u32, 0, 0, &bubble_left, &bubble_right);
         assert!(border_detected);
     }
 
@@ -1083,7 +1108,7 @@ mod tests {
         let bubble_right = ScreenRect::new(60, 10, 30, 30);
 
         let border_detected =
-            has_border_between(&bgra, w as u32, h as u32, &bubble_left, &bubble_right);
+            has_border_between(&bgra, w as u32, h as u32, 0, 0, &bubble_left, &bubble_right);
         assert!(!border_detected);
     }
 
@@ -1098,10 +1123,75 @@ mod tests {
         let line_bottom = ScreenRect::new(10, 25, 80, 15);
 
         let border_detected =
-            has_border_between(&bgra, w as u32, h as u32, &line_top, &line_bottom);
+            has_border_between(&bgra, w as u32, h as u32, 0, 0, &line_top, &line_bottom);
         assert!(
             !border_detected,
             "Dialogue lines on dark background should NOT be treated as separated by panel border"
+        );
+    }
+
+    #[test]
+    fn test_has_border_between_respects_non_zero_frame_offset() {
+        let w = 100;
+        let h = 50;
+        let mut bgra = vec![255u8; (w * h * 4) as usize];
+
+        // Draw a dark vertical panel line between local x=45 and x=55
+        for y in 0..h {
+            for x in 45..55 {
+                let idx = ((y * w + x) * 4) as usize;
+                bgra[idx] = 20;
+                bgra[idx + 1] = 20;
+                bgra[idx + 2] = 20;
+            }
+        }
+
+        let off_x = 500;
+        let off_y = 300;
+        // Global screen rectangles
+        let bubble_left = ScreenRect::new(510, 310, 30, 30);
+        let bubble_right = ScreenRect::new(560, 310, 30, 30);
+
+        let border_detected = has_border_between(
+            &bgra,
+            w as u32,
+            h as u32,
+            off_x,
+            off_y,
+            &bubble_left,
+            &bubble_right,
+        );
+        assert!(
+            border_detected,
+            "Must detect border when rectangles have global coordinates with offset"
+        );
+    }
+
+    #[test]
+    fn test_has_border_between_dark_letters_inside_rect_do_not_skew_bg() {
+        let w = 100;
+        let h = 60;
+        // White bubble background
+        let mut bgra = vec![250u8; (w * h * 4) as usize];
+
+        // Line 1: put dense dark letters (0 luma) in its center
+        for y in 12..18 {
+            for x in 30..50 {
+                let idx = ((y * w + x) * 4) as usize;
+                bgra[idx] = 10;
+                bgra[idx + 1] = 10;
+                bgra[idx + 2] = 10;
+            }
+        }
+
+        let line_top = ScreenRect::new(10, 10, 80, 15);
+        let line_bottom = ScreenRect::new(10, 30, 80, 15);
+
+        let border_detected =
+            has_border_between(&bgra, w as u32, h as u32, 0, 0, &line_top, &line_bottom);
+        assert!(
+            !border_detected,
+            "Dark letter ink inside line rect must not skew background luma and cause false border detection"
         );
     }
 

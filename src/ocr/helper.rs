@@ -164,16 +164,16 @@ pub fn resolve_helper_path(path_str: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Converts BGRA8 frame pixels to raw RGB bytes (R, G, B order).
-pub fn bgra_to_rgb(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Converts BGRA8 frame pixels to raw BGR bytes (B, G, R order).
+pub fn bgra_to_bgr(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
     let pixel_count = (width * height) as usize;
-    let mut rgb = Vec::with_capacity(pixel_count * 3);
+    let mut bgr = Vec::with_capacity(pixel_count * 3);
     for chunk in bgra.as_chunks::<4>().0.iter().take(pixel_count) {
-        rgb.push(chunk[2]); // R
-        rgb.push(chunk[1]); // G
-        rgb.push(chunk[0]); // B
+        bgr.push(chunk[0]); // B
+        bgr.push(chunk[1]); // G
+        bgr.push(chunk[2]); // R
     }
-    rgb
+    bgr
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -218,6 +218,7 @@ pub struct OcrHelperClient {
     config: Arc<Mutex<AppConfig>>,
     is_ready: Arc<AtomicBool>,
     is_available: Arc<AtomicBool>,
+    is_initializing: Arc<AtomicBool>,
     has_warned: Arc<AtomicBool>,
     restart_attempted: Arc<AtomicBool>,
     next_id: AtomicU64,
@@ -232,6 +233,7 @@ impl OcrHelperClient {
             config,
             is_ready: Arc::new(AtomicBool::new(false)),
             is_available: Arc::new(AtomicBool::new(false)),
+            is_initializing: Arc::new(AtomicBool::new(false)),
             has_warned: Arc::new(AtomicBool::new(false)),
             restart_attempted: Arc::new(AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
@@ -251,6 +253,21 @@ impl OcrHelperClient {
     }
 
     async fn init_session(&self) {
+        if self.is_initializing.swap(true, Ordering::SeqCst) {
+            tracing::debug!(
+                "OCR helper initialization already in progress, skipping duplicate init."
+            );
+            return;
+        }
+
+        struct InitGuard<'a>(&'a AtomicBool);
+        impl<'a> Drop for InitGuard<'a> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = InitGuard(&self.is_initializing);
+
         let (raw_python_path, raw_server_path, ocr_engine) = {
             let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -424,6 +441,7 @@ impl OcrHelperClient {
                     self.is_ready.store(true, Ordering::SeqCst);
                     self.is_available.store(true, Ordering::SeqCst);
                     self.has_warned.store(false, Ordering::SeqCst);
+                    self.restart_attempted.store(false, Ordering::SeqCst);
                 } else {
                     warn!("Unexpected first line from OCR helper: {}", line);
                     self.is_available.store(false, Ordering::SeqCst);
@@ -463,8 +481,16 @@ impl OcrHelperClient {
         lang: &str,
     ) -> Result<Vec<OcrBlock>, String> {
         let lines = self.recognize_raw_lines(frame, lang).await?;
-        let blocks =
-            cluster_lines_into_blocks(lines, Some((&frame.bgra_bytes, frame.width, frame.height)));
+        let blocks = cluster_lines_into_blocks(
+            lines,
+            Some((
+                &frame.bgra_bytes,
+                frame.width,
+                frame.height,
+                frame.offset_x,
+                frame.offset_y,
+            )),
+        );
         Ok(blocks)
     }
 
@@ -478,17 +504,29 @@ impl OcrHelperClient {
         }
 
         if !self.is_ready() {
-            // If unavailable and restart has not been attempted yet, attempt one restart
-            if !self.restart_attempted.swap(true, Ordering::SeqCst) {
-                info!("Attempting one restart of OCR helper process...");
-                self.init_session().await;
+            if self.is_initializing.load(Ordering::SeqCst) {
+                // If initialization is currently in progress, wait briefly for it to complete
+                for _ in 0..30 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if self.is_ready() {
+                        break;
+                    }
+                }
             }
 
             if !self.is_ready() {
-                if !self.has_warned.swap(true, Ordering::Relaxed) {
-                    warn!("OCR helper is currently unavailable. Falling back to WinRT.");
+                // If unavailable and restart has not been attempted yet, attempt one restart
+                if !self.restart_attempted.swap(true, Ordering::SeqCst) {
+                    info!("Attempting one restart of OCR helper process...");
+                    self.init_session().await;
                 }
-                return Err("OCR helper is unavailable".to_string());
+
+                if !self.is_ready() {
+                    if !self.has_warned.swap(true, Ordering::Relaxed) {
+                        warn!("OCR helper is currently unavailable. Falling back to WinRT.");
+                    }
+                    return Err("OCR helper is unavailable".to_string());
+                }
             }
         }
 
@@ -509,7 +547,7 @@ impl OcrHelperClient {
             .map_err(|e| format!("Failed to serialize OCR request: {}", e))?;
         header_bytes.push(b'\n');
 
-        let raw_rgb = bgra_to_rgb(&frame.bgra_bytes, frame.width, frame.height);
+        let raw_bgr = bgra_to_bgr(&frame.bgra_bytes, frame.width, frame.height);
 
         let mut session_guard = self.session.lock().await;
         let session = match session_guard.as_mut() {
@@ -520,10 +558,10 @@ impl OcrHelperClient {
             }
         };
 
-        // Write request header + raw RGB bytes
+        // Write request header + raw BGR bytes
         let write_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             session.stdin.write_all(&header_bytes).await?;
-            session.stdin.write_all(&raw_rgb).await?;
+            session.stdin.write_all(&raw_bgr).await?;
             session.stdin.flush().await?;
             tokio::io::Result::Ok(())
         })
@@ -590,6 +628,8 @@ impl OcrHelperClient {
                 .unwrap_or_else(|| "Unknown helper error".to_string());
             return Err(format!("OCR helper reported error: {}", err_msg));
         }
+
+        self.restart_attempted.store(false, Ordering::SeqCst);
 
         let raw_lines = resp.lines.unwrap_or_default();
         if let Some(ms) = resp.ms {
@@ -670,12 +710,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bgra_to_rgb_conversion() {
-        // Pixel 0: B=10, G=20, R=30, A=255 -> RGB should be [30, 20, 10]
-        // Pixel 1: B=50, G=60, R=70, A=255 -> RGB should be [70, 60, 50]
+    fn test_bgra_to_bgr_conversion() {
+        // Pixel 0: B=10, G=20, R=30, A=255 -> BGR should be [10, 20, 30]
+        // Pixel 1: B=50, G=60, R=70, A=255 -> BGR should be [50, 60, 70]
         let bgra = vec![10, 20, 30, 255, 50, 60, 70, 255];
-        let rgb = bgra_to_rgb(&bgra, 2, 1);
-        assert_eq!(rgb, vec![30, 20, 10, 70, 60, 50]);
+        let bgr = bgra_to_bgr(&bgra, 2, 1);
+        assert_eq!(bgr, vec![10, 20, 30, 50, 60, 70]);
     }
 
     #[test]
@@ -769,6 +809,7 @@ mod tests {
             config,
             is_ready: Arc::new(AtomicBool::new(true)),
             is_available: Arc::new(AtomicBool::new(true)),
+            is_initializing: Arc::new(AtomicBool::new(false)),
             has_warned: Arc::new(AtomicBool::new(false)),
             restart_attempted: Arc::new(AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
@@ -783,5 +824,24 @@ mod tests {
         assert!(!client.is_available.load(Ordering::SeqCst));
         assert!(!client.is_ready.load(Ordering::SeqCst));
         assert!(client.session.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_init_session_concurrency_guard() {
+        let config = Arc::new(Mutex::new(AppConfig::default()));
+        let client = Arc::new(OcrHelperClient {
+            session: tokio::sync::Mutex::new(None),
+            config,
+            is_ready: Arc::new(AtomicBool::new(false)),
+            is_available: Arc::new(AtomicBool::new(false)),
+            is_initializing: Arc::new(AtomicBool::new(true)),
+            has_warned: Arc::new(AtomicBool::new(false)),
+            restart_attempted: Arc::new(AtomicBool::new(false)),
+            next_id: AtomicU64::new(1),
+        });
+
+        // While is_initializing is true, init_session should return immediately without spawning
+        client.init_session().await;
+        assert!(client.is_initializing.load(Ordering::SeqCst));
     }
 }

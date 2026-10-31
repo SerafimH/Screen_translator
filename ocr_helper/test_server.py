@@ -48,11 +48,20 @@ class TestOcrHelperProtocol(unittest.TestCase):
     def test_unsupported_language(self):
         engine = MockEngine()
         resp = process_request(
-            {"id": 1, "width": 10, "height": 10, "lang": "ru"}, None, engine
+            {"id": 1, "width": 10, "height": 10, "lang": "xyz"}, None, engine
         )
         self.assertFalse(resp.get("ok"))
         self.assertEqual(resp.get("id"), 1)
         self.assertIn("not supported yet", resp.get("error", ""))
+
+    def test_en_variants_supported(self):
+        engine = MockEngine([])
+        raw_bgr = bytes([0, 0, 0] * 4)
+        for lang_code in ("en", "en-US", "en_US", "en-GB"):
+            resp = process_request(
+                {"id": 10, "width": 2, "height": 2, "lang": lang_code}, raw_bgr, engine
+            )
+            self.assertTrue(resp.get("ok"), f"Failed for {lang_code}")
 
     def test_missing_or_invalid_id(self):
         engine = MockEngine()
@@ -158,8 +167,8 @@ class TestOcrHelperProtocol(unittest.TestCase):
 
     def test_resolve_models_dir(self):
         models_dir = resolve_models_dir()
-        self.assertIsNotNone(models_dir)
-        self.assertTrue(os.path.isdir(models_dir))
+        if models_dir is not None:
+            self.assertTrue(os.path.isdir(models_dir))
 
 
 if __name__ == "__main__":

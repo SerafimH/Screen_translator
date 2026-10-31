@@ -51,47 +51,65 @@ pub fn extract_outlined_text_mask(bgra: &[u8], width: u32, height: u32) -> Vec<u
         }
     }
 
+    const RADIUS: usize = 6;
+    let w_usize = width as usize;
+    let h_usize = height as usize;
+
+    // 1. Separable horizontal morphological dilation of is_dark in O(W * H)
+    let mut dark_h = vec![false; pixel_count];
+    for y in 0..h_usize {
+        let row_offset = y * w_usize;
+        let mut count = 0usize;
+        let init_end = RADIUS.min(w_usize.saturating_sub(1));
+        for i in 0..=init_end {
+            if is_dark[row_offset + i] {
+                count += 1;
+            }
+        }
+        for x in 0..w_usize {
+            dark_h[row_offset + x] = count > 0;
+            let enter_x = x + 1 + RADIUS;
+            if enter_x < w_usize && is_dark[row_offset + enter_x] {
+                count += 1;
+            }
+            if x >= RADIUS && is_dark[row_offset + (x - RADIUS)] {
+                count -= 1;
+            }
+        }
+    }
+
+    // 2. Separable vertical morphological dilation of dark_h in O(W * H)
+    let mut dark_dilated = vec![false; pixel_count];
+    for x in 0..w_usize {
+        let mut count = 0usize;
+        let init_end = RADIUS.min(h_usize.saturating_sub(1));
+        for y in 0..=init_end {
+            if dark_h[y * w_usize + x] {
+                count += 1;
+            }
+        }
+        for y in 0..h_usize {
+            dark_dilated[y * w_usize + x] = count > 0;
+            let enter_y = y + 1 + RADIUS;
+            if enter_y < h_usize && dark_h[enter_y * w_usize + x] {
+                count += 1;
+            }
+            if y >= RADIUS && dark_h[(y - RADIUS) * w_usize + x] {
+                count -= 1;
+            }
+        }
+    }
+
     // Default entire output to pure white background
     let mut result = vec![255u8; pixel_count * 4];
 
-    // Search offsets within circular radius of 7 pixels (Chebyshev bounds: dx in -7..=7, dy in -7..=7)
-    const RADIUS: i32 = 7;
-    const RADIUS_SQ: i32 = RADIUS * RADIUS;
-
-    for y in 0..h {
-        let row_offset = y as usize * width as usize;
-        for x in 0..w {
-            let p_idx = row_offset + x as usize;
-            if !is_light_candidate[p_idx] {
-                continue;
-            }
-
-            // Check if there is at least one dark outline pixel within radius
-            let mut has_dark_outline = false;
-            let y_min = (y - RADIUS).max(0);
-            let y_max = (y + RADIUS).min(h - 1);
-            let x_min = (x - RADIUS).max(0);
-            let x_max = (x + RADIUS).min(w - 1);
-
-            'outer: for ny in y_min..=y_max {
-                let dy = ny - y;
-                let ny_row = ny as usize * width as usize;
-                for nx in x_min..=x_max {
-                    let dx = nx - x;
-                    if dx * dx + dy * dy <= RADIUS_SQ && is_dark[ny_row + nx as usize] {
-                        has_dark_outline = true;
-                        break 'outer;
-                    }
-                }
-            }
-
-            if has_dark_outline {
-                let out_idx = p_idx * 4;
-                result[out_idx] = 0; // B
-                result[out_idx + 1] = 0; // G
-                result[out_idx + 2] = 0; // R
-                result[out_idx + 3] = 255;
-            }
+    for i in 0..pixel_count {
+        if is_light_candidate[i] && dark_dilated[i] {
+            let out_idx = i * 4;
+            result[out_idx] = 0; // B
+            result[out_idx + 1] = 0; // G
+            result[out_idx + 2] = 0; // R
+            result[out_idx + 3] = 255;
         }
     }
 

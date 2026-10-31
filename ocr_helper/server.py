@@ -126,11 +126,13 @@ def process_request(
         return {"ok": False, "error": "Missing 'id' or 'cmd' in request"}
 
     lang = str(header.get("lang", "")).strip().lower()
-    if lang != "en":
+    base_lang = lang.split("-")[0].split("_")[0]
+    supported_langs = {"en", "ch", "zh", "ja", "ko", "ru"}
+    if base_lang not in supported_langs:
         return {
             "id": req_id,
             "ok": False,
-            "error": f"Language '{lang}' is not supported yet (only 'en' is supported)",
+            "error": f"Language '{lang}' is not supported yet (supported: {', '.join(sorted(supported_langs))})",
         }
 
     width = header.get("width")
@@ -159,13 +161,12 @@ def process_request(
     t0 = time.perf_counter()
     try:
         try:
-            # Convert raw RGB to numpy array (H, W, 3) and invert to BGR for RapidOCR/OpenCV
+            # Convert raw BGR directly to numpy array (H, W, 3) for RapidOCR/OpenCV
             import numpy as np
 
-            img_rgb = np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
+            img_bgr = np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
                 (height, width, 3)
             )
-            img_bgr = img_rgb[:, :, ::-1]
         except ImportError:
             # In test environments without numpy installed, pass raw buffer directly to mock engine
             img_bgr = raw_rgb

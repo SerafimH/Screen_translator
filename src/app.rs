@@ -14,8 +14,7 @@ use crate::ocr::{
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
 use crate::types::{
-    AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationBlock, TranslationProvider,
-    find_text_under_cursor,
+    AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationBlock, find_text_under_cursor,
 };
 
 /// RAII Guard that ensures `is_processing` is unconditionally reset to false upon completion or error.
@@ -65,7 +64,7 @@ impl Drop for ProcessingGuard {
 struct AppState {
     config: Arc<Mutex<AppConfig>>,
     overlay: OverlayHandle,
-    ocr: Arc<WinrtOcrEngine>,
+    ocr: Option<Arc<WinrtOcrEngine>>,
     helper_ocr: Arc<OcrHelperClient>,
     translator: Arc<TranslatorService>,
     active_roi: Arc<Mutex<Option<ScreenRect>>>,
@@ -82,16 +81,28 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig) -> Result<Self, String> {
-        let (overlay, event_rx) =
-            OverlayManager::spawn().map_err(|e| format!("Failed to spawn overlay: {:?}", e))?;
+        let (overlay, event_rx) = OverlayManager::spawn(&config)
+            .map_err(|e| format!("Failed to spawn overlay: {:?}", e))?;
 
-        let ocr = Arc::new(
-            WinrtOcrEngine::new(&config.ocr_lang)
-                .map_err(|e| format!("Failed to init OCR engine: {}", e))?,
-        );
+        let ocr = match WinrtOcrEngine::new(&config.ocr_lang) {
+            Ok(engine) => Some(Arc::new(engine)),
+            Err(e) => {
+                if config.ocr_engine == OcrMode::Helper || config.ocr_engine == OcrMode::Auto {
+                    warn!(
+                        "WinRT OCR engine initialization skipped: {}. (Using RapidOCR helper).",
+                        e
+                    );
+                    None
+                } else {
+                    return Err(format!("Failed to init OCR engine: {}", e));
+                }
+            }
+        };
         let config_arc = Arc::new(Mutex::new(config.clone()));
         let helper_ocr = OcrHelperClient::new(config_arc.clone());
-        let translator = Arc::new(TranslatorService::new());
+        let translator = Arc::new(TranslatorService::with_history_size(
+            config.context_history_size,
+        ));
 
         overlay.set_provider_name(config.provider.display_name().to_string());
 
@@ -325,6 +336,21 @@ where
     }
 }
 
+pub fn cursor_capture_roi(
+    pt: POINT,
+    active_roi: Option<ScreenRect>,
+    min_x: i32,
+    min_y: i32,
+) -> ScreenRect {
+    if let Some(roi) = active_roi.filter(|r| r.contains(pt.x, pt.y)) {
+        roi
+    } else {
+        let cap_x = (pt.x - 400).max(min_x);
+        let cap_y = (pt.y - 120).max(min_y);
+        ScreenRect::new(cap_x, cap_y, 800, 240)
+    }
+}
+
 impl AppState {
     fn dispatch_cursor_translation_task(&self, pt: POINT) {
         let state = self.clone();
@@ -352,21 +378,32 @@ impl AppState {
             .clone();
 
         // If an active ROI was manually selected and contains the cursor, capture that ROI;
-        // otherwise, capture a focused region (800x240) centered on the cursor clamped to non-negative desktop coordinates.
+        // otherwise, capture a focused region (800x240) centered on the cursor clamped to virtual screen coordinates.
         let active = *self.active_roi.lock().unwrap_or_else(|e| e.into_inner());
-        let capture_roi = if let Some(roi) = active.filter(|r| r.contains(pt.x, pt.y)) {
-            roi
-        } else {
-            let cap_x = (pt.x - 400).max(0);
-            let cap_y = (pt.y - 120).max(0);
-            ScreenRect::new(cap_x, cap_y, 800, 240)
+        let (vx, vy) = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            };
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if vw > 0 && vh > 0 {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                )
+            } else {
+                (0, 0)
+            }
         };
+        let capture_roi = cursor_capture_roi(pt, active, vx, vy);
 
         self.overlay
             .set_loading(true, Some("Поиск текста под курсором...".to_string()));
 
         let capture_res =
-            tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(Some(capture_roi))).await;
+            tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(Some(capture_roi)))
+                .await;
 
         let frame = match capture_res {
             Ok(Ok(f)) => f,
@@ -415,12 +452,9 @@ impl AppState {
 
         let translation_block = if is_multi_word {
             let word = target.word_text.as_ref().unwrap();
-            let word_fut = self.translator.lookup_word_details(
-                word,
-                &cfg.source_lang,
-                &cfg.target_lang,
-                &cfg,
-            );
+            let word_fut =
+                self.translator
+                    .lookup_word_details(word, &cfg.source_lang, &cfg.target_lang, &cfg);
             let sentence_fut = self.translator.translate_text(
                 &target.sentence_text,
                 &cfg.source_lang,
@@ -461,19 +495,11 @@ impl AppState {
                 ),
             }
         } else {
-            let word_or_line = target
-                .word_text
-                .as_ref()
-                .unwrap_or(&target.sentence_text);
+            let word_or_line = target.word_text.as_ref().unwrap_or(&target.sentence_text);
 
             let details = self
                 .translator
-                .lookup_word_details(
-                    word_or_line,
-                    &cfg.source_lang,
-                    &cfg.target_lang,
-                    &cfg,
-                )
+                .lookup_word_details(word_or_line, &cfg.source_lang, &cfg.target_lang, &cfg)
                 .await;
 
             let mut card_text = format!("Слово: {} → {}", word_or_line, details.primary);
@@ -510,7 +536,8 @@ impl AppState {
         let elapsed = start_time.elapsed().as_millis();
         let status = format!("Перевод под курсором за {} мс", elapsed);
         info!("{}", status);
-        self.overlay.update_blocks(vec![translation_block], Some(status));
+        self.overlay
+            .update_blocks(vec![translation_block], Some(status));
     }
 
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
@@ -586,10 +613,7 @@ impl AppState {
 
         let has_text = !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text));
 
-        let has_vision_support = (cfg.provider == TranslationProvider::Gemini
-            && cfg.gemini_api_key.is_some())
-            || (cfg.provider == TranslationProvider::OpenAICompatible
-                && cfg.openai_api_key.is_some());
+        let has_vision_support = cfg.gemini_api_key.is_some() || cfg.openai_api_key.is_some();
 
         // Step 4: Vision fallback if all local passes found nothing and vision_fallback is enabled with API key
         if !has_text && cfg.vision_fallback && has_vision_support {
@@ -662,7 +686,11 @@ impl AppState {
                     true,
                     Some("Распознавание текста (WinRT OCR)...".to_string()),
                 );
-                self.ocr.recognize(frame).await
+                if let Some(ocr) = &self.ocr {
+                    ocr.recognize(frame).await
+                } else {
+                    Err("Системный WinRT OCR недоступен. Установите языковой пакет в Windows или выберите RapidOCR.".to_string())
+                }
             }
             OcrMode::Helper => {
                 self.overlay
@@ -671,20 +699,32 @@ impl AppState {
                     Ok(blocks) => Ok(blocks),
                     Err(err) => {
                         warn!("RapidOCR helper failed: {}. Falling back to WinRT...", err);
-                        self.overlay.set_loading(
-                            true,
-                            Some("RapidOCR недоступен, откат на WinRT OCR...".to_string()),
-                        );
-                        self.ocr.recognize(frame).await
+                        if let Some(ocr) = &self.ocr {
+                            self.overlay.set_loading(
+                                true,
+                                Some("RapidOCR недоступен, откат на WinRT OCR...".to_string()),
+                            );
+                            ocr.recognize(frame).await
+                        } else {
+                            Err(format!(
+                                "RapidOCR helper failed: {}. WinRT OCR также недоступен.",
+                                err
+                            ))
+                        }
                     }
                 }
             }
             OcrMode::Auto => {
+                let Some(ocr) = &self.ocr else {
+                    // WinRT is not available, directly use RapidOCR helper
+                    return self.helper_ocr.recognize(frame, &cfg.ocr_lang).await;
+                };
+
                 self.overlay.set_loading(
                     true,
                     Some("Распознавание (Auto: WinRT Pass 1)...".to_string()),
                 );
-                let pass1_lines = self.ocr.recognize_pass_1(frame).await.unwrap_or_default();
+                let pass1_lines = ocr.recognize_pass_1(frame).await.unwrap_or_default();
                 let pass1_score = score_recognized_lines(&pass1_lines);
 
                 if pass1_score >= 12 && !pass1_lines.is_empty() {
@@ -694,7 +734,13 @@ impl AppState {
                     );
                     let blocks = cluster_lines_into_blocks(
                         pass1_lines,
-                        Some((&frame.bgra_bytes, frame.width, frame.height)),
+                        Some((
+                            &frame.bgra_bytes,
+                            frame.width,
+                            frame.height,
+                            frame.offset_x,
+                            frame.offset_y,
+                        )),
                     );
                     Ok(blocks)
                 } else {
@@ -719,7 +765,7 @@ impl AppState {
                             info!(
                                 "Auto mode: RapidOCR yielded no text, falling back to full WinRT multi-pass..."
                             );
-                            self.ocr.recognize(frame).await
+                            ocr.recognize(frame).await
                         }
                     }
                 }
@@ -922,5 +968,33 @@ mod tests {
         assert!(handle.is_some(), "Handle must be stored in slot");
         handle.unwrap().await.unwrap();
         assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_cursor_capture_roi_multi_monitor_bounds() {
+        // Primary monitor: pt=(500, 300), min=(0, 0)
+        let pt_primary = POINT { x: 500, y: 300 };
+        let roi_primary = cursor_capture_roi(pt_primary, None, 0, 0);
+        assert_eq!(roi_primary.x, 100);
+        assert_eq!(roi_primary.y, 180);
+        assert_eq!(roi_primary.width, 800);
+        assert_eq!(roi_primary.height, 240);
+
+        // Secondary monitor to the left: pt=(-1000, 200), min=(-1920, 0)
+        let pt_left = POINT { x: -1000, y: 200 };
+        let roi_left = cursor_capture_roi(pt_left, None, -1920, 0);
+        assert_eq!(roi_left.x, -1400);
+        assert_eq!(roi_left.y, 80);
+
+        // Secondary monitor to the top-left: pt=(-1800, -500), min=(-1920, -1080)
+        let pt_topleft = POINT { x: -1800, y: -500 };
+        let roi_topleft = cursor_capture_roi(pt_topleft, None, -1920, -1080);
+        assert_eq!(roi_topleft.x, -1920); // clamped to min_x
+        assert_eq!(roi_topleft.y, -620);
+
+        // If manual active ROI contains pt, it takes precedence
+        let active = ScreenRect::new(-1200, 100, 400, 300);
+        let roi_manual = cursor_capture_roi(pt_left, Some(active), -1920, 0);
+        assert_eq!(roi_manual, active);
     }
 }
