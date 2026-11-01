@@ -790,6 +790,41 @@ pub fn parse_deepl_batch_response(body: &str, expected: usize) -> Result<Vec<Str
     Ok(results)
 }
 
+/// Combines cached translations with newly batch-translated strings according to original indices.
+pub fn assemble_batch_translations(
+    cached_results: &[Option<String>],
+    uncached_indices: &[usize],
+    batch_translations: &[String],
+) -> Result<Vec<String>, String> {
+    if uncached_indices.len() != batch_translations.len() {
+        return Err(format!(
+            "Batch translation count mismatch: expected {}, got {}",
+            uncached_indices.len(),
+            batch_translations.len()
+        ));
+    }
+
+    let mut results = vec![String::new(); cached_results.len()];
+    for (i, cached) in cached_results.iter().enumerate() {
+        if let Some(c) = cached {
+            results[i] = c.clone();
+        }
+    }
+
+    for (&idx, trans) in uncached_indices.iter().zip(batch_translations.iter()) {
+        if idx >= results.len() {
+            return Err(format!(
+                "Index {} out of bounds for result length {}",
+                idx,
+                results.len()
+            ));
+        }
+        results[idx] = trans.clone();
+    }
+
+    Ok(results)
+}
+
 #[derive(Clone)]
 pub struct TranslatorService {
     client: reqwest::Client,
@@ -1676,41 +1711,63 @@ impl TranslatorService {
             && config.provider == TranslationProvider::DeepL
             && let Some(key) = &config.deepl_api_key
         {
-            let text_refs: Vec<&str> = cleaned_texts.iter().map(|s| s.as_str()).collect();
-            let ctx = self.context.format_history_context();
-            if let Ok(batch_translated) = self
-                .translate_deepl_batch(
-                    &text_refs,
-                    &config.source_lang,
-                    &config.target_lang,
-                    key,
-                    &ctx,
-                )
-                .await
-            {
-                if batch_translated.len() == blocks.len() {
-                    let mut results = Vec::with_capacity(blocks.len());
-                    for (i, trans) in batch_translated.into_iter().enumerate() {
-                        let clean_part = clean_russian_punctuation(trans.trim());
-                        let final_text = self.context.postprocess(&clean_part);
-                        let key = format!(
-                            "{}:{}:{}:{}",
-                            config.provider.as_str(),
-                            config.source_lang,
-                            config.target_lang,
-                            cleaned_texts[i]
-                        );
-                        self.cache.insert(key, final_text.clone());
-                        self.context
-                            .record_translation(cleaned_texts[i].clone(), final_text.clone());
+            let uncached_indices: Vec<usize> = cached_results
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| if c.is_none() { Some(i) } else { None })
+                .collect();
 
-                        results.push(TranslationBlock {
-                            original_text: blocks[i].text.clone(),
-                            translated_text: final_text,
-                            rect: blocks[i].rect,
-                        });
+            if !uncached_indices.is_empty() {
+                let text_refs: Vec<&str> = uncached_indices
+                    .iter()
+                    .map(|&i| cleaned_texts[i].as_str())
+                    .collect();
+                let ctx = self.context.format_history_context();
+                if let Ok(batch_translated) = self
+                    .translate_deepl_batch(
+                        &text_refs,
+                        &config.source_lang,
+                        &config.target_lang,
+                        key,
+                        &ctx,
+                    )
+                    .await
+                {
+                    if batch_translated.len() == uncached_indices.len() {
+                        let mut processed_translations = Vec::with_capacity(batch_translated.len());
+                        for (k, trans) in batch_translated.into_iter().enumerate() {
+                            let orig_idx = uncached_indices[k];
+                            let clean_part = clean_russian_punctuation(trans.trim());
+                            let final_text = self.context.postprocess(&clean_part);
+                            let key = format!(
+                                "{}:{}:{}:{}",
+                                config.provider.as_str(),
+                                config.source_lang,
+                                config.target_lang,
+                                cleaned_texts[orig_idx]
+                            );
+                            self.cache.insert(key, final_text.clone());
+                            self.context
+                                .record_translation(cleaned_texts[orig_idx].clone(), final_text.clone());
+                            processed_translations.push(final_text);
+                        }
+
+                        if let Ok(merged_texts) = assemble_batch_translations(
+                            &cached_results,
+                            &uncached_indices,
+                            &processed_translations,
+                        ) {
+                            return blocks
+                                .iter()
+                                .zip(merged_texts)
+                                .map(|(b, trans)| TranslationBlock {
+                                    original_text: b.text.clone(),
+                                    translated_text: trans,
+                                    rect: b.rect,
+                                })
+                                .collect();
+                        }
                     }
-                    return results;
                 }
             }
         }
@@ -2310,5 +2367,36 @@ mod tests {
         let err_api = parse_deepl_batch_response(json_err, 1);
         assert!(err_api.is_err());
         assert!(err_api.unwrap_err().contains("Quota exceeded"));
+    }
+
+    #[test]
+    fn test_assemble_batch_translations() {
+        // 1. All in cache (empty uncached)
+        let cached_all = vec![Some("First".to_string()), Some("Second".to_string())];
+        let res_all = assemble_batch_translations(&cached_all, &[], &[]).unwrap();
+        assert_eq!(res_all, vec!["First", "Second"]);
+
+        // 2. Partial in cache (middle block translated)
+        let cached_partial = vec![
+            Some("Первый".to_string()),
+            None,
+            Some("Третий".to_string()),
+        ];
+        let uncached_idx = vec![1];
+        let new_trans = vec!["Второй".to_string()];
+        let res_partial =
+            assemble_batch_translations(&cached_partial, &uncached_idx, &new_trans).unwrap();
+        assert_eq!(res_partial, vec!["Первый", "Второй", "Третий"]);
+
+        // 3. None in cache (all translated)
+        let cached_none = vec![None, None];
+        let uncached_all = vec![0, 1];
+        let new_all = vec!["Блок 1".to_string(), "Блок 2".to_string()];
+        let res_none = assemble_batch_translations(&cached_none, &uncached_all, &new_all).unwrap();
+        assert_eq!(res_none, vec!["Блок 1", "Блок 2"]);
+
+        // 4. Mismatch between uncached indices and translations count
+        let err = assemble_batch_translations(&cached_partial, &uncached_idx, &[]);
+        assert!(err.is_err());
     }
 }
