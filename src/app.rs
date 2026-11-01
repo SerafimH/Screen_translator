@@ -105,6 +105,7 @@ impl App {
         ));
 
         overlay.set_provider_name(config.provider.display_name().to_string());
+        overlay.set_ocr_engine_name(config.ocr_engine.display_name().to_string());
 
         let state = AppState {
             config: config_arc,
@@ -220,6 +221,13 @@ impl App {
                         prev.abort();
                     }
 
+                    // Reset FrameSignature so dialogue watcher immediately processes new frame if needed
+                    *self
+                        .state
+                        .last_signature
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+
                     let new_provider = {
                         let mut cfg = self.state.config.lock().unwrap_or_else(|e| e.into_inner());
                         cfg.provider = cfg.provider.next();
@@ -262,6 +270,9 @@ impl App {
                         cfg.ocr_engine
                     };
 
+                    self.state
+                        .overlay
+                        .set_ocr_engine_name(new_mode.display_name().to_string());
                     let status = format!("Режим OCR: {}", new_mode.display_name());
                     info!("{}", status);
                     self.state.overlay.set_loading(false, Some(status));
@@ -277,8 +288,23 @@ impl App {
                     {
                         prev.abort();
                     }
+                    *self
+                        .state
+                        .active_roi
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                     self.state.overlay.clear();
-                    info!("Overlay cleared.");
+                    info!("Overlay and ROI cleared.");
+                }
+
+                AppEvent::ResetRoi => {
+                    *self
+                        .state
+                        .active_roi
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                    self.state.overlay.set_active_roi(None);
+                    info!("ROI reset to full screen.");
                 }
 
                 AppEvent::TranslateUnderCursor(pt) => {
@@ -433,13 +459,13 @@ impl AppState {
 
         if !crate::overlay::is_shift_held() {
             info!("Shift was released before OCR finished, aborting cursor translation.");
-            self.overlay.set_loading(false, None);
+            self.overlay.set_loading(false, Some("Готов".to_string()));
             return;
         }
 
         let Some(target) = find_text_under_cursor(&blocks, pt.x, pt.y) else {
             info!("No text found under cursor at ({}, {})", pt.x, pt.y);
-            self.overlay.set_loading(false, None);
+            self.overlay.set_loading(false, Some("Готов".to_string()));
             return;
         };
 
@@ -529,7 +555,7 @@ impl AppState {
 
         if !crate::overlay::is_shift_held() {
             info!("Shift was released before translation finished, skipping card display.");
-            self.overlay.set_loading(false, None);
+            self.overlay.set_loading(false, Some("Готов".to_string()));
             return;
         }
 
@@ -647,7 +673,7 @@ impl AppState {
             }
         }
 
-        if blocks.is_empty() {
+        if !has_text {
             let elapsed = start_time.elapsed().as_millis();
             let status = if !cfg.vision_fallback {
                 format!(
@@ -661,12 +687,17 @@ impl AppState {
             return;
         }
 
+        let valid_blocks: Vec<OcrBlock> = blocks
+            .into_iter()
+            .filter(|b| !is_ocr_garbage(&b.text))
+            .collect();
+
         self.overlay.set_loading(
             true,
-            Some(format!("Перевод {} блоков текста...", blocks.len())),
+            Some(format!("Перевод {} блоков текста...", valid_blocks.len())),
         );
 
-        let translations = self.translator.translate_blocks(&blocks, &cfg).await;
+        let translations = self.translator.translate_blocks(&valid_blocks, &cfg).await;
 
         let elapsed = start_time.elapsed().as_millis();
         let status = format!("Переведено {} блоков за {} мс", translations.len(), elapsed);
@@ -792,9 +823,10 @@ mod tests {
             }],
             status_msg: Some("Translating...".to_string()),
             is_loading: true,
-            active_roi: None,
+            active_roi: Some(ScreenRect::new(10, 10, 100, 50)),
             auto_mode: false,
             provider_name: "Test".to_string(),
+            ocr_engine_name: "RapidOCR".to_string(),
         }));
 
         let handle = OverlayHandle {
@@ -802,18 +834,23 @@ mod tests {
             shared_state: shared_state.clone(),
         };
 
-        // Before clear, blocks are present and loading is true
+        // Before clear, blocks are present, active_roi is set, and loading is true
         assert_eq!(shared_state.lock().unwrap().current_blocks.len(), 1);
+        assert!(shared_state.lock().unwrap().active_roi.is_some());
         assert!(shared_state.lock().unwrap().is_loading);
 
         // When clear() is called (as required by BUG-9 on AppEvent::Clear):
         handle.clear();
 
-        // After clear, blocks must be empty, loading must be false, status set to "Очищено"
+        // After clear, blocks must be empty, active_roi must be reset, loading must be false, status set to "Очищено"
         let state = shared_state.lock().unwrap();
         assert!(
             state.current_blocks.is_empty(),
             "Cards must be cleared from overlay"
+        );
+        assert!(
+            state.active_roi.is_none(),
+            "Active ROI must be cleared back to full screen"
         );
         assert!(!state.is_loading, "is_loading must be false after clear");
         assert_eq!(state.status_msg.as_deref(), Some("Очищено"));

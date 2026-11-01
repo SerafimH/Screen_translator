@@ -31,6 +31,7 @@ pub struct RenderScene<'a> {
     pub active_roi: Option<ScreenRect>,
     pub auto_mode: bool,
     pub provider_name: &'a str,
+    pub ocr_engine_name: &'a str,
     pub mode: AppMode,
     pub selection_rect: Option<ScreenRect>,
     pub status_msg: Option<&'a str>,
@@ -576,7 +577,7 @@ impl OverlayRenderer {
 
     fn draw_hud(&self, scene: &RenderScene<'_>) -> Result<()> {
         unsafe {
-            let hud_w = (self.width as f32 - 40.0).min(920.0).max(300.0);
+            let hud_w = (self.width as f32 - 40.0).min(1100.0).max(300.0);
             let hud_h = 36.0;
             let hud_x = ((self.width as f32) - hud_w) / 2.0;
             let hud_y = 12.0;
@@ -623,8 +624,8 @@ impl OverlayRenderer {
                 }
                 AppMode::Normal => {
                     format!(
-                        " ScreenTranslator [{}] | Alt+T: Перевод | Alt+S: Выделение | Alt+A: {} | Alt+P: Движок | Alt+C: Скрыть | Alt+Q: Выход | {}{}",
-                        scene.provider_name, auto_str, loading_prefix, status_str
+                        " ScreenTranslator [{} | {}] | Alt+T: Перевод | Alt+S: Выделение | Alt+A: {} | Alt+P: Движок | Alt+O: OCR | Alt+C: Скрыть | Alt+Q: Выход | {}{}",
+                        scene.provider_name, scene.ocr_engine_name, auto_str, loading_prefix, status_str
                     )
                 }
             };

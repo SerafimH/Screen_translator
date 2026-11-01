@@ -9,6 +9,7 @@ import unittest
 
 import os
 from ocr_helper.server import (
+    EngineManager,
     extract_lines_from_result,
     process_request,
     read_exact,
@@ -169,6 +170,26 @@ class TestOcrHelperProtocol(unittest.TestCase):
         models_dir = resolve_models_dir()
         if models_dir is not None:
             self.assertTrue(os.path.isdir(models_dir))
+
+    def test_engine_manager_dispatch(self):
+        eng_en = MockEngine([[[[0, 0], [10, 0], [10, 10], [0, 10]], "English", 0.99]])
+        eng_ja = MockEngine([[[[0, 0], [10, 0], [10, 10], [0, 10]], "日本語", 0.99]])
+        mgr = EngineManager()
+        mgr.engines["en"] = eng_en
+        mgr.engines["ja"] = eng_ja
+
+        raw_bgr = bytes([0, 0, 0] * 4)
+        resp_en = process_request(
+            {"id": 1, "width": 2, "height": 2, "lang": "en"}, raw_bgr, mgr
+        )
+        self.assertTrue(resp_en["ok"])
+        self.assertEqual(resp_en["lines"][0]["text"], "English")
+
+        resp_ja = process_request(
+            {"id": 2, "width": 2, "height": 2, "lang": "ja"}, raw_bgr, mgr
+        )
+        self.assertTrue(resp_ja["ok"])
+        self.assertEqual(resp_ja["lines"][0]["text"], "日本語")
 
 
 if __name__ == "__main__":

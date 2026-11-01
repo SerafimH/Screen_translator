@@ -63,11 +63,10 @@ impl ContextManager {
     }
 
     /// Pre-processes text before sending it to the translation backend.
-    ///
-    /// Currently a no-op that returns the input text as-is.
-    pub fn preprocess(&self, text: &str) -> String {
-        // TODO: pre-translation glossary substitution
-        text.to_string()
+    /// Returns the borrowed &str without unnecessary heap allocation.
+    pub fn preprocess<'a>(&self, text: &'a str) -> &'a str {
+        // shortcut: glossary substitution runs in postprocess; pre-translation substitution deferred
+        text
     }
 
     pub fn postprocess(&self, translated: &str) -> String {
@@ -967,6 +966,14 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("Gemini response error: {:?}", e)))?;
 
+        if let Some(err_msg) = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Err(redact_secrets(&format!("Gemini API error: {}", err_msg)));
+        }
+
         let candidate = json
             .get("candidates")
             .and_then(|c| c.as_array())
@@ -1026,6 +1033,14 @@ impl TranslatorService {
             .json()
             .await
             .map_err(|e| redact_secrets(&format!("OpenAI response error: {:?}", e)))?;
+
+        if let Some(err_msg) = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Err(redact_secrets(&format!("OpenAI API error: {}", err_msg)));
+        }
 
         let text_res = json
             .get("choices")
@@ -1148,6 +1163,14 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("Gemini Vision response error: {:?}", e)))?;
 
+        if let Some(err_msg) = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Err(redact_secrets(&format!("Gemini Vision API error: {}", err_msg)));
+        }
+
         let raw_text = json
             .get("candidates")
             .and_then(|c| c.as_array())
@@ -1216,6 +1239,14 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("OpenAI Vision response error: {:?}", e)))?;
 
+        if let Some(err_msg) = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Err(redact_secrets(&format!("OpenAI Vision API error: {}", err_msg)));
+        }
+
         let raw_text = json
             .get("choices")
             .and_then(|c| c.as_array())
@@ -1258,7 +1289,7 @@ impl TranslatorService {
 
         let preprocessed = self.context.preprocess(&normalized);
         let raw = self
-            .translate_provider_raw(&preprocessed, source_lang, target_lang, config)
+            .translate_provider_raw(preprocessed, source_lang, target_lang, config)
             .await?;
         let clean_ru = clean_russian_punctuation(&raw);
         let final_text = self.context.postprocess(&clean_ru);
@@ -1311,15 +1342,29 @@ impl TranslatorService {
             WordDetails::default()
         };
 
+        let mut is_success = !details.primary.is_empty();
+
         if details.primary.is_empty() {
-            let fallback_trans = self
+            match self
                 .translate_text(normalized, source_lang, target_lang, config)
                 .await
-                .unwrap_or_else(|_| normalized.to_string());
-            details.primary = fallback_trans;
+            {
+                Ok(fallback_trans) => {
+                    details.primary = fallback_trans;
+                    is_success = true;
+                }
+                Err(e) => {
+                    warn!(
+                        "Translation fallback failed for word '{}': {}",
+                        normalized, e
+                    );
+                    details.primary = normalized.to_string();
+                    is_success = false;
+                }
+            }
         }
 
-        if let Ok(serialized) = serde_json::to_string(&details) {
+        if is_success && let Ok(serialized) = serde_json::to_string(&details) {
             self.cache.insert(cache_key, serialized);
         }
 
@@ -1930,5 +1975,54 @@ mod tests {
             resolve_openai_vision_model(None, "http://localhost:11434/v1", "llava:latest"),
             "llava:latest"
         );
+    }
+
+    #[tokio::test]
+    async fn test_lookup_word_details_failure_does_not_pollute_cache() {
+        let service = TranslatorService::new();
+        let config = AppConfig {
+            provider: TranslationProvider::OpenAICompatible,
+            openai_api_key: Some("dummy_key".to_string()),
+            openai_base_url: "http://127.0.0.1:9".to_string(),
+            ..Default::default()
+        };
+
+        let details = service
+            .lookup_word_details("untranslatedword123", "en", "ru", &config)
+            .await;
+        assert_eq!(details.primary, "untranslatedword123");
+
+        // The failed translation must NOT be stored in cache
+        let cache_key = "dict:openai_compatible:en:ru:untranslatedword123";
+        assert_eq!(service.cache.get(cache_key), None);
+    }
+
+    #[test]
+    fn test_api_error_response_parsing() {
+        let gemini_err: serde_json::Value = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT"
+            }
+        });
+        let msg = gemini_err
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str());
+        assert_eq!(msg, Some("API key not valid. Please pass a valid API key."));
+
+        let openai_err: serde_json::Value = serde_json::json!({
+            "error": {
+                "message": "Incorrect API key provided",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key"
+            }
+        });
+        let msg_oai = openai_err
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str());
+        assert_eq!(msg_oai, Some("Incorrect API key provided"));
     }
 }

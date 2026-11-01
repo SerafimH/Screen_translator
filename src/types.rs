@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 use tracing::warn;
 
 /// Computes standard Rec. 601 luma (Y) from 8-bit BGR color components.
@@ -575,9 +575,20 @@ impl fmt::Debug for AppConfig {
 impl AppConfig {
     /// Loads configuration from `config.toml`, falling back to defaults for missing fields or files.
     pub fn load_or_default() -> Self {
-        let candidates = ["config.toml", "../config.toml"];
+        let mut candidates = vec![
+            PathBuf::from("config.toml"),
+            PathBuf::from("../config.toml"),
+        ];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent()
+        {
+            candidates.push(exe_dir.join("config.toml"));
+            if let Some(parent) = exe_dir.parent() {
+                candidates.push(parent.join("config.toml"));
+            }
+        }
         for path in &candidates {
-            if Path::new(path).exists()
+            if path.exists()
                 && let Ok(content) = fs::read_to_string(path)
             {
                 return Self::from_toml_str(&content);
@@ -941,5 +952,13 @@ mod tests {
         // Cursor far outside
         let target_miss = find_text_under_cursor(&blocks, 500, 500);
         assert!(target_miss.is_none());
+    }
+
+    #[test]
+    fn test_load_or_default_returns_valid_config() {
+        let config = AppConfig::load_or_default();
+        assert!(!config.source_lang.is_empty());
+        assert!(!config.target_lang.is_empty());
+        assert!(config.auto_mode_interval_ms >= 100);
     }
 }

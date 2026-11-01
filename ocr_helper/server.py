@@ -33,7 +33,7 @@ def read_exact(stream, num_bytes: int) -> Optional[bytes]:
     return bytes(buf)
 
 
-def create_ocr_engine(models_dir: Optional[str] = None):
+def create_ocr_engine(models_dir: Optional[str] = None, lang: str = "en"):
     """Initializes RapidOCR engine using local models if present."""
     try:
         from rapidocr import RapidOCR
@@ -42,19 +42,38 @@ def create_ocr_engine(models_dir: Optional[str] = None):
         if models_dir and os.path.exists(models_dir):
             params["Global.model_root_dir"] = models_dir
             params["Det.lang_type"] = "en"
-            params["Rec.lang_type"] = "en"
+            params["Rec.lang_type"] = lang
             params["Cls.lang_type"] = "ch"
-        logger.info(f"Initializing RapidOCR engine with models_dir={models_dir}...")
+        logger.info(f"Initializing RapidOCR engine ({lang}) with models_dir={models_dir}...")
         return RapidOCR(params=params if params else None)
     except ImportError:
         try:
             from rapidocr_onnxruntime import RapidOCR
 
-            logger.info("Initializing RapidOCR via rapidocr_onnxruntime fallback...")
+            logger.info(f"Initializing RapidOCR ({lang}) via rapidocr_onnxruntime fallback...")
             return RapidOCR()
         except ImportError as e:
             logger.error(f"RapidOCR is not installed: {e}")
             raise
+
+
+class EngineManager:
+    """Manages language-specific RapidOCR engine instances with lazy loading."""
+
+    def __init__(self, models_dir: Optional[str] = None, default_engine=None):
+        self.models_dir = models_dir
+        self.engines: Dict[str, Any] = {}
+        if default_engine is not None:
+            self.engines["default"] = default_engine
+
+    def get_engine(self, lang: str):
+        base_lang = lang.split("-")[0].split("_")[0].lower() if lang else "en"
+        if "default" in self.engines:
+            return self.engines["default"]
+        if base_lang not in self.engines:
+            logger.info(f"Loading RapidOCR engine for language: {base_lang}")
+            self.engines[base_lang] = create_ocr_engine(self.models_dir, lang=base_lang)
+        return self.engines[base_lang]
 
 
 def extract_lines_from_result(result) -> List[Dict[str, Any]]:
@@ -171,7 +190,14 @@ def process_request(
             # In test environments without numpy installed, pass raw buffer directly to mock engine
             img_bgr = raw_rgb
 
-        result = engine(img_bgr)
+        if hasattr(engine, "get_engine"):
+            ocr_exec = engine.get_engine(base_lang)
+        elif isinstance(engine, dict):
+            ocr_exec = engine.get(base_lang) or next(iter(engine.values()))
+        else:
+            ocr_exec = engine
+
+        result = ocr_exec(img_bgr)
         lines = extract_lines_from_result(result)
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return {
@@ -228,11 +254,7 @@ def run_server(stdin=None, stdout=None, engine=None):
 
     if engine is None:
         models_dir = resolve_models_dir()
-        try:
-            engine = create_ocr_engine(models_dir)
-        except Exception as e:
-            logger.error(f"Failed to create OCR engine: {e}")
-            sys.exit(1)
+        engine = EngineManager(models_dir)
 
     # Send ready notification to client
     ready_msg = json.dumps({"event": "ready"}).encode("utf-8") + b"\n"

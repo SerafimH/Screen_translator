@@ -107,6 +107,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
 pub enum AppEvent {
     TriggerTranslate,
     RoiSelected(ScreenRect),
+    ResetRoi,
     ToggleAutoMode,
     CycleProvider,
     CycleOcrMode,
@@ -124,6 +125,7 @@ pub struct OverlaySharedState {
     pub active_roi: Option<ScreenRect>,
     pub auto_mode: bool,
     pub provider_name: String,
+    pub ocr_engine_name: String,
 }
 
 impl Default for OverlaySharedState {
@@ -135,6 +137,7 @@ impl Default for OverlaySharedState {
             active_roi: None,
             auto_mode: false,
             provider_name: "Google Translate".to_string(),
+            ocr_engine_name: "RapidOCR".to_string(),
         }
     }
 }
@@ -212,6 +215,16 @@ impl OverlayHandle {
         }
     }
 
+    pub fn set_ocr_engine_name(&self, name: String) {
+        {
+            let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.ocr_engine_name = name;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0));
+        }
+    }
+
     pub fn start_roi_selection(&self) {
         unsafe {
             let _ = PostMessageW(
@@ -227,6 +240,7 @@ impl OverlayHandle {
         {
             let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             s.current_blocks.clear();
+            s.active_roi = None;
             s.status_msg = Some("Очищено".to_string());
             s.is_loading = false;
         }
@@ -239,6 +253,7 @@ impl OverlayHandle {
         {
             let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             s.current_blocks.clear();
+            s.status_msg = Some("Готов".to_string());
             s.is_loading = false;
         }
         unsafe {
@@ -265,6 +280,8 @@ struct WindowThreadState {
     event_tx: UnboundedSender<AppEvent>,
     // Low-level keyboard hook handle for Shift word/sentence translation
     keyboard_hook: HHOOK,
+    // Previously focused window to restore after selection mode
+    previous_foreground_hwnd: HWND,
 }
 
 pub struct OverlayManager;
@@ -453,6 +470,7 @@ impl OverlayManager {
                     shared_state: shared_for_thread,
                     event_tx,
                     keyboard_hook,
+                    previous_foreground_hwnd: HWND(core::ptr::null_mut()),
                 });
 
                 let state_ptr = Box::into_raw(state);
@@ -510,6 +528,7 @@ fn render_current_scene(state: &mut WindowThreadState) {
         active_roi: shared.active_roi,
         auto_mode: shared.auto_mode,
         provider_name: &shared.provider_name,
+        ocr_engine_name: &shared.ocr_engine_name,
         mode: state.mode,
         selection_rect: sel_rect,
         status_msg: shared.status_msg.as_deref(),
@@ -582,6 +601,7 @@ unsafe extern "system" fn overlay_wndproc(
                     {
                         let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                         s.current_blocks.clear();
+                        s.active_roi = None;
                         s.status_msg = Some("Очищено".to_string());
                         s.is_loading = false;
                     }
@@ -645,15 +665,22 @@ unsafe extern "system" fn overlay_wndproc(
                     s.active_roi = Some(rect);
                     s.status_msg = Some(format!("Область выбрана: {}x{}", rect.width, rect.height));
                 }
-            } else {
-                let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
-                s.status_msg = Some("Выделение слишком мало".to_string());
-            }
-
-            render_current_scene(state);
-
-            if rect.width > 20 && rect.height > 20 {
+                render_current_scene(state);
                 let _ = state.event_tx.send(AppEvent::RoiSelected(rect));
+            } else if rect.width <= 5 && rect.height <= 5 {
+                {
+                    let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.active_roi = None;
+                    s.status_msg = Some("Область сброшена (полный экран)".to_string());
+                }
+                render_current_scene(state);
+                let _ = state.event_tx.send(AppEvent::ResetRoi);
+            } else {
+                {
+                    let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.status_msg = Some("Выделение слишком мало".to_string());
+                }
+                render_current_scene(state);
             }
 
             LRESULT(0)
@@ -730,6 +757,9 @@ fn enter_selection_mode(state: &mut WindowThreadState) {
     };
 
     let fg_hwnd = unsafe { GetForegroundWindow() };
+    if fg_hwnd != state.hwnd {
+        state.previous_foreground_hwnd = fg_hwnd;
+    }
     let current_thread_id = unsafe { GetCurrentThreadId() };
     let fg_thread_id = if !fg_hwnd.0.is_null() {
         unsafe { GetWindowThreadProcessId(fg_hwnd, None) }
@@ -773,6 +803,10 @@ fn exit_selection_mode(state: &mut WindowThreadState) {
             SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
         )
     };
+    if !state.previous_foreground_hwnd.0.is_null() {
+        let _ = unsafe { SetForegroundWindow(state.previous_foreground_hwnd) };
+        state.previous_foreground_hwnd = HWND(core::ptr::null_mut());
+    }
 }
 
 #[cfg(test)]
