@@ -28,11 +28,6 @@ pub const DELTA_THRESHOLD: f32 = 3.5;
 
 static WINRT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Returns the total number of WinRT capture timeouts that have occurred.
-pub fn winrt_timeout_count() -> u64 {
-    WINRT_TIMEOUT_COUNT.load(Ordering::Relaxed)
-}
-
 /// Compact 32x16 Luma perceptual hash to detect genuine dialogue transitions
 /// while rejecting flickering cursors, animated particles, and subtle background noise.
 #[derive(Debug, Clone, PartialEq)]

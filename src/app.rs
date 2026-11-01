@@ -74,6 +74,16 @@ struct AppState {
     current_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
+/// Checks whether WinRT Pass 1 yielded confident OCR text.
+pub fn is_pass1_confident(pass1_score: usize, pass1_lines_count: usize) -> bool {
+    pass1_score >= 12 && pass1_lines_count > 0
+}
+
+/// Checks whether RapidOCR helper returned valid non-garbage dialogue blocks.
+pub fn is_helper_result_valid(blocks: &[OcrBlock]) -> bool {
+    !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text))
+}
+
 pub struct App {
     state: AppState,
     event_rx: UnboundedReceiver<AppEvent>,
@@ -156,18 +166,19 @@ impl App {
                     .unwrap_or_else(|e| e.into_inner());
 
                 let frame_res = tokio::task::spawn_blocking(move || {
-                    ScreenCapture::capture_primary(current_roi)
+                    let frame = ScreenCapture::capture_primary(current_roi)?;
+                    let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
+                    Ok::<(CapturedFrame, FrameSignature), String>((frame, sig))
                 })
                 .await;
 
-                let frame = match frame_res {
-                    Ok(Ok(f)) => f,
+                let (frame, sig) = match frame_res {
+                    Ok(Ok(pair)) => pair,
                     _ => continue,
                 };
 
-                let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
                 {
-                    let mut last_sig_lock = auto_state
+                    let last_sig_lock = auto_state
                         .last_signature
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
@@ -176,7 +187,6 @@ impl App {
                     {
                         continue;
                     }
-                    *last_sig_lock = Some(sig);
                 }
 
                 let task_state = auto_state.clone();
@@ -374,13 +384,28 @@ pub fn cursor_capture_roi(
     active_roi: Option<ScreenRect>,
     min_x: i32,
     min_y: i32,
+    max_x: i32,
+    max_y: i32,
 ) -> ScreenRect {
     if let Some(roi) = active_roi.filter(|r| r.contains(pt.x, pt.y)) {
         roi
     } else {
-        let cap_x = (pt.x - 400).max(min_x);
-        let cap_y = (pt.y - 120).max(min_y);
-        ScreenRect::new(cap_x, cap_y, 800, 240)
+        let cap_w = 800.min((max_x - min_x).max(1));
+        let cap_h = 240.min((max_y - min_y).max(1));
+
+        let cap_x = if max_x > min_x + cap_w {
+            (pt.x - cap_w / 2).clamp(min_x, max_x - cap_w)
+        } else {
+            min_x
+        };
+
+        let cap_y = if max_y > min_y + cap_h {
+            (pt.y - cap_h / 2).clamp(min_y, max_y - cap_h)
+        } else {
+            min_y
+        };
+
+        ScreenRect::new(cap_x, cap_y, cap_w, cap_h)
     }
 }
 
@@ -413,23 +438,39 @@ impl AppState {
         // If an active ROI was manually selected and contains the cursor, capture that ROI;
         // otherwise, capture a focused region (800x240) centered on the cursor clamped to virtual screen coordinates.
         let active = *self.active_roi.lock().unwrap_or_else(|e| e.into_inner());
-        let (vx, vy) = unsafe {
+        let (vx, vy, vw, vh, primary_w, primary_h) = unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-                SM_YVIRTUALSCREEN,
+                GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             };
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let pw = GetSystemMetrics(SM_CXSCREEN);
+            let ph = GetSystemMetrics(SM_CYSCREEN);
             if vw > 0 && vh > 0 {
                 (
                     GetSystemMetrics(SM_XVIRTUALSCREEN),
                     GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    vw,
+                    vh,
+                    pw,
+                    ph,
                 )
             } else {
-                (0, 0)
+                (0, 0, pw, ph, pw, ph)
             }
         };
-        let capture_roi = cursor_capture_roi(pt, active, vx, vy);
+
+        // If cursor is within primary monitor bounds, keep ROI on primary monitor [0, primary_w / primary_h]
+        // so fast WinRT D3D11 capture is preserved instead of spilling into secondary displays
+        let (min_x, min_y, max_x, max_y) =
+            if pt.x >= 0 && pt.x < primary_w && pt.y >= 0 && pt.y < primary_h {
+                (0, 0, primary_w, primary_h)
+            } else {
+                (vx, vy, vx + vw, vy + vh)
+            };
+
+        let capture_roi = cursor_capture_roi(pt, active, min_x, min_y, max_x, max_y);
 
         self.overlay
             .set_loading(true, Some("Поиск текста под курсором...".to_string()));
@@ -633,11 +674,13 @@ impl AppState {
             "Captured {}x{} frame. Running OCR (mode: {:?})...",
             frame.width, frame.height, cfg.ocr_engine
         );
+        let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
 
         let blocks = match self.perform_ocr(&frame, &cfg).await {
             Ok(b) => b,
             Err(e) => {
                 error!("OCR error: {}", e);
+                *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
                 self.overlay
                     .update_blocks(Vec::new(), Some(format!("Ошибка OCR: {}", e)));
                 return;
@@ -670,6 +713,7 @@ impl AppState {
                             elapsed
                         );
                         info!("{}", status);
+                        *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
                         self.overlay.update_blocks(vision_blocks, Some(status));
                         return;
                     }
@@ -690,6 +734,7 @@ impl AppState {
             } else {
                 format!("Текст не найден ({} мс)", elapsed)
             };
+            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
             self.overlay.update_blocks(Vec::new(), Some(status));
             return;
         }
@@ -709,6 +754,8 @@ impl AppState {
         let elapsed = start_time.elapsed().as_millis();
         let status = format!("Переведено {} блоков за {} мс", translations.len(), elapsed);
         info!("{}", status);
+
+        *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
 
         self.overlay.update_blocks(translations, Some(status));
     }
@@ -765,7 +812,7 @@ impl AppState {
                 let pass1_lines = ocr.recognize_pass_1(frame).await.unwrap_or_default();
                 let pass1_score = score_recognized_lines(&pass1_lines);
 
-                if pass1_score >= 12 && !pass1_lines.is_empty() {
+                if is_pass1_confident(pass1_score, pass1_lines.len()) {
                     info!(
                         "Auto mode: WinRT Pass 1 succeeded with high score ({})",
                         pass1_score
@@ -789,10 +836,7 @@ impl AppState {
                     self.overlay
                         .set_loading(true, Some("Auto: пробую RapidOCR помощник...".to_string()));
                     match self.helper_ocr.recognize(frame, &cfg.ocr_lang).await {
-                        Ok(blocks)
-                            if !blocks.is_empty()
-                                && blocks.iter().any(|b| !is_ocr_garbage(&b.text)) =>
-                        {
+                        Ok(blocks) if is_helper_result_valid(&blocks) => {
                             info!(
                                 "Auto mode: RapidOCR helper succeeded with {} blocks",
                                 blocks.len()
@@ -1061,29 +1105,79 @@ mod tests {
 
     #[test]
     fn test_cursor_capture_roi_multi_monitor_bounds() {
-        // Primary monitor: pt=(500, 300), min=(0, 0)
+        // Primary monitor: pt=(500, 300), min=(0, 0), max=(1920, 1080)
         let pt_primary = POINT { x: 500, y: 300 };
-        let roi_primary = cursor_capture_roi(pt_primary, None, 0, 0);
+        let roi_primary = cursor_capture_roi(pt_primary, None, 0, 0, 1920, 1080);
         assert_eq!(roi_primary.x, 100);
         assert_eq!(roi_primary.y, 180);
         assert_eq!(roi_primary.width, 800);
         assert_eq!(roi_primary.height, 240);
 
-        // Secondary monitor to the left: pt=(-1000, 200), min=(-1920, 0)
+        // Right edge of primary monitor: pt=(1850, 300) -> must clamp cap_x to 1920 - 800 = 1120
+        let pt_right = POINT { x: 1850, y: 300 };
+        let roi_right = cursor_capture_roi(pt_right, None, 0, 0, 1920, 1080);
+        assert_eq!(roi_right.x, 1120);
+        assert_eq!(roi_right.y, 180);
+        assert_eq!(roi_right.x + roi_right.width, 1920);
+
+        // Secondary monitor to the left: pt=(-1000, 200), min=(-1920, 0), max=(0, 1080)
         let pt_left = POINT { x: -1000, y: 200 };
-        let roi_left = cursor_capture_roi(pt_left, None, -1920, 0);
+        let roi_left = cursor_capture_roi(pt_left, None, -1920, 0, 0, 1080);
         assert_eq!(roi_left.x, -1400);
         assert_eq!(roi_left.y, 80);
 
-        // Secondary monitor to the top-left: pt=(-1800, -500), min=(-1920, -1080)
+        // Secondary monitor to the top-left: pt=(-1800, -500), min=(-1920, -1080), max=(0, 0)
         let pt_topleft = POINT { x: -1800, y: -500 };
-        let roi_topleft = cursor_capture_roi(pt_topleft, None, -1920, -1080);
+        let roi_topleft = cursor_capture_roi(pt_topleft, None, -1920, -1080, 0, 0);
         assert_eq!(roi_topleft.x, -1920); // clamped to min_x
         assert_eq!(roi_topleft.y, -620);
 
         // If manual active ROI contains pt, it takes precedence
         let active = ScreenRect::new(-1200, 100, 400, 300);
-        let roi_manual = cursor_capture_roi(pt_left, Some(active), -1920, 0);
+        let roi_manual = cursor_capture_roi(pt_left, Some(active), -1920, 0, 0, 1080);
         assert_eq!(roi_manual, active);
+    }
+
+    #[tokio::test]
+    async fn test_auto_mode_signature_not_overwritten_when_busy() {
+        let is_processing = Arc::new(AtomicBool::new(true)); // Worker is currently busy
+        let last_signature: Arc<Mutex<Option<FrameSignature>>> = Arc::new(Mutex::new(None));
+
+        // When perform_translation is called while busy, acquire_or_wait returns None
+        // and last_signature must remain None (not prematurely updated).
+        let guard_opt = ProcessingGuard::acquire_or_wait(&is_processing, std::time::Duration::from_millis(50)).await;
+        assert!(guard_opt.is_none());
+        assert_eq!(*last_signature.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn test_auto_ocr_fallback_predicates() {
+        // High score Pass 1 with lines
+        assert!(is_pass1_confident(15, 2));
+        // Exact threshold boundary: score 12 with lines
+        assert!(is_pass1_confident(12, 1));
+        // Low score Pass 1 (< 12)
+        assert!(!is_pass1_confident(11, 2));
+        // Zero lines with high score cannot be accepted
+        assert!(!is_pass1_confident(25, 0));
+
+        // RapidOCR returns valid dialogue text
+        let valid_block = OcrBlock {
+            text: "Hello, traveler!".to_string(),
+            rect: ScreenRect::new(10, 10, 100, 30),
+            lines: Vec::new(),
+        };
+        assert!(is_helper_result_valid(&[valid_block]));
+
+        // RapidOCR returns empty blocks
+        assert!(!is_helper_result_valid(&[]));
+
+        // RapidOCR returns only noise/garbage
+        let garbage_block = OcrBlock {
+            text: "...".to_string(),
+            rect: ScreenRect::new(10, 10, 30, 15),
+            lines: Vec::new(),
+        };
+        assert!(!is_helper_result_valid(&[garbage_block]));
     }
 }

@@ -29,14 +29,13 @@ fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
 
 pub struct WinrtOcrEngine {
     engine: OcrEngine,
-    language_tag: String,
 }
 
 // SAFETY: The underlying WinRT runtime class `Windows.Media.Ocr.OcrEngine` has Agile
 // marshaling behavior (implements IAgileObject in Windows Metadata), for which the `windows`
 // crate explicitly provides `unsafe impl Send for OcrEngine {}` and `unsafe impl Sync for OcrEngine {}`
 // (see `windows` v0.62.2, `src/Windows/Media/Ocr/mod.rs:153-154`). Since all fields of `WinrtOcrEngine`
-// (`engine: OcrEngine` and `language_tag: String`) are `Send + Sync`, implementing Send and Sync is sound.
+// (`engine: OcrEngine`) are `Send + Sync`, implementing Send and Sync is sound.
 unsafe impl Send for WinrtOcrEngine {}
 unsafe impl Sync for WinrtOcrEngine {}
 
@@ -129,14 +128,7 @@ impl WinrtOcrEngine {
             .to_string();
 
         info!("Initialized WinrtOcrEngine with language: {}", lang);
-        Ok(Self {
-            engine,
-            language_tag: lang,
-        })
-    }
-
-    pub fn language(&self) -> &str {
-        &self.language_tag
+        Ok(Self { engine })
     }
 
     /// Checks if a given language (e.g. "en" or "ru") is installed and available for WinRT OCR.
@@ -167,7 +159,11 @@ impl WinrtOcrEngine {
             return Ok(Vec::new());
         }
 
-        let (prep, _) = prepare_ocr_image(frame);
+        let frame_clone = frame.clone();
+        let (prep, _) = tokio::task::spawn_blocking(move || prepare_ocr_image(&frame_clone))
+            .await
+            .map_err(|e| format!("Prepare OCR image task join error: {:?}", e))?;
+
         let remap = RemapParams {
             pad: prep.pad,
             scale: prep.scale,
@@ -201,7 +197,10 @@ impl WinrtOcrEngine {
         save_debug_image("raw.png", &frame.bgra_bytes, frame.width, frame.height);
 
         // 1. Pass 1: Standard manga preprocessing (bubble cleaning and contrast enhancement)
-        let (prep, fallback_inv) = prepare_ocr_image(frame);
+        let frame_clone = frame.clone();
+        let (prep, fallback_inv) = tokio::task::spawn_blocking(move || prepare_ocr_image(&frame_clone))
+            .await
+            .map_err(|e| format!("Prepare OCR image task join error: {:?}", e))?;
         save_debug_image("prep.png", &prep.bgra_bytes, prep.width, prep.height);
 
         let remap = RemapParams {
@@ -235,11 +234,14 @@ impl WinrtOcrEngine {
 
             // Pass 2: Outlined text mask (meme font filter)
             if std::time::Instant::now() < deadline {
-                let mask_bgra = preprocessing::extract_outlined_text_mask(
-                    &frame.bgra_bytes,
-                    frame.width,
-                    frame.height,
-                );
+                let bytes = frame.bgra_bytes.clone();
+                let fw = frame.width;
+                let fh = frame.height;
+                let mask_bgra = tokio::task::spawn_blocking(move || {
+                    preprocessing::extract_outlined_text_mask(&bytes, fw, fh)
+                })
+                .await
+                .unwrap_or_default();
                 save_debug_image("meme_mask.png", &mask_bgra, frame.width, frame.height);
 
                 let mask_pass = OcrPassParams {
@@ -322,13 +324,14 @@ impl WinrtOcrEngine {
 
             // Pass 5: Upscaled & contrast-enhanced (for small / fine print)
             if best_score < 15 && std::time::Instant::now() < deadline {
-                let (up_bgra, up_w, up_h, applied_scale) =
-                    preprocessing::upscale_and_enhance_contrast(
-                        &frame.bgra_bytes,
-                        frame.width,
-                        frame.height,
-                        2.0,
-                    );
+                let bytes = frame.bgra_bytes.clone();
+                let fw = frame.width;
+                let fh = frame.height;
+                let (up_bgra, up_w, up_h, applied_scale) = tokio::task::spawn_blocking(move || {
+                    preprocessing::upscale_and_enhance_contrast(&bytes, fw, fh, 2.0)
+                })
+                .await
+                .unwrap_or_else(|_| (Vec::new(), 0, 0, 1.0));
                 if applied_scale > 1.05 {
                     save_debug_image("upscaled.png", &up_bgra, up_w, up_h);
                     let up_pass = OcrPassParams {

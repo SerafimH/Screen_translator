@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Computes standard Rec. 601 luma (Y) from 8-bit BGR color components.
 ///
@@ -76,16 +76,6 @@ impl ScreenRect {
         Self {
             x: self.x - origin_x,
             y: self.y - origin_y,
-            width: self.width,
-            height: self.height,
-        }
-    }
-
-    /// Converts from local window coordinates to global screen coordinates given a virtual origin.
-    pub fn to_global(&self, origin_x: i32, origin_y: i32) -> Self {
-        Self {
-            x: self.x + origin_x,
-            y: self.y + origin_y,
             width: self.width,
             height: self.height,
         }
@@ -575,6 +565,7 @@ impl fmt::Debug for AppConfig {
 impl AppConfig {
     /// Loads configuration from `config.toml`, falling back to defaults for missing fields or files.
     pub fn load_or_default() -> Self {
+        let mut target_dir = PathBuf::from(".");
         let mut candidates = vec![
             PathBuf::from("config.toml"),
             PathBuf::from("../config.toml"),
@@ -582,6 +573,7 @@ impl AppConfig {
         if let Ok(exe) = std::env::current_exe()
             && let Some(exe_dir) = exe.parent()
         {
+            target_dir = exe_dir.to_path_buf();
             candidates.push(exe_dir.join("config.toml"));
             if let Some(parent) = exe_dir.parent() {
                 candidates.push(parent.join("config.toml"));
@@ -594,7 +586,16 @@ impl AppConfig {
                 return Self::from_toml_str(&content);
             }
         }
-        Self::default()
+        let def = Self::default();
+        if let Ok(toml_str) = toml::to_string_pretty(&def) {
+            let write_path = target_dir.join("config.toml");
+            if let Err(e) = fs::write(&write_path, toml_str) {
+                warn!("Failed to create default {}: {e}", write_path.display());
+            } else {
+                info!("Created default {}", write_path.display());
+            }
+        }
+        def
     }
 
     /// Parses a TOML string into `AppConfig`, falling back to defaults on parse error.
@@ -629,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_global_virtual_screen_conversion() {
+    fn test_to_local_virtual_screen_conversion() {
         // Multi-monitor setup with secondary monitor to the left at x = -1920
         let origin_x = -1920;
         let origin_y = 0;
@@ -637,9 +638,6 @@ mod tests {
         let global_rect = ScreenRect::new(-1000, 150, 400, 300);
         let local_rect = global_rect.to_local(origin_x, origin_y);
         assert_eq!(local_rect, ScreenRect::new(920, 150, 400, 300));
-
-        let restored_global = local_rect.to_global(origin_x, origin_y);
-        assert_eq!(restored_global, global_rect);
     }
 
     #[test]
@@ -960,5 +958,17 @@ mod tests {
         assert!(!config.source_lang.is_empty());
         assert!(!config.target_lang.is_empty());
         assert!(config.auto_mode_interval_ms >= 100);
+    }
+
+    #[test]
+    fn test_app_config_default_roundtrip_toml() {
+        let def = AppConfig::default();
+        let toml_str = toml::to_string_pretty(&def).expect("Serialization to TOML must succeed");
+        let parsed = AppConfig::from_toml_str(&toml_str);
+        assert_eq!(parsed.provider, def.provider);
+        assert_eq!(parsed.ocr_engine, def.ocr_engine);
+        assert_eq!(parsed.ocr_lang, def.ocr_lang);
+        assert_eq!(parsed.source_lang, def.source_lang);
+        assert_eq!(parsed.target_lang, def.target_lang);
     }
 }

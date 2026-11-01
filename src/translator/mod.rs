@@ -74,8 +74,14 @@ impl ContextManager {
         let mut result = translated.to_string();
         let mut lower_result = result.to_lowercase();
 
-        for (lower_key, entry) in g.iter() {
-            if lower_result.contains(lower_key)
+        let mut entries: Vec<&GlossaryEntry> = g.values().collect();
+        // Sort descending by original term length so compound terms (e.g. "MAX HP")
+        // are replaced before shorter sub-terms (e.g. "HP").
+        entries.sort_by(|a, b| b.original.len().cmp(&a.original.len()));
+
+        for entry in entries {
+            let lower_key = entry.original.to_lowercase();
+            if lower_result.contains(&lower_key)
                 && let Ok(re) = regex_simple_replace(&result, &entry.original, &entry.replacement)
             {
                 result = re;
@@ -474,18 +480,17 @@ pub fn normalize_all_caps(text: &str) -> String {
         let mut words_fixed = Vec::new();
         for word in result.split(' ') {
             let lower = word.to_lowercase();
+            let core = word
+                .trim_matches(|c: char| !c.is_alphabetic())
+                .to_lowercase();
             if lower == "i" {
                 words_fixed.push("I".to_string());
             } else if let Some(rest) = lower.strip_prefix("i'") {
                 words_fixed.push(format!("I'{}", rest));
-            } else if lower == "hp"
-                || lower == "mp"
-                || lower == "exp"
-                || lower == "lv"
-                || lower == "atk"
-                || lower == "def"
-                || lower == "npc"
-            {
+            } else if matches!(
+                core.as_str(),
+                "hp" | "mp" | "exp" | "lv" | "atk" | "def" | "npc"
+            ) {
                 words_fixed.push(word.to_uppercase());
             } else {
                 words_fixed.push(word.to_string());
@@ -830,15 +835,17 @@ impl TranslatorService {
         target_lang: &str,
     ) -> Result<String, String> {
         let url = format!(
-            "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dj=1&q={}",
+            "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dj=1",
             urlencode(source_lang),
-            urlencode(target_lang),
-            urlencode(text)
+            urlencode(target_lang)
         );
+        let body = format!("q={}", urlencode(text));
 
         let resp = self
             .client
-            .get(&url)
+            .post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
@@ -1271,7 +1278,18 @@ impl TranslatorService {
     ) -> Result<String, String> {
         let cleaned = clean_ocr_noise(text);
         let normalized = normalize_all_caps(&cleaned);
+        self.translate_normalized_text(&normalized, source_lang, target_lang, config, true)
+            .await
+    }
 
+    async fn translate_normalized_text(
+        &self,
+        normalized: &str,
+        source_lang: &str,
+        target_lang: &str,
+        config: &AppConfig,
+        record_history: bool,
+    ) -> Result<String, String> {
         if normalized.is_empty() {
             return Ok(String::new());
         }
@@ -1287,7 +1305,7 @@ impl TranslatorService {
             return Ok(cached);
         }
 
-        let preprocessed = self.context.preprocess(&normalized);
+        let preprocessed = self.context.preprocess(normalized);
         let raw = self
             .translate_provider_raw(preprocessed, source_lang, target_lang, config)
             .await?;
@@ -1295,8 +1313,10 @@ impl TranslatorService {
         let final_text = self.context.postprocess(&clean_ru);
 
         self.cache.insert(cache_key, final_text.clone());
-        self.context
-            .record_translation(normalized, final_text.clone());
+        if record_history {
+            self.context
+                .record_translation(normalized.to_string(), final_text.clone());
+        }
 
         Ok(final_text)
     }
@@ -1586,22 +1606,22 @@ impl TranslatorService {
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.ok();
                 let res = this
-                    .translate_text(&clean_text, &cfg.source_lang, &cfg.target_lang, &cfg)
+                    .translate_normalized_text(&clean_text, &cfg.source_lang, &cfg.target_lang, &cfg, false)
                     .await;
                 (idx, orig_text, rect, res)
             });
         }
 
-        let mut collected: Vec<(usize, TranslationBlock)> = Vec::with_capacity(blocks.len());
+        let mut collected: Vec<(usize, TranslationBlock, bool)> = Vec::with_capacity(blocks.len());
 
         while let Some(res) = join_set.join_next().await {
             match res {
                 Ok((idx, orig_text, rect, trans_res)) => {
-                    let translated_text = match trans_res {
-                        Ok(t) => t,
+                    let (translated_text, is_ok) = match trans_res {
+                        Ok(t) => (t, true),
                         Err(e) => {
                             error!("Failed to translate block '{}': {}", orig_text, e);
-                            format!("[Err: {}]", orig_text)
+                            (format!("[Err: {}]", orig_text), false)
                         }
                     };
                     collected.push((
@@ -1611,6 +1631,7 @@ impl TranslatorService {
                             translated_text,
                             rect,
                         },
+                        is_ok,
                     ));
                 }
                 Err(e) => {
@@ -1619,8 +1640,14 @@ impl TranslatorService {
             }
         }
 
-        collected.sort_by_key(|(idx, _)| *idx);
-        collected.into_iter().map(|(_, block)| block).collect()
+        collected.sort_by_key(|(idx, _, _)| *idx);
+        for (idx, block, is_ok) in &collected {
+            if *is_ok {
+                self.context
+                    .record_translation(cleaned_texts[*idx].clone(), block.translated_text.clone());
+            }
+        }
+        collected.into_iter().map(|(_, block, _)| block).collect()
     }
 }
 
@@ -1664,6 +1691,13 @@ mod tests {
         // Keep mixed case unchanged
         let mixed = "Already Normal Sentence.";
         assert_eq!(normalize_all_caps(mixed), "Already Normal Sentence.");
+
+        // Stat abbreviations with trailing or wrapping punctuation
+        let stats = "YOUR HP: 100! (MP) RESTORED. CURRENT LV. 5 EXP +50.";
+        assert_eq!(
+            normalize_all_caps(stats),
+            "Your HP: 100! (MP) restored. Current LV. 5 EXP +50."
+        );
     }
 
     #[test]
@@ -1875,6 +1909,11 @@ mod tests {
         let postprocessed = ctx.postprocess(translated);
         assert!(postprocessed.contains("HP"));
         assert!(postprocessed.contains("Опыт"));
+
+        // Compound term must precede shorter sub-term
+        ctx.add_glossary_term("MAX HP", "Максимальное здоровье", None);
+        let compound = ctx.postprocess("Текущие HP и MAX HP героя");
+        assert_eq!(compound, "Текущие HP и Максимальное здоровье героя");
     }
 
     #[test]
@@ -2024,5 +2063,54 @@ mod tests {
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str());
         assert_eq!(msg_oai, Some("Incorrect API key provided"));
+    }
+
+    #[tokio::test]
+    async fn test_translate_blocks_preserves_history_order() {
+        let service = TranslatorService::new();
+        let config = AppConfig {
+            provider: TranslationProvider::Google,
+            source_lang: "en".to_string(),
+            target_lang: "ru".to_string(),
+            ..Default::default()
+        };
+
+        // Prepopulate cache so no network calls are needed
+        service.cache.insert(
+            "google:en:ru:First block".to_string(),
+            "Первый блок".to_string(),
+        );
+        service.cache.insert(
+            "google:en:ru:Second block".to_string(),
+            "Второй блок".to_string(),
+        );
+        service.cache.insert(
+            "google:en:ru:Third block".to_string(),
+            "Третий блок".to_string(),
+        );
+
+        let blocks = vec![
+            OcrBlock {
+                text: "First block".to_string(),
+                rect: ScreenRect::new(0, 0, 100, 20),
+                lines: vec![],
+            },
+            OcrBlock {
+                text: "Second block".to_string(),
+                rect: ScreenRect::new(0, 30, 100, 20),
+                lines: vec![],
+            },
+            OcrBlock {
+                text: "Third block".to_string(),
+                rect: ScreenRect::new(0, 60, 100, 20),
+                lines: vec![],
+            },
+        ];
+
+        let results = service.translate_blocks(&blocks, &config).await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].translated_text, "Первый блок");
+        assert_eq!(results[1].translated_text, "Второй блок");
+        assert_eq!(results[2].translated_text, "Третий блок");
     }
 }

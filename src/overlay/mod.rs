@@ -39,7 +39,6 @@ pub const HOTKEY_QUIT: i32 = 105;
 pub const HOTKEY_CYCLE_PROVIDER: i32 = 106;
 pub const HOTKEY_CYCLE_OCR_MODE: i32 = 107;
 
-pub const WM_APP_ENTER_SELECTION: u32 = WM_APP + 1;
 pub const WM_APP_UPDATE_STATE: u32 = WM_APP + 2;
 pub const WM_APP_CLEAR: u32 = WM_APP + 3;
 
@@ -222,17 +221,6 @@ impl OverlayHandle {
         }
         unsafe {
             let _ = PostMessageW(Some(self.hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0));
-        }
-    }
-
-    pub fn start_roi_selection(&self) {
-        unsafe {
-            let _ = PostMessageW(
-                Some(self.hwnd),
-                WM_APP_ENTER_SELECTION,
-                WPARAM(0),
-                LPARAM(0),
-            );
         }
     }
 
@@ -563,11 +551,6 @@ unsafe extern "system" fn overlay_wndproc(
 
         WM_APP_UPDATE_STATE => {
             render_current_scene(state);
-            LRESULT(0)
-        }
-
-        WM_APP_ENTER_SELECTION => {
-            enter_selection_mode(state);
             LRESULT(0)
         }
 

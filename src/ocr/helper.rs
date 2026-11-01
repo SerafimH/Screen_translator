@@ -670,13 +670,7 @@ impl OcrHelperClient {
                 continue;
             }
 
-            let words = trimmed
-                .split_whitespace()
-                .map(|w| RecognizedWord {
-                    text: w.to_string(),
-                    rect,
-                })
-                .collect();
+            let words = split_line_words_proportionate(trimmed, rect);
 
             recognized.push(RecognizedLine {
                 text: trimmed.to_string(),
@@ -705,9 +699,60 @@ impl OcrHelperClient {
     }
 }
 
+/// Splits recognized line text into words and estimates proportional horizontal bounding boxes
+/// across the line rectangle based on character positions and lengths.
+pub fn split_line_words_proportionate(text: &str, line_rect: ScreenRect) -> Vec<RecognizedWord> {
+    let total_chars = text.chars().count().max(1);
+    let mut words = Vec::new();
+    let mut char_cursor = 0usize;
+
+    for w_str in text.split_whitespace() {
+        if let Some(pos) = text.chars().skip(char_cursor).position(|c| !c.is_whitespace()) {
+            char_cursor += pos;
+        }
+        let w_len = w_str.chars().count();
+        let word_x = line_rect.x
+            + ((char_cursor as f32 / total_chars as f32) * line_rect.width as f32).round() as i32;
+        let word_w = ((w_len as f32 / total_chars as f32) * line_rect.width as f32)
+            .round()
+            .max(1.0) as i32;
+        words.push(RecognizedWord {
+            text: w_str.to_string(),
+            rect: ScreenRect::new(word_x, line_rect.y, word_w, line_rect.height),
+        });
+        char_cursor += w_len;
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_line_words_proportionate() {
+        let line = "The quick fox";
+        let line_rect = ScreenRect::new(100, 50, 130, 20);
+        let words = split_line_words_proportionate(line, line_rect);
+
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0].text, "The");
+        assert_eq!(words[1].text, "quick");
+        assert_eq!(words[2].text, "fox");
+
+        // The first word starts at line_rect.x
+        assert_eq!(words[0].rect.x, 100);
+        assert_eq!(words[0].rect.y, 50);
+        assert_eq!(words[0].rect.height, 20);
+
+        // Subsequent words must strictly advance to the right
+        assert!(words[1].rect.x > words[0].rect.x);
+        assert!(words[2].rect.x > words[1].rect.x);
+
+        // Combined words must fit inside the line rect
+        let last_word_end = words[2].rect.x + words[2].rect.width;
+        assert!(last_word_end <= line_rect.x + line_rect.width + 1);
+    }
 
     #[test]
     fn test_bgra_to_bgr_conversion() {
