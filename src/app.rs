@@ -198,6 +198,7 @@ impl App {
         while let Some(event) = self.event_rx.recv().await {
             match event {
                 AppEvent::TriggerTranslate => {
+                    crate::capture::reset_winrt_timeout_count();
                     self.state.dispatch_translation_task(None);
                 }
 
@@ -260,6 +261,7 @@ impl App {
                 }
 
                 AppEvent::CycleOcrMode => {
+                    crate::capture::reset_winrt_timeout_count();
                     // Abort previous in-flight task on OCR mode switch
                     if let Some(prev) = self
                         .state

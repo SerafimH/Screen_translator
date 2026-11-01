@@ -130,16 +130,16 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
 
     let dist_to_rect = |r: &ScreenRect, x: i32, y: i32| -> i64 {
         let dx = if x < r.x {
-            r.x - x
+            (r.x - x) as i64
         } else if x >= r.x + r.width {
-            x - (r.x + r.width - 1)
+            (x - (r.x + r.width - 1)) as i64
         } else {
             0
         };
         let dy = if y < r.y {
-            r.y - y
+            (r.y - y) as i64
         } else if y >= r.y + r.height {
-            y - (r.y + r.height - 1)
+            (y - (r.y + r.height - 1)) as i64
         } else {
             0
         };
@@ -440,15 +440,17 @@ impl From<AppConfigRaw> for AppConfig {
             resolve_vision_fallback(raw.vision_fallback, raw.use_vision_ocr, false);
         let deepl_api_key = raw.deepl_api_key.filter(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty() && trimmed != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
+            !trimmed.is_empty()
+                && !trimmed.starts_with("your-")
+                && trimmed != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
         });
         let gemini_api_key = raw.gemini_api_key.filter(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty() && trimmed != "AIzaSy..."
+            !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "AIzaSy..."
         });
         let openai_api_key = raw.openai_api_key.filter(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty() && trimmed != "gsk_..."
+            !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "gsk_..."
         });
         Self {
             provider: raw.provider,
@@ -839,6 +841,16 @@ mod tests {
         assert_eq!(cfg_placeholders.gemini_api_key, None);
         assert_eq!(cfg_placeholders.openai_api_key, None);
 
+        let toml_readme_placeholders = r#"
+            deepl_api_key = "your-deepl-key:fx"
+            gemini_api_key = "your-gemini-key"
+            openai_api_key = "your-openai-or-groq-key"
+        "#;
+        let cfg_readme = AppConfig::from_toml_str(toml_readme_placeholders);
+        assert_eq!(cfg_readme.deepl_api_key, None);
+        assert_eq!(cfg_readme.gemini_api_key, None);
+        assert_eq!(cfg_readme.openai_api_key, None);
+
         let toml_valid = r#"
             deepl_api_key = "real-deepl-key:fx"
             gemini_api_key = "AIzaSyValidGeminiKey123"
@@ -950,6 +962,10 @@ mod tests {
         // Cursor far outside
         let target_miss = find_text_under_cursor(&blocks, 500, 500);
         assert!(target_miss.is_none());
+
+        // Extreme multi-monitor coordinates (|dx| > 46341) must not overflow i32 or panic
+        let target_overflow = find_text_under_cursor(&blocks, 60000, 60000);
+        assert!(target_overflow.is_none());
     }
 
     #[test]

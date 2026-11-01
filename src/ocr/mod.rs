@@ -6,7 +6,7 @@ pub use helper::OcrHelperClient;
 use image::{ImageBuffer, Rgba};
 use std::collections::VecDeque;
 use std::fs;
-use tracing::info;
+use tracing::{info, warn};
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
@@ -91,8 +91,8 @@ impl WinrtOcrEngine {
 
         let mut matched_lang = None;
         let target_lower = target_lang.trim().to_lowercase();
-        if !target_lower.is_empty() {
-            if let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
+        if !target_lower.is_empty()
+            && let Ok(langs) = OcrEngine::AvailableRecognizerLanguages()
                 && let Ok(size) = langs.Size()
             {
                 for i in 0..size {
@@ -107,7 +107,6 @@ impl WinrtOcrEngine {
                     }
                 }
             }
-        }
 
         let engine = if let Some(lang) = matched_lang {
             OcrEngine::TryCreateFromLanguage(&lang).map_err(|e| {
@@ -117,6 +116,12 @@ impl WinrtOcrEngine {
                 )
             })?
         } else {
+            if !target_lower.is_empty() {
+                warn!(
+                    "Requested OCR language '{}' is not installed in Windows; falling back to user profile language.",
+                    target_lang
+                );
+            }
             OcrEngine::TryCreateFromUserProfileLanguages()
                 .map_err(|e| format!("Failed to create WinRT OcrEngine: {:?}", e))?
         };

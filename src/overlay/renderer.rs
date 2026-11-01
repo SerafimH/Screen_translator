@@ -20,7 +20,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HDC,
     HGDIOBJ, SelectObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXSCREEN, ULW_ALPHA, UpdateLayeredWindow,
+};
 use windows::core::{Result, w};
 
 use crate::capture::ScreenDcGuard;
@@ -216,7 +218,7 @@ impl OverlayRenderer {
                 .collect();
             let family_pcwstr = windows::core::PCWSTR(family_wide.as_ptr());
             let card_font_size = font_size.max(8.0);
-            let hud_font_size = (card_font_size * 0.8).max(10.0);
+            let hud_font_size = (card_font_size * 0.8).clamp(10.0, 16.0);
 
             let text_format_card = dwrite_factory.CreateTextFormat(
                 family_pcwstr,
@@ -577,10 +579,13 @@ impl OverlayRenderer {
 
     fn draw_hud(&self, scene: &RenderScene<'_>) -> Result<()> {
         unsafe {
-            let hud_w = (self.width as f32 - 40.0).min(1100.0).max(300.0);
+            // Center HUD on the primary monitor rather than the whole virtual desktop span
+            let primary_w = GetSystemMetrics(SM_CXSCREEN).max(320);
+            let hud_w = (primary_w as f32 - 40.0).clamp(300.0, 1100.0);
             let hud_h = 36.0;
-            let hud_x = ((self.width as f32) - hud_w) / 2.0;
-            let hud_y = 12.0;
+            let primary_local_x = -self.origin_x as f32;
+            let hud_x = primary_local_x + (primary_w as f32 - hud_w) / 2.0;
+            let hud_y = (-self.origin_y as f32) + 12.0;
 
             let rect = D2D_RECT_F {
                 left: hud_x,

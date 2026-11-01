@@ -1,6 +1,7 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, warn};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
@@ -25,8 +26,34 @@ use crate::types::{ScreenRect, luma_from_bgr};
 pub const SIGNATURE_COLS: usize = 32;
 pub const SIGNATURE_ROWS: usize = 16;
 pub const DELTA_THRESHOLD: f32 = 3.5;
+pub const WINRT_MAX_CONSECUTIVE_TIMEOUTS: u64 = 3;
+pub const WINRT_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 static WINRT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_WINRT_TIMEOUT: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn winrt_consecutive_timeouts() -> u64 {
+    WINRT_TIMEOUT_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_winrt_timeout_count() {
+    WINRT_TIMEOUT_COUNT.store(0, Ordering::Relaxed);
+    if let Ok(mut last) = LAST_WINRT_TIMEOUT.lock() {
+        *last = None;
+    }
+}
+
+pub fn is_winrt_available() -> bool {
+    if WINRT_TIMEOUT_COUNT.load(Ordering::Relaxed) < WINRT_MAX_CONSECUTIVE_TIMEOUTS {
+        return true;
+    }
+    let last = LAST_WINRT_TIMEOUT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *last
+        && t.elapsed() >= WINRT_CIRCUIT_COOLDOWN {
+            return true;
+        }
+    false
+}
 
 /// Compact 32x16 Luma perceptual hash to detect genuine dialogue transitions
 /// while rejecting flickering cursors, animated particles, and subtle background noise.
@@ -267,10 +294,11 @@ impl ScreenCapture {
             }
         }
 
-        // Attempt fast D3D11 WinRT Graphics Capture
-        if let Ok(frame) = Self::capture_winrt(roi) {
-            return Ok(frame);
-        }
+        // Attempt fast D3D11 WinRT Graphics Capture if circuit breaker is not tripped (or cooldown elapsed)
+        if is_winrt_available()
+            && let Ok(frame) = Self::capture_winrt(roi) {
+                return Ok(frame);
+            }
 
         // Seamless fallback to GDI BitBlt
         Self::capture_gdi_fallback(roi)
@@ -300,13 +328,23 @@ impl ScreenCapture {
         match rx.recv_timeout(Duration::from_millis(600)) {
             Ok(frame) => {
                 let _ = capture_control.wait();
+                reset_winrt_timeout_count();
                 Ok(frame)
             }
             Err(_) => {
                 let count = WINRT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                warn!(
-                    "WinRT capture timed out after 600ms (total timeouts: {count}), stopping capture thread and falling back to GDI"
-                );
+                if let Ok(mut last) = LAST_WINRT_TIMEOUT.lock() {
+                    *last = Some(Instant::now());
+                }
+                if count >= WINRT_MAX_CONSECUTIVE_TIMEOUTS {
+                    warn!(
+                        "WinRT capture timed out {count} times consecutively. Tripping circuit breaker, switching to GDI fallback."
+                    );
+                } else {
+                    warn!(
+                        "WinRT capture timed out after 600ms ({count}/{WINRT_MAX_CONSECUTIVE_TIMEOUTS}), stopping capture thread and falling back to GDI"
+                    );
+                }
                 if let Err(e) = capture_control.stop() {
                     warn!("Failed to gracefully stop WinRT capture thread: {e:?}");
                 }
@@ -621,5 +659,37 @@ mod tests {
         // Empty rect -> false
         let empty = ScreenRect::new(100, 100, 0, 100);
         assert!(!is_roi_within_primary_monitor(&empty, pw, ph));
+    }
+
+    #[test]
+    fn test_winrt_circuit_breaker_tripping_and_reset() {
+        reset_winrt_timeout_count();
+        assert_eq!(winrt_consecutive_timeouts(), 0);
+        assert!(is_winrt_available());
+
+        // Simulate 2 timeouts -> circuit breaker should still allow attempts (< 3)
+        WINRT_TIMEOUT_COUNT.store(2, Ordering::Relaxed);
+        assert!(winrt_consecutive_timeouts() < WINRT_MAX_CONSECUTIVE_TIMEOUTS);
+        assert!(is_winrt_available());
+
+        // Simulate 3 timeouts -> circuit breaker trips
+        WINRT_TIMEOUT_COUNT.store(WINRT_MAX_CONSECUTIVE_TIMEOUTS, Ordering::Relaxed);
+        if let Ok(mut last) = LAST_WINRT_TIMEOUT.lock() {
+            *last = Some(Instant::now());
+        }
+        assert_eq!(winrt_consecutive_timeouts(), 3);
+        assert!(winrt_consecutive_timeouts() >= WINRT_MAX_CONSECUTIVE_TIMEOUTS);
+        assert!(!is_winrt_available());
+
+        // Simulate elapsed cooldown -> half-open allows retry
+        if let Ok(mut last) = LAST_WINRT_TIMEOUT.lock() {
+            *last = Some(Instant::now() - Duration::from_secs(31));
+        }
+        assert!(is_winrt_available());
+
+        // Reset
+        reset_winrt_timeout_count();
+        assert_eq!(winrt_consecutive_timeouts(), 0);
+        assert!(is_winrt_available());
     }
 }

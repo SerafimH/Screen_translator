@@ -76,26 +76,21 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 let win_down = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as u16 & 0x8000) != 0
                     || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } as u16 & 0x8000) != 0;
 
-                if !alt_down && !ctrl_down && !win_down {
-                    if !SHIFT_HELD.swap(true, Ordering::SeqCst) {
+                if !alt_down && !ctrl_down && !win_down
+                    && !SHIFT_HELD.swap(true, Ordering::SeqCst) {
                         let mut pt = POINT::default();
                         let _ = unsafe { GetCursorPos(&mut pt) };
-                        if let Ok(guard) = HOOK_TX.lock() {
-                            if let Some(tx) = guard.as_ref() {
+                        if let Ok(guard) = HOOK_TX.lock()
+                            && let Some(tx) = guard.as_ref() {
                                 let _ = tx.send(AppEvent::TranslateUnderCursor(pt));
                             }
-                        }
                     }
-                }
-            } else if is_key_up {
-                if SHIFT_HELD.swap(false, Ordering::SeqCst) {
-                    if let Ok(guard) = HOOK_TX.lock() {
-                        if let Some(tx) = guard.as_ref() {
+            } else if is_key_up
+                && SHIFT_HELD.swap(false, Ordering::SeqCst)
+                    && let Ok(guard) = HOOK_TX.lock()
+                        && let Some(tx) = guard.as_ref() {
                             let _ = tx.send(AppEvent::ShiftReleased);
                         }
-                    }
-                }
-            }
         }
     }
 
@@ -472,9 +467,9 @@ impl OverlayManager {
 
                 let _ = init_tx.send(Ok(hwnd.0 as isize));
 
-                // Win32 message pump
+                // Win32 message pump (returns > 0 for messages, 0 on WM_QUIT, -1 on error)
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

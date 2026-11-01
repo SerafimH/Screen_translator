@@ -55,6 +55,9 @@ impl ContextManager {
     }
 
     pub fn record_translation(&self, original: String, translated: String) {
+        if self.max_history == 0 {
+            return;
+        }
         let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
         if h.len() >= self.max_history {
             h.pop_front();
@@ -77,7 +80,7 @@ impl ContextManager {
         let mut entries: Vec<&GlossaryEntry> = g.values().collect();
         // Sort descending by original term length so compound terms (e.g. "MAX HP")
         // are replaced before shorter sub-terms (e.g. "HP").
-        entries.sort_by(|a, b| b.original.len().cmp(&a.original.len()));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.original.len()));
 
         for entry in entries {
             let lower_key = entry.original.to_lowercase();
@@ -137,27 +140,23 @@ fn match_find_at(source: &str, start_idx: usize, find_lower: &str) -> Option<usi
             let find_first_alpha = find_lower
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_alphanumeric());
-            if find_first_alpha && start_idx > 0 {
-                if let Some(prev_ch) = source[..start_idx].chars().next_back() {
-                    if prev_ch.is_alphanumeric() {
+                .is_some_and(|c| c.is_alphanumeric());
+            if find_first_alpha && start_idx > 0
+                && let Some(prev_ch) = source[..start_idx].chars().next_back()
+                    && prev_ch.is_alphanumeric() {
                         return None;
                     }
-                }
-            }
 
             let match_end = start_idx + offset + ch.len_utf8();
             let find_last_alpha = find_lower
                 .chars()
                 .next_back()
-                .map_or(false, |c| c.is_alphanumeric());
-            if find_last_alpha && match_end < source.len() {
-                if let Some(next_ch) = source[match_end..].chars().next() {
-                    if next_ch.is_alphanumeric() {
+                .is_some_and(|c| c.is_alphanumeric());
+            if find_last_alpha && match_end < source.len()
+                && let Some(next_ch) = source[match_end..].chars().next()
+                    && next_ch.is_alphanumeric() {
                         return None;
                     }
-                }
-            }
 
             return Some(offset + ch.len_utf8());
         }
@@ -376,6 +375,15 @@ pub fn redact_secrets(input: &str) -> String {
     }
 
     out
+}
+
+async fn ensure_http_success(resp: reqwest::Response, service: &str) -> Result<reqwest::Response, String> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(redact_secrets(&format!("{service} HTTP {status}: {body}")));
+    }
+    Ok(resp)
 }
 
 /// Cleans boundary noise characters and internal OCR letter-number confusions.
@@ -850,6 +858,8 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
 
+        let resp = ensure_http_success(resp, "Google").await?;
+
         let json: serde_json::Value = resp
             .json()
             .await
@@ -907,6 +917,8 @@ impl TranslatorService {
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("DeepL network error: {:?}", e)))?;
+
+        let resp = ensure_http_success(resp, "DeepL").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -968,6 +980,8 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("Gemini network error: {:?}", e)))?;
 
+        let resp = ensure_http_success(resp, "Gemini").await?;
+
         let json: serde_json::Value = resp
             .json()
             .await
@@ -996,6 +1010,7 @@ impl TranslatorService {
         Ok(candidate.trim().to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn translate_openai(
         &self,
         text: &str,
@@ -1035,6 +1050,8 @@ impl TranslatorService {
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("OpenAI network error: {:?}", e)))?;
+
+        let resp = ensure_http_success(resp, "OpenAI").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1165,6 +1182,8 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("Gemini Vision network error: {:?}", e)))?;
 
+        let resp = ensure_http_success(resp, "Gemini Vision").await?;
+
         let json: serde_json::Value = resp
             .json()
             .await
@@ -1240,6 +1259,8 @@ impl TranslatorService {
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("OpenAI Vision network error: {:?}", e)))?;
+
+        let resp = ensure_http_success(resp, "OpenAI Vision").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1348,11 +1369,10 @@ impl TranslatorService {
             normalized.to_lowercase()
         );
 
-        if let Some(cached_json) = self.cache.get(&cache_key) {
-            if let Ok(details) = serde_json::from_str::<WordDetails>(&cached_json) {
+        if let Some(cached_json) = self.cache.get(&cache_key)
+            && let Ok(details) = serde_json::from_str::<WordDetails>(&cached_json) {
                 return details;
             }
-        }
 
         let mut details = if config.provider == TranslationProvider::Google {
             self.lookup_google_dict(normalized, source_lang, target_lang)
@@ -1411,6 +1431,8 @@ impl TranslatorService {
             .send()
             .await
             .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
+
+        let resp = ensure_http_success(resp, "Google Dict").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1473,8 +1495,8 @@ impl TranslatorService {
             }
         }
 
-        if examples.len() < 2 {
-            if let Some(ex_obj) = json
+        if examples.len() < 2
+            && let Some(ex_obj) = json
                 .get("examples")
                 .and_then(|v| v.get("example"))
                 .and_then(|v| v.as_array())
@@ -1491,7 +1513,6 @@ impl TranslatorService {
                     }
                 }
             }
-        }
 
         if primary.is_empty() {
             return Err("No translation found".to_string());
@@ -1928,6 +1949,11 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0], ("two".to_string(), "два".to_string()));
         assert_eq!(hist[1], ("three".to_string(), "три".to_string()));
+
+        // Zero max_history must stay empty
+        let zero_ctx = ContextManager::new(0);
+        zero_ctx.record_translation("hello".to_string(), "привет".to_string());
+        assert!(zero_ctx.get_recent_history().is_empty());
     }
 
     #[test]
@@ -2069,23 +2095,21 @@ mod tests {
     async fn test_translate_blocks_preserves_history_order() {
         let service = TranslatorService::new();
         let config = AppConfig {
-            provider: TranslationProvider::Google,
+            provider: TranslationProvider::OpenAICompatible,
             source_lang: "en".to_string(),
             target_lang: "ru".to_string(),
+            openai_api_key: Some("dummy_key".to_string()),
+            openai_base_url: "http://127.0.0.1:9".to_string(),
             ..Default::default()
         };
 
-        // Prepopulate cache so no network calls are needed
+        // Prepopulate cache for blocks 0 and 2; block 1 is omitted to trigger translation processing
         service.cache.insert(
-            "google:en:ru:First block".to_string(),
+            "openai_compatible:en:ru:First block".to_string(),
             "Первый блок".to_string(),
         );
         service.cache.insert(
-            "google:en:ru:Second block".to_string(),
-            "Второй блок".to_string(),
-        );
-        service.cache.insert(
-            "google:en:ru:Third block".to_string(),
+            "openai_compatible:en:ru:Third block".to_string(),
             "Третий блок".to_string(),
         );
 
@@ -2110,7 +2134,22 @@ mod tests {
         let results = service.translate_blocks(&blocks, &config).await;
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].translated_text, "Первый блок");
-        assert_eq!(results[1].translated_text, "Второй блок");
+        assert!(results[1].translated_text.starts_with("[Err:"));
         assert_eq!(results[2].translated_text, "Третий блок");
+
+        // History must record successful blocks in original order and exclude the failed block
+        let history = service.context.get_recent_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], ("First block".to_string(), "Первый блок".to_string()));
+        assert_eq!(history[1], ("Third block".to_string(), "Третий блок".to_string()));
+
+        // When all blocks are cached, translate_blocks returns results without polluting history
+        service.cache.insert(
+            "openai_compatible:en:ru:Second block".to_string(),
+            "Второй блок".to_string(),
+        );
+        let cached_results = service.translate_blocks(&blocks, &config).await;
+        assert_eq!(cached_results[1].translated_text, "Второй блок");
+        assert_eq!(service.context.get_recent_history().len(), 2);
     }
 }
