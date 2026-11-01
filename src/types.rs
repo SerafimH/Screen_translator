@@ -438,19 +438,32 @@ impl From<AppConfigRaw> for AppConfig {
     fn from(raw: AppConfigRaw) -> Self {
         let vision_fallback =
             resolve_vision_fallback(raw.vision_fallback, raw.use_vision_ocr, false);
-        let deepl_api_key = raw.deepl_api_key.filter(|k| {
+        let deepl_api_key = raw.deepl_api_key.and_then(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty()
+            if !trimmed.is_empty()
                 && !trimmed.starts_with("your-")
                 && trimmed != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
+            {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
         });
-        let gemini_api_key = raw.gemini_api_key.filter(|k| {
+        let gemini_api_key = raw.gemini_api_key.and_then(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "AIzaSy..."
+            if !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "AIzaSy..." {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
         });
-        let openai_api_key = raw.openai_api_key.filter(|k| {
+        let openai_api_key = raw.openai_api_key.and_then(|k| {
             let trimmed = k.trim();
-            !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "gsk_..."
+            if !trimmed.is_empty() && !trimmed.starts_with("your-") && trimmed != "gsk_..." {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
         });
         Self {
             provider: raw.provider,
@@ -518,7 +531,7 @@ impl Default for AppConfig {
             gemini_api_key: None,
             openai_api_key: None,
             openai_base_url: "https://api.groq.com/openai/v1".to_string(),
-            openai_model: "meta-llama/llama-4-scout-17b-16e-instruct".to_string(),
+            openai_model: "openai/gpt-oss-120b".to_string(),
             openai_vision_model: None,
             auto_mode_interval_ms: 1200,
             font_size: 16,
@@ -867,6 +880,25 @@ mod tests {
         );
         assert_eq!(
             cfg_valid.openai_api_key.as_deref(),
+            Some("gsk_valid_openai_token_456")
+        );
+
+        let toml_trimmed = r#"
+            deepl_api_key = "  real-deepl-key:fx  "
+            gemini_api_key = "  AIzaSyValidGeminiKey123\t"
+            openai_api_key = " gsk_valid_openai_token_456 \n"
+        "#;
+        let cfg_trimmed = AppConfig::from_toml_str(toml_trimmed);
+        assert_eq!(
+            cfg_trimmed.deepl_api_key.as_deref(),
+            Some("real-deepl-key:fx")
+        );
+        assert_eq!(
+            cfg_trimmed.gemini_api_key.as_deref(),
+            Some("AIzaSyValidGeminiKey123")
+        );
+        assert_eq!(
+            cfg_trimmed.openai_api_key.as_deref(),
             Some("gsk_valid_openai_token_456")
         );
     }

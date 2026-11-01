@@ -114,6 +114,7 @@ pub enum AppEvent {
 #[derive(Debug, Clone)]
 pub struct OverlaySharedState {
     pub current_blocks: Vec<TranslationBlock>,
+    pub cursor_card: Option<TranslationBlock>,
     pub status_msg: Option<String>,
     pub is_loading: bool,
     pub active_roi: Option<ScreenRect>,
@@ -126,6 +127,7 @@ impl Default for OverlaySharedState {
     fn default() -> Self {
         Self {
             current_blocks: Vec::new(),
+            cursor_card: None,
             status_msg: Some("Готов - нажмите Alt+T для перевода".to_string()),
             is_loading: false,
             active_roi: None,
@@ -159,6 +161,32 @@ impl OverlayHandle {
             let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             s.current_blocks = blocks;
             s.status_msg = status;
+            s.is_loading = false;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    pub fn update_cursor_card(&self, card: Option<TranslationBlock>, status: Option<String>) {
+        {
+            let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.cursor_card = card;
+            if let Some(msg) = status {
+                s.status_msg = Some(msg);
+            }
+            s.is_loading = false;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    pub fn clear_cursor_card(&self) {
+        {
+            let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+            s.cursor_card = None;
+            s.status_msg = Some("Готов".to_string());
             s.is_loading = false;
         }
         unsafe {
@@ -223,6 +251,7 @@ impl OverlayHandle {
         {
             let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             s.current_blocks.clear();
+            s.cursor_card = None;
             s.active_roi = None;
             s.status_msg = Some("Очищено".to_string());
             s.is_loading = false;
@@ -236,6 +265,7 @@ impl OverlayHandle {
         {
             let mut s = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             s.current_blocks.clear();
+            s.cursor_card = None;
             s.status_msg = Some("Готов".to_string());
             s.is_loading = false;
         }
@@ -279,7 +309,11 @@ impl OverlayManager {
         let (init_tx, init_rx) =
             std::sync::mpsc::channel::<std::result::Result<isize, windows::core::Error>>();
 
-        let shared_state = Arc::new(Mutex::new(OverlaySharedState::default()));
+        let shared_state = Arc::new(Mutex::new(OverlaySharedState {
+            provider_name: config.provider.display_name().to_string(),
+            ocr_engine_name: config.ocr_engine.display_name().to_string(),
+            ..OverlaySharedState::default()
+        }));
         let shared_for_thread = shared_state.clone();
         let font_family = config.font_family.clone();
         let font_size = config.font_size as f32;
@@ -508,6 +542,7 @@ fn render_current_scene(state: &mut WindowThreadState) {
 
     let scene = RenderScene {
         blocks: &shared.current_blocks,
+        cursor_card: shared.cursor_card.as_ref(),
         active_roi: shared.active_roi,
         auto_mode: shared.auto_mode,
         provider_name: &shared.provider_name,

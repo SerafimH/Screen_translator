@@ -610,12 +610,18 @@ impl OcrHelperClient {
             }
         };
 
-        let resp: HelperResponseJson = serde_json::from_str(&response_line)
-            .map_err(|e| format!("Failed to parse OCR helper response: {}", e))?;
+        let resp: HelperResponseJson = match serde_json::from_str(&response_line) {
+            Ok(r) => r,
+            Err(e) => {
+                self.handle_failure("desync / bad response", session_guard);
+                return Err(format!("Failed to parse OCR helper response: {}", e));
+            }
+        };
 
         if let Some(resp_id) = resp.id
             && resp_id != req_id
         {
+            self.handle_failure("desync / bad response", session_guard);
             return Err(format!(
                 "OCR helper response ID mismatch: expected {}, got {}",
                 req_id, resp_id

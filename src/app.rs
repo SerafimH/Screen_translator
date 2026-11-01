@@ -340,7 +340,7 @@ impl App {
                     {
                         prev.abort();
                     }
-                    self.state.overlay.clear_blocks();
+                    self.state.overlay.clear_cursor_card();
                 }
 
                 AppEvent::Quit => {
@@ -613,7 +613,7 @@ impl AppState {
         let status = format!("Перевод под курсором за {} мс", elapsed);
         info!("{}", status);
         self.overlay
-            .update_blocks(vec![translation_block], Some(status));
+            .update_cursor_card(Some(translation_block), Some(status));
     }
 
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
@@ -874,6 +874,7 @@ mod tests {
                 translated_text: "Привет".to_string(),
                 rect: ScreenRect::new(10, 10, 100, 50),
             }],
+            cursor_card: None,
             status_msg: Some("Translating...".to_string()),
             is_loading: true,
             active_roi: Some(ScreenRect::new(10, 10, 100, 50)),
@@ -922,6 +923,7 @@ mod tests {
                 translated_text: "Текст".to_string(),
                 rect: ScreenRect::new(20, 20, 150, 60),
             }],
+            cursor_card: None,
             status_msg: Some("Ready".to_string()),
             is_loading: false,
             active_roi: Some(ScreenRect::new(10, 10, 200, 100)),
@@ -952,6 +954,45 @@ mod tests {
             "Active ROI must NOT be cleared when cycling OCR mode"
         );
         assert_eq!(state.ocr_engine_name, "WinRT");
+    }
+
+    #[test]
+    fn test_clear_cursor_card_preserves_current_blocks() {
+        use crate::overlay::{OverlayHandle, OverlaySharedState};
+        use crate::types::{ScreenRect, TranslationBlock};
+        use windows::Win32::Foundation::HWND;
+
+        let shared_state = Arc::new(Mutex::new(OverlaySharedState {
+            current_blocks: vec![TranslationBlock {
+                original_text: "Background".to_string(),
+                translated_text: "Фон".to_string(),
+                rect: ScreenRect::new(0, 0, 100, 50),
+            }],
+            cursor_card: Some(TranslationBlock {
+                original_text: "Word".to_string(),
+                translated_text: "Слово".to_string(),
+                rect: ScreenRect::new(10, 10, 80, 40),
+            }),
+            status_msg: Some("Translating under cursor".to_string()),
+            is_loading: false,
+            active_roi: None,
+            auto_mode: false,
+            provider_name: "Google Translate".to_string(),
+            ocr_engine_name: "RapidOCR".to_string(),
+        }));
+
+        let overlay = OverlayHandle {
+            hwnd: HWND(core::ptr::null_mut()),
+            shared_state: shared_state.clone(),
+        };
+
+        overlay.clear_cursor_card();
+
+        let state = shared_state.lock().unwrap();
+        assert_eq!(state.current_blocks.len(), 1);
+        assert_eq!(state.current_blocks[0].translated_text, "Фон");
+        assert!(state.cursor_card.is_none());
+        assert_eq!(state.status_msg.as_deref(), Some("Готов"));
     }
 
     #[test]

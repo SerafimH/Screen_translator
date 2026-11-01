@@ -30,6 +30,7 @@ use crate::types::{AppMode, ScreenRect, TranslationBlock};
 
 pub struct RenderScene<'a> {
     pub blocks: &'a [TranslationBlock],
+    pub cursor_card: Option<&'a TranslationBlock>,
     pub active_roi: Option<ScreenRect>,
     pub auto_mode: bool,
     pub provider_name: &'a str,
@@ -453,7 +454,7 @@ impl OverlayRenderer {
                 }
 
                 // 3. Draw Translation Blocks as floating rounded cards with DirectWrite TextLayout
-                for block in scene.blocks {
+                for block in scene.blocks.iter().chain(scene.cursor_card) {
                     let pad = 8.0;
                     let min_width = 140.0;
                     let max_layout_w = (self.width as f32 - 40.0).max(200.0);
@@ -629,8 +630,8 @@ impl OverlayRenderer {
                 }
                 AppMode::Normal => {
                     format!(
-                        " ScreenTranslator [{} | {}] | Alt+T: Перевод | Alt+S: Выделение | Alt+A: {} | Alt+P: Движок | Alt+O: OCR | Alt+C: Скрыть | Alt+Q: Выход | {}{}",
-                        scene.provider_name, scene.ocr_engine_name, auto_str, loading_prefix, status_str
+                        " ScreenTranslator | {}{} | [{} | {}] | Alt+T: Перевод | Alt+S: Выделение | Alt+A: {} | Alt+P: Движок | Alt+O: OCR | Alt+C: Скрыть | Alt+Q: Выход",
+                        loading_prefix, status_str, scene.provider_name, scene.ocr_engine_name, auto_str
                     )
                 }
             };

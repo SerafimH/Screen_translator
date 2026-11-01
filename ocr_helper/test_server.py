@@ -5,12 +5,14 @@ Can be run via pytest (`python -m pytest ocr_helper`) or unittest.
 
 import io
 import json
-import unittest
-
 import os
+import unittest
+from unittest.mock import patch
+
 from ocr_helper.server import (
     EngineManager,
     RAPIDOCR_LANG_MAP,
+    create_ocr_engine,
     extract_lines_from_result,
     process_request,
     read_exact,
@@ -192,10 +194,18 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertTrue(resp_ja["ok"])
         self.assertEqual(resp_ja["lines"][0]["text"], "日本語")
 
-    def test_engine_manager_reuses_common_instance_when_no_models_dir(self):
+    def test_engine_manager_caches_instance_per_lang(self):
         mgr = EngineManager()
+        mock_en = MockEngine([])
+        mock_ja = MockEngine([])
+        mgr.engines["en"] = mock_en
+        mgr.engines["ja"] = mock_ja
+        self.assertIs(mgr.get_engine("en"), mock_en)
+        self.assertIs(mgr.get_engine("ja"), mock_ja)
+
+    def test_engine_manager_uses_default_engine_if_provided(self):
         mock = MockEngine([])
-        mgr.engines["common"] = mock
+        mgr = EngineManager(default_engine=mock)
         self.assertIs(mgr.get_engine("en"), mock)
         self.assertIs(mgr.get_engine("ja"), mock)
         self.assertIs(mgr.get_engine("ru"), mock)
@@ -205,6 +215,39 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(RAPIDOCR_LANG_MAP.get("ko"), "korean")
         self.assertEqual(RAPIDOCR_LANG_MAP.get("ru"), "cyrillic")
         self.assertEqual(RAPIDOCR_LANG_MAP.get("zh"), "ch")
+
+    def test_create_ocr_engine_passes_lang_type(self):
+        with patch("rapidocr.RapidOCR") as mock_rapid:
+            create_ocr_engine(None, lang="ja")
+            mock_rapid.assert_called_once_with(params={"Rec.lang_type": "japan"})
+
+        with patch("os.path.exists", return_value=True), patch("rapidocr.RapidOCR") as mock_rapid:
+            create_ocr_engine("/fake/models", lang="ru")
+            mock_rapid.assert_called_once_with(
+                params={"Rec.lang_type": "cyrillic", "Global.model_root_dir": "/fake/models"}
+            )
+
+    def test_engine_manager_cache_limit_lru(self):
+        def fake_create(models_dir, lang):
+            return MockEngine([{"text": lang}])
+
+        with patch("ocr_helper.server.create_ocr_engine", side_effect=fake_create):
+            mgr = EngineManager()
+            e_en = mgr.get_engine("en")
+            e_ja = mgr.get_engine("ja")
+            self.assertEqual(len(mgr.engines), 2)
+            self.assertIn("en", mgr.engines)
+            self.assertIn("ja", mgr.engines)
+
+            # Touch 'en' so it becomes most recently used
+            self.assertIs(mgr.get_engine("en"), e_en)
+
+            # Loading third language 'ru' should evict 'ja'
+            e_ru = mgr.get_engine("ru")
+            self.assertEqual(len(mgr.engines), 2)
+            self.assertIn("en", mgr.engines)
+            self.assertIn("ru", mgr.engines)
+            self.assertNotIn("ja", mgr.engines)
 
 
 if __name__ == "__main__":

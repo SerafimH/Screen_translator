@@ -6,12 +6,18 @@ Stdout is strictly reserved for single-line JSON messages ending with '\n'.
 All logs, diagnostic messages, and warnings are directed to stderr.
 """
 
+from collections import OrderedDict
 import json
 import logging
 import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 # Configure logging to sys.stderr exclusively
 logging.basicConfig(
@@ -47,10 +53,9 @@ def create_ocr_engine(models_dir: Optional[str] = None, lang: str = "en"):
     try:
         from rapidocr import RapidOCR
 
-        params = {}
+        params = {"Rec.lang_type": rec_lang}
         if models_dir and os.path.exists(models_dir):
             params["Global.model_root_dir"] = models_dir
-            params["Rec.lang_type"] = rec_lang
         logger.info(
             f"Initializing RapidOCR engine ({rec_lang}) with models_dir={models_dir}..."
         )
@@ -73,7 +78,7 @@ class EngineManager:
 
     def __init__(self, models_dir: Optional[str] = None, default_engine=None):
         self.models_dir = models_dir
-        self.engines: Dict[str, Any] = {}
+        self.engines: OrderedDict[str, Any] = OrderedDict()
         if default_engine is not None:
             self.engines["default"] = default_engine
 
@@ -82,16 +87,19 @@ class EngineManager:
         if "default" in self.engines:
             return self.engines["default"]
         if base_lang in self.engines:
+            self.engines.move_to_end(base_lang)
             return self.engines[base_lang]
-        # Without custom models, the default engine handles all languages without duplicate memory allocation
-        if not (self.models_dir and os.path.exists(self.models_dir)):
-            if "common" not in self.engines:
-                self.engines["common"] = create_ocr_engine(None, lang=base_lang)
-            return self.engines["common"]
-
+        target_dir = (
+            self.models_dir
+            if (self.models_dir and os.path.exists(self.models_dir))
+            else None
+        )
         logger.info(f"Loading RapidOCR engine for language: {base_lang}")
-        self.engines[base_lang] = create_ocr_engine(self.models_dir, lang=base_lang)
-        return self.engines[base_lang]
+        engine = create_ocr_engine(target_dir, lang=base_lang)
+        while len(self.engines) >= 2:
+            self.engines.popitem(last=False)
+        self.engines[base_lang] = engine
+        return engine
 
 
 def extract_lines_from_result(result) -> List[Dict[str, Any]]:
@@ -197,14 +205,12 @@ def process_request(
 
     t0 = time.perf_counter()
     try:
-        try:
+        if np is not None:
             # Convert raw BGR directly to numpy array (H, W, 3) for RapidOCR/OpenCV
-            import numpy as np
-
             img_bgr = np.frombuffer(raw_rgb, dtype=np.uint8).reshape(
                 (height, width, 3)
             )
-        except ImportError:
+        else:
             # In test environments without numpy installed, pass raw buffer directly to mock engine
             img_bgr = raw_rgb
 

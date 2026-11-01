@@ -678,13 +678,31 @@ pub fn bgra_to_png(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
         dst[3] = src[3]; // A
     }
 
+    let max_dim = width.max(height);
+    let (target_w, target_h, final_rgba) = if max_dim > 1920 {
+        let scale = 1920.0 / max_dim as f64;
+        let new_w = ((width as f64 * scale).round() as u32).max(1);
+        let new_h = ((height as f64 * scale).round() as u32).max(1);
+        let img_buf = image::RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| "Failed to construct RgbaImage from buffer".to_string())?;
+        let resized = image::imageops::resize(
+            &img_buf,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        );
+        (new_w, new_h, resized.into_raw())
+    } else {
+        (width, height, rgba)
+    };
+
     let mut png_bytes = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
     image::ImageEncoder::write_image(
         encoder,
-        &rgba,
-        width,
-        height,
+        &final_rgba,
+        target_w,
+        target_h,
         image::ExtendedColorType::Rgba8,
     )
     .map_err(|e| format!("PNG encoding failed: {:?}", e))?;
@@ -736,6 +754,40 @@ pub fn resolve_openai_vision_model<'a>(
     } else {
         text_model
     }
+}
+
+/// Parses the JSON response body from DeepL translation API for batch requests.
+pub fn parse_deepl_batch_response(body: &str, expected: usize) -> Result<Vec<String>, String> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| redact_secrets(&format!("DeepL response error: {:?}", e)))?;
+
+    if let Some(err) = json.get("message").and_then(|v| v.as_str()) {
+        return Err(redact_secrets(&format!("DeepL error: {}", err)));
+    }
+
+    let translations = json
+        .get("translations")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| "Invalid DeepL response structure".to_string())?;
+
+    if expected > 0 && translations.len() != expected {
+        return Err(format!(
+            "DeepL response count mismatch: expected {}, got {}",
+            expected,
+            translations.len()
+        ));
+    }
+
+    let mut results = Vec::with_capacity(translations.len());
+    for item in translations {
+        if let Some(txt) = item.get("text").and_then(|t| t.as_str()) {
+            results.push(txt.to_string());
+        } else {
+            return Err("Missing text in DeepL translation item".to_string());
+        }
+    }
+
+    Ok(results)
 }
 
 #[derive(Clone)]
@@ -889,6 +941,25 @@ impl TranslatorService {
         api_key: &str,
         context: &str,
     ) -> Result<String, String> {
+        let mut results = self
+            .translate_deepl_batch(&[text], source_lang, target_lang, api_key, context)
+            .await?;
+        results
+            .pop()
+            .ok_or_else(|| "Missing translation in DeepL response".to_string())
+    }
+
+    pub async fn translate_deepl_batch(
+        &self,
+        texts: &[&str],
+        source_lang: &str,
+        target_lang: &str,
+        api_key: &str,
+        context: &str,
+    ) -> Result<Vec<String>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let endpoint = if api_key.ends_with(":fx") {
             "https://api-free.deepl.com/v2/translate"
         } else {
@@ -896,7 +967,7 @@ impl TranslatorService {
         };
 
         let mut body = serde_json::json!({
-            "text": [text],
+            "text": texts,
             "target_lang": deepl_target_lang(target_lang),
         });
 
@@ -920,24 +991,12 @@ impl TranslatorService {
 
         let resp = ensure_http_success(resp, "DeepL").await?;
 
-        let json: serde_json::Value = resp
-            .json()
+        let body_str = resp
+            .text()
             .await
             .map_err(|e| redact_secrets(&format!("DeepL response error: {:?}", e)))?;
 
-        if let Some(err) = json.get("message").and_then(|v| v.as_str()) {
-            return Err(redact_secrets(&format!("DeepL error: {}", err)));
-        }
-
-        let trans = json
-            .get("translations")
-            .and_then(|t| t.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|txt| txt.as_str())
-            .ok_or_else(|| "Invalid DeepL response structure".to_string())?;
-
-        Ok(trans.to_string())
+        parse_deepl_batch_response(&body_str, texts.len())
     }
 
     pub async fn translate_gemini(
@@ -1092,6 +1151,7 @@ impl TranslatorService {
             frame.height as i32,
         );
 
+        // TODO: gpt-oss-120b не принимает изображения, для vision нужна отдельная модель
         let openai_vision_model = resolve_openai_vision_model(
             config.openai_vision_model.as_deref(),
             &config.openai_base_url,
@@ -1589,6 +1649,49 @@ impl TranslatorService {
                     let mut results = Vec::with_capacity(blocks.len());
                     for (i, part) in parts.iter().enumerate() {
                         let clean_part = clean_russian_punctuation(part.trim());
+                        let final_text = self.context.postprocess(&clean_part);
+                        let key = format!(
+                            "{}:{}:{}:{}",
+                            config.provider.as_str(),
+                            config.source_lang,
+                            config.target_lang,
+                            cleaned_texts[i]
+                        );
+                        self.cache.insert(key, final_text.clone());
+                        self.context
+                            .record_translation(cleaned_texts[i].clone(), final_text.clone());
+
+                        results.push(TranslationBlock {
+                            original_text: blocks[i].text.clone(),
+                            translated_text: final_text,
+                            rect: blocks[i].rect,
+                        });
+                    }
+                    return results;
+                }
+            }
+        }
+
+        if blocks.len() > 1
+            && config.provider == TranslationProvider::DeepL
+            && let Some(key) = &config.deepl_api_key
+        {
+            let text_refs: Vec<&str> = cleaned_texts.iter().map(|s| s.as_str()).collect();
+            let ctx = self.context.format_history_context();
+            if let Ok(batch_translated) = self
+                .translate_deepl_batch(
+                    &text_refs,
+                    &config.source_lang,
+                    &config.target_lang,
+                    key,
+                    &ctx,
+                )
+                .await
+            {
+                if batch_translated.len() == blocks.len() {
+                    let mut results = Vec::with_capacity(blocks.len());
+                    for (i, trans) in batch_translated.into_iter().enumerate() {
+                        let clean_part = clean_russian_punctuation(trans.trim());
                         let final_text = self.context.postprocess(&clean_part);
                         let key = format!(
                             "{}:{}:{}:{}",
@@ -2151,5 +2254,61 @@ mod tests {
         let cached_results = service.translate_blocks(&blocks, &config).await;
         assert_eq!(cached_results[1].translated_text, "Второй блок");
         assert_eq!(service.context.get_recent_history().len(), 2);
+    }
+
+    #[test]
+    fn test_bgra_to_png_downscaling() {
+        let width = 2000;
+        let height = 1000;
+        let bgra = vec![255u8; (width * height * 4) as usize];
+        let png = bgra_to_png(&bgra, width, height).expect("png encoding should succeed");
+        let decoder = image::ImageReader::new(std::io::Cursor::new(png))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(decoder, (1920, 960));
+    }
+
+    #[test]
+    fn test_parse_deepl_batch_response() {
+        // 1. Normal response with N translations
+        let json_normal = r#"{"translations": [{"text": "Hello"}, {"text": "World"}]}"#;
+        let normal = parse_deepl_batch_response(json_normal, 2).expect("should parse 2 items");
+        assert_eq!(normal, vec!["Hello", "World"]);
+
+        // 2. Cyrillic text
+        let json_ru = r#"{"translations": [{"text": "Привет"}, {"text": "Мир"}]}"#;
+        let ru = parse_deepl_batch_response(json_ru, 2).expect("should parse cyrillic");
+        assert_eq!(ru, vec!["Привет", "Мир"]);
+
+        // 3. Fewer translations than expected
+        let err_fewer = parse_deepl_batch_response(json_normal, 3);
+        assert!(err_fewer.is_err());
+        assert!(err_fewer.unwrap_err().contains("count mismatch"));
+
+        // 4. More translations than expected
+        let err_more = parse_deepl_batch_response(json_normal, 1);
+        assert!(err_more.is_err());
+        assert!(err_more.unwrap_err().contains("count mismatch"));
+
+        // 5. Empty list
+        let json_empty = r#"{"translations": []}"#;
+        let err_empty = parse_deepl_batch_response(json_empty, 2);
+        assert!(err_empty.is_err());
+        assert_eq!(
+            parse_deepl_batch_response(json_empty, 0).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // 6. Invalid JSON
+        let err_invalid = parse_deepl_batch_response("{ not valid json", 1);
+        assert!(err_invalid.is_err());
+
+        // 7. API error message
+        let json_err = r#"{"message": "Quota exceeded"}"#;
+        let err_api = parse_deepl_batch_response(json_err, 1);
+        assert!(err_api.is_err());
+        assert!(err_api.unwrap_err().contains("Quota exceeded"));
     }
 }
