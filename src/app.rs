@@ -205,6 +205,13 @@ impl App {
                 AppEvent::ToggleAutoMode => {
                     let new_val = !self.state.auto_mode.load(Ordering::Relaxed);
                     self.state.auto_mode.store(new_val, Ordering::Relaxed);
+                    if new_val {
+                        *self
+                            .state
+                            .last_signature
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = None;
+                    }
                     self.state.overlay.set_auto_mode(new_val);
                     info!("Auto-translate mode set to: {}", new_val);
                 }
@@ -261,8 +268,8 @@ impl App {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
 
-                    // Clear overlay cards
-                    self.state.overlay.clear();
+                    // Clear overlay cards without resetting active ROI
+                    self.state.overlay.clear_blocks();
 
                     let new_mode = {
                         let mut cfg = self.state.config.lock().unwrap_or_else(|e| e.into_inner());
@@ -854,6 +861,51 @@ mod tests {
         );
         assert!(!state.is_loading, "is_loading must be false after clear");
         assert_eq!(state.status_msg.as_deref(), Some("Очищено"));
+    }
+
+    #[test]
+    fn test_cycle_ocr_mode_preserves_roi_and_resets_signature() {
+        use crate::capture::FrameSignature;
+        use crate::overlay::{OverlayHandle, OverlaySharedState};
+        use crate::types::{ScreenRect, TranslationBlock};
+        use windows::Win32::Foundation::HWND;
+
+        let shared_state = Arc::new(Mutex::new(OverlaySharedState {
+            current_blocks: vec![TranslationBlock {
+                original_text: "Text".to_string(),
+                translated_text: "Текст".to_string(),
+                rect: ScreenRect::new(20, 20, 150, 60),
+            }],
+            status_msg: Some("Ready".to_string()),
+            is_loading: false,
+            active_roi: Some(ScreenRect::new(10, 10, 200, 100)),
+            auto_mode: true,
+            provider_name: "Google Translate".to_string(),
+            ocr_engine_name: "RapidOCR".to_string(),
+        }));
+
+        let overlay = OverlayHandle {
+            hwnd: HWND(core::ptr::null_mut()),
+            shared_state: shared_state.clone(),
+        };
+
+        let last_sig = Arc::new(Mutex::new(Some(FrameSignature::default())));
+
+        // Cycle OCR mode logic: reset signature, clear blocks (without wiping ROI), update mode name
+        *last_sig.lock().unwrap() = None;
+        overlay.clear_blocks();
+        overlay.set_ocr_engine_name("WinRT".to_string());
+
+        assert_eq!(*last_sig.lock().unwrap(), None);
+
+        let state = shared_state.lock().unwrap();
+        assert!(state.current_blocks.is_empty(), "Cards must be cleared");
+        assert_eq!(
+            state.active_roi,
+            Some(ScreenRect::new(10, 10, 200, 100)),
+            "Active ROI must NOT be cleared when cycling OCR mode"
+        );
+        assert_eq!(state.ocr_engine_name, "WinRT");
     }
 
     #[test]

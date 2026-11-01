@@ -735,6 +735,15 @@ unsafe extern "system" fn overlay_wndproc(
 }
 
 fn enter_selection_mode(state: &mut WindowThreadState) {
+    if state.mode == AppMode::SelectingRoi {
+        return;
+    }
+
+    let fg_hwnd = unsafe { GetForegroundWindow() };
+    if fg_hwnd != state.hwnd {
+        state.previous_foreground_hwnd = fg_hwnd;
+    }
+
     state.mode = AppMode::SelectingRoi;
     state.is_dragging = false;
 
@@ -755,11 +764,6 @@ fn enter_selection_mode(state: &mut WindowThreadState) {
             SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_SHOWWINDOW.0),
         )
     };
-
-    let fg_hwnd = unsafe { GetForegroundWindow() };
-    if fg_hwnd != state.hwnd {
-        state.previous_foreground_hwnd = fg_hwnd;
-    }
     let current_thread_id = unsafe { GetCurrentThreadId() };
     let fg_thread_id = if !fg_hwnd.0.is_null() {
         unsafe { GetWindowThreadProcessId(fg_hwnd, None) }

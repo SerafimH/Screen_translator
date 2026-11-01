@@ -33,24 +33,35 @@ def read_exact(stream, num_bytes: int) -> Optional[bytes]:
     return bytes(buf)
 
 
+RAPIDOCR_LANG_MAP = {
+    "ja": "japan",
+    "ko": "korean",
+    "ru": "cyrillic",
+    "zh": "ch",
+}
+
+
 def create_ocr_engine(models_dir: Optional[str] = None, lang: str = "en"):
     """Initializes RapidOCR engine using local models if present."""
+    rec_lang = RAPIDOCR_LANG_MAP.get(lang.lower(), lang.lower())
     try:
         from rapidocr import RapidOCR
 
         params = {}
         if models_dir and os.path.exists(models_dir):
             params["Global.model_root_dir"] = models_dir
-            params["Det.lang_type"] = "en"
-            params["Rec.lang_type"] = lang
-            params["Cls.lang_type"] = "ch"
-        logger.info(f"Initializing RapidOCR engine ({lang}) with models_dir={models_dir}...")
+            params["Rec.lang_type"] = rec_lang
+        logger.info(
+            f"Initializing RapidOCR engine ({rec_lang}) with models_dir={models_dir}..."
+        )
         return RapidOCR(params=params if params else None)
     except ImportError:
         try:
             from rapidocr_onnxruntime import RapidOCR
 
-            logger.info(f"Initializing RapidOCR ({lang}) via rapidocr_onnxruntime fallback...")
+            logger.info(
+                f"Initializing RapidOCR ({rec_lang}) via rapidocr_onnxruntime fallback..."
+            )
             return RapidOCR()
         except ImportError as e:
             logger.error(f"RapidOCR is not installed: {e}")
@@ -70,9 +81,16 @@ class EngineManager:
         base_lang = lang.split("-")[0].split("_")[0].lower() if lang else "en"
         if "default" in self.engines:
             return self.engines["default"]
-        if base_lang not in self.engines:
-            logger.info(f"Loading RapidOCR engine for language: {base_lang}")
-            self.engines[base_lang] = create_ocr_engine(self.models_dir, lang=base_lang)
+        if base_lang in self.engines:
+            return self.engines[base_lang]
+        # Without custom models, the default engine handles all languages without duplicate memory allocation
+        if not (self.models_dir and os.path.exists(self.models_dir)):
+            if "common" not in self.engines:
+                self.engines["common"] = create_ocr_engine(None, lang=base_lang)
+            return self.engines["common"]
+
+        logger.info(f"Loading RapidOCR engine for language: {base_lang}")
+        self.engines[base_lang] = create_ocr_engine(self.models_dir, lang=base_lang)
         return self.engines[base_lang]
 
 

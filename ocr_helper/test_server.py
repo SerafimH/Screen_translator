@@ -10,6 +10,7 @@ import unittest
 import os
 from ocr_helper.server import (
     EngineManager,
+    RAPIDOCR_LANG_MAP,
     extract_lines_from_result,
     process_request,
     read_exact,
@@ -190,6 +191,20 @@ class TestOcrHelperProtocol(unittest.TestCase):
         )
         self.assertTrue(resp_ja["ok"])
         self.assertEqual(resp_ja["lines"][0]["text"], "日本語")
+
+    def test_engine_manager_reuses_common_instance_when_no_models_dir(self):
+        mgr = EngineManager()
+        mock = MockEngine([])
+        mgr.engines["common"] = mock
+        self.assertIs(mgr.get_engine("en"), mock)
+        self.assertIs(mgr.get_engine("ja"), mock)
+        self.assertIs(mgr.get_engine("ru"), mock)
+
+    def test_rapidocr_lang_mapping(self):
+        self.assertEqual(RAPIDOCR_LANG_MAP.get("ja"), "japan")
+        self.assertEqual(RAPIDOCR_LANG_MAP.get("ko"), "korean")
+        self.assertEqual(RAPIDOCR_LANG_MAP.get("ru"), "cyrillic")
+        self.assertEqual(RAPIDOCR_LANG_MAP.get("zh"), "ch")
 
 
 if __name__ == "__main__":
