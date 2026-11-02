@@ -665,6 +665,21 @@ pub fn is_spike_word(word: &str) -> bool {
     trimmed.chars().all(|c| spike_chars.contains(&c))
 }
 
+fn has_letter_run(text: &str, min_len: usize) -> bool {
+    let mut count = 0;
+    for c in text.chars() {
+        if c.is_alphabetic() {
+            count += 1;
+            if count >= min_len {
+                return true;
+            }
+        } else {
+            count = 0;
+        }
+    }
+    false
+}
+
 /// Identifies meaningless OCR artifacts resulting from burst bubbles, action lines, and panel frames.
 pub fn is_ocr_garbage(text: &str) -> bool {
     let trimmed = text.trim();
@@ -702,7 +717,22 @@ pub fn is_ocr_garbage(text: &str) -> bool {
     let meaningful = alpha_count + digit_count;
     let ratio = meaningful as f32 / total_non_space as f32;
 
-    if ratio < 0.40 {
+    if ratio < 0.25 {
+        return true;
+    }
+    if ratio < 0.50 && !has_letter_run(trimmed, 2) {
+        return true;
+    }
+
+    // Harsh noise symbols (@, #, $, *, ~, |, \, •) typical of title page OCR garbage (e.g. "I@II#O*$", "•PA")
+    let harsh_symbols = trimmed
+        .chars()
+        .filter(|c| matches!(c, '@' | '#' | '$' | '*' | '~' | '|' | '\\' | '^' | '•' | '·' | '●' | '○'))
+        .count();
+    if harsh_symbols >= 1
+        && (trimmed.chars().any(|c| matches!(c, '•' | '·' | '●' | '○')) || harsh_symbols >= 2)
+        && (harsh_symbols as f32 / total_non_space as f32) >= 0.25
+    {
         return true;
     }
 
@@ -773,7 +803,13 @@ pub fn has_border_between(
     let bg1 = sample_bg(r1);
     let bg2 = sample_bg(r2);
 
-    if (bg1 - bg2).abs() > 60.0 {
+    let y_gap = if r1.y < r2.y {
+        r2.y - (r1.y + r1.height)
+    } else {
+        r1.y - (r2.y + r2.height)
+    };
+
+    if (bg1 - bg2).abs() > 80.0 && y_gap > 8 {
         return true;
     }
 
@@ -806,7 +842,7 @@ pub fn has_border_between(
                     total += 1;
                 }
             }
-            if total > 0 && (sep_count as f32 / total as f32) >= 0.15 {
+            if total > 0 && (sep_count as f32 / total as f32) >= 0.25 {
                 return true;
             }
         }
@@ -821,6 +857,10 @@ pub fn has_border_between(
         let x_end = (top.x + top.width).min(bottom.x + bottom.width);
 
         if y_end > y_start && x_end > x_start {
+            // Very small gaps (< 8px) between horizontally overlapping lines are line breaks, not panel borders
+            if (y_end - y_start) <= 8 {
+                return false;
+            }
             let mut sep_count = 0;
             let mut total = 0;
             for y in y_start..y_end {
@@ -831,7 +871,7 @@ pub fn has_border_between(
                     total += 1;
                 }
             }
-            if total > 0 && (sep_count as f32 / total as f32) >= 0.15 {
+            if total > 0 && (sep_count as f32 / total as f32) >= 0.35 {
                 return true;
             }
         }
@@ -886,6 +926,87 @@ pub fn create_inverted_buffer(buf: &[u8]) -> Vec<u8> {
     inv
 }
 
+/// Saves OCR debug artifacts (frame, input, raw JSON, final text) into `debug/ocr/<timestamp>/`.
+pub fn dump_ocr_artifacts(
+    frame: &CapturedFrame,
+    input_bgra: Option<(&[u8], u32, u32)>,
+    raw_json: &str,
+    result_text: &str,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let dir = format!("debug/ocr/{}", ts);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!("Failed to create debug dump dir {}: {}", dir, e);
+        return;
+    }
+
+    // 1. frame.png
+    let mut frame_rgba = frame.bgra_bytes.clone();
+    for chunk in frame_rgba.as_chunks_mut::<4>().0 {
+        chunk.swap(0, 2);
+    }
+    if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, frame_rgba) {
+        let _ = img.save(format!("{}/frame.png", dir));
+    }
+
+    // 2. input.png
+    let (in_bytes, in_w, in_h) = input_bgra.unwrap_or((&frame.bgra_bytes, frame.width, frame.height));
+    let mut in_rgba = in_bytes.to_vec();
+    for chunk in in_rgba.as_chunks_mut::<4>().0 {
+        chunk.swap(0, 2);
+    }
+    if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(in_w, in_h, in_rgba) {
+        let _ = img.save(format!("{}/input.png", dir));
+    }
+
+    // 3. raw.json
+    let _ = fs::write(format!("{}/raw.json", dir), raw_json);
+
+    // 4. result.txt
+    let _ = fs::write(format!("{}/result.txt", dir), result_text);
+    info!("Saved OCR debug dump to {}", dir);
+}
+
+/// Sorts lines into natural 2D reading order:
+/// Clusters lines vertically by row (Y-axis bands), and within each row sorts horizontally (X-axis, left to right).
+pub fn sort_lines_reading_order(lines: &mut Vec<RecognizedLine>) {
+    if lines.len() <= 1 {
+        return;
+    }
+    lines.sort_by_key(|l| l.rect.y);
+
+    let mut rows: Vec<Vec<RecognizedLine>> = Vec::new();
+    for line in lines.drain(..) {
+        let mut target_row = None;
+        for (r_idx, row) in rows.iter().enumerate() {
+            let row_y = row[0].rect.y;
+            let row_h = row[0].rect.height.max(1);
+            let cy_row = row_y + row_h / 2;
+            let cy_line = line.rect.y + line.rect.height / 2;
+            // Overlap or vertical centers within half line height
+            if (cy_row - cy_line).abs() <= (row_h / 2).max(10) {
+                target_row = Some(r_idx);
+                break;
+            }
+        }
+        if let Some(r_idx) = target_row {
+            rows[r_idx].push(line);
+        } else {
+            rows.push(vec![line]);
+        }
+    }
+    for row in rows.iter_mut() {
+        row.sort_by_key(|l| l.rect.x);
+    }
+    rows.sort_by_key(|row| row[0].rect.y);
+    for row in rows {
+        lines.extend(row);
+    }
+}
+
 /// Clusters recognized lines into coherent paragraphs and speech bubbles,
 /// taking line barriers and hyphenated wrap into account.
 pub fn cluster_lines_into_blocks(
@@ -899,13 +1020,8 @@ pub fn cluster_lines_into_blocks(
     // Filter out garbage lines
     lines.retain(|l| !is_ocr_garbage(&l.text));
 
-    // Sort lines primarily top-to-bottom, secondarily left-to-right
-    lines.sort_by(|a, b| {
-        a.rect
-            .y
-            .cmp(&b.rect.y)
-            .then_with(|| a.rect.x.cmp(&b.rect.x))
-    });
+    // Sort lines into reading order: clusters by Y, sorted by X within each cluster
+    sort_lines_reading_order(&mut lines);
 
     let mut blocks: Vec<OcrBlock> = Vec::new();
 
@@ -1210,6 +1326,9 @@ mod tests {
         assert!(is_ocr_garbage("~~~~___"));
         assert!(is_ocr_garbage("   "));
         assert!(is_ocr_garbage("! ! ! |"));
+        assert!(is_ocr_garbage("I@II#O*$"));
+        assert!(is_ocr_garbage("!?!?a"));
+        assert!(is_ocr_garbage("-=-a-=-"));
     }
 
     #[test]
@@ -1219,6 +1338,12 @@ mod tests {
         assert!(!is_ocr_garbage("100"));
         assert!(!is_ocr_garbage("Hello world"));
         assert!(!is_ocr_garbage("What is your HP?"));
+        assert!(!is_ocr_garbage("(No!?)"));
+        assert!(!is_ocr_garbage("Ah..."));
+        assert!(!is_ocr_garbage("Oh..."));
+        assert!(!is_ocr_garbage("No..."));
+        assert!(!is_ocr_garbage("Wait..."));
+        assert!(!is_ocr_garbage("Go!"));
     }
 
     #[tokio::test]

@@ -185,11 +185,20 @@ struct HelperOcrRequest<'a> {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct HelperWordJson {
+    pub text: String,
+    pub score: Option<f32>,
+    #[serde(rename = "box")]
+    pub bbox: [[f32; 2]; 4],
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct HelperLineJson {
     text: String,
     #[serde(rename = "box")]
     bbox: [[f32; 2]; 4],
     score: f32,
+    words: Option<Vec<HelperWordJson>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -199,6 +208,21 @@ struct HelperResponseJson {
     lines: Option<Vec<HelperLineJson>>,
     ms: Option<f64>,
     error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseMatch {
+    Stale,
+    Current,
+    Future,
+}
+
+fn classify_response_id(resp_id: Option<u64>, req_id: u64) -> ResponseMatch {
+    match resp_id {
+        Some(id) if id < req_id => ResponseMatch::Stale,
+        Some(id) if id > req_id => ResponseMatch::Future,
+        _ => ResponseMatch::Current,
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -480,7 +504,16 @@ impl OcrHelperClient {
         frame: &CapturedFrame,
         lang: &str,
     ) -> Result<Vec<OcrBlock>, String> {
-        let lines = self.recognize_raw_lines(frame, lang).await?;
+        let (blocks, _) = self.recognize_with_raw(frame, lang).await?;
+        Ok(blocks)
+    }
+
+    pub async fn recognize_with_raw(
+        &self,
+        frame: &CapturedFrame,
+        lang: &str,
+    ) -> Result<(Vec<OcrBlock>, String), String> {
+        let (lines, raw_json) = self.recognize_raw_lines_with_raw(frame, lang).await?;
         let blocks = cluster_lines_into_blocks(
             lines,
             Some((
@@ -491,7 +524,7 @@ impl OcrHelperClient {
                 frame.offset_y,
             )),
         );
-        Ok(blocks)
+        Ok((blocks, raw_json))
     }
 
     pub async fn recognize_raw_lines(
@@ -499,8 +532,17 @@ impl OcrHelperClient {
         frame: &CapturedFrame,
         lang: &str,
     ) -> Result<Vec<RecognizedLine>, String> {
+        let (lines, _) = self.recognize_raw_lines_with_raw(frame, lang).await?;
+        Ok(lines)
+    }
+
+    pub async fn recognize_raw_lines_with_raw(
+        &self,
+        frame: &CapturedFrame,
+        lang: &str,
+    ) -> Result<(Vec<RecognizedLine>, String), String> {
         if frame.width == 0 || frame.height == 0 || frame.bgra_bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), String::new()));
         }
 
         if !self.is_ready() {
@@ -584,49 +626,66 @@ impl OcrHelperClient {
             }
         }
 
-        // Read single line JSON response
-        let read_res = tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            session.stdout_lines.next_line(),
-        )
-        .await;
-
-        let response_line = match read_res {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => {
-                self.handle_failure("stdout closed unexpectedly", session_guard);
-                return Err("OCR helper closed stdout unexpectedly".to_string());
-            }
-            Ok(Err(e)) => {
-                self.handle_failure("IO error reading stdout", session_guard);
-                return Err(format!("IO error reading from OCR helper: {}", e));
-            }
-            Err(_) => {
+        // Read JSON response in a loop, skipping any stale responses from cancelled previous requests
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let (resp, response_line) = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 self.handle_failure("request timed out", session_guard);
                 return Err(format!(
                     "OCR helper request #{} timed out after {} ms",
                     req_id, timeout_ms
                 ));
             }
-        };
 
-        let resp: HelperResponseJson = match serde_json::from_str(&response_line) {
-            Ok(r) => r,
-            Err(e) => {
-                self.handle_failure("desync / bad response", session_guard);
-                return Err(format!("Failed to parse OCR helper response: {}", e));
+            let read_res = tokio::time::timeout(remaining, session.stdout_lines.next_line()).await;
+
+            let response_line = match read_res {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => {
+                    self.handle_failure("stdout closed unexpectedly", session_guard);
+                    return Err("OCR helper closed stdout unexpectedly".to_string());
+                }
+                Ok(Err(e)) => {
+                    self.handle_failure("IO error reading stdout", session_guard);
+                    return Err(format!("IO error reading from OCR helper: {}", e));
+                }
+                Err(_) => {
+                    self.handle_failure("request timed out", session_guard);
+                    return Err(format!(
+                        "OCR helper request #{} timed out after {} ms",
+                        req_id, timeout_ms
+                    ));
+                }
+            };
+
+            let parsed: HelperResponseJson = match serde_json::from_str(&response_line) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.handle_failure("desync / bad response", session_guard);
+                    return Err(format!("Failed to parse OCR helper response: {}", e));
+                }
+            };
+
+            match classify_response_id(parsed.id, req_id) {
+                ResponseMatch::Stale => {
+                    tracing::debug!(
+                        "Skipping stale OCR helper response: expected req_id {}, got {:?}",
+                        req_id,
+                        parsed.id
+                    );
+                    continue;
+                }
+                ResponseMatch::Current => break (parsed, response_line),
+                ResponseMatch::Future => {
+                    self.handle_failure("desync / bad response", session_guard);
+                    return Err(format!(
+                        "OCR helper response ID mismatch: expected {}, got {:?}",
+                        req_id, parsed.id
+                    ));
+                }
             }
         };
-
-        if let Some(resp_id) = resp.id
-            && resp_id != req_id
-        {
-            self.handle_failure("desync / bad response", session_guard);
-            return Err(format!(
-                "OCR helper response ID mismatch: expected {}, got {}",
-                req_id, resp_id
-            ));
-        }
 
         if !resp.ok {
             let err_msg = resp
@@ -676,7 +735,45 @@ impl OcrHelperClient {
                 continue;
             }
 
-            let words = split_line_words_proportionate(trimmed, rect);
+            let words = if let Some(h_words) = line.words
+                && !h_words.is_empty()
+            {
+                h_words
+                    .into_iter()
+                    .filter_map(|w| {
+                        let w_text = w.text.trim();
+                        if w_text.is_empty() {
+                            return None;
+                        }
+                        let mut min_x = f32::MAX;
+                        let mut max_x = f32::MIN;
+                        let mut min_y = f32::MAX;
+                        let mut max_y = f32::MIN;
+                        for pt in &w.bbox {
+                            min_x = min_x.min(pt[0]);
+                            max_x = max_x.max(pt[0]);
+                            min_y = min_y.min(pt[1]);
+                            max_y = max_y.max(pt[1]);
+                        }
+                        let local_x = min_x.round() as i32;
+                        let local_y = min_y.round() as i32;
+                        let w_w = (max_x - min_x).round().max(1.0) as i32;
+                        let w_h = (max_y - min_y).round().max(1.0) as i32;
+                        let rect = ScreenRect::new(
+                            local_x + frame.offset_x,
+                            local_y + frame.offset_y,
+                            w_w,
+                            w_h,
+                        );
+                        Some(RecognizedWord {
+                            text: w_text.to_string(),
+                            rect,
+                        })
+                    })
+                    .collect()
+            } else {
+                split_line_words_proportionate(trimmed, rect)
+            };
 
             recognized.push(RecognizedLine {
                 text: trimmed.to_string(),
@@ -685,7 +782,7 @@ impl OcrHelperClient {
             });
         }
 
-        Ok(recognized)
+        Ok((recognized, response_line))
     }
 
     fn handle_failure(
@@ -950,5 +1047,107 @@ mod tests {
         // While is_initializing is true, init_session should return immediately without spawning
         client.init_session().await;
         assert!(client.is_initializing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_helper_line_words_exact_boxes_deserialization() {
+        let json_str = r#"{
+            "id": 1,
+            "ok": true,
+            "lines": [
+                {
+                    "text": "PLEASE FOLLOW",
+                    "box": [[90.0, 95.0], [300.0, 95.0], [300.0, 130.0], [90.0, 130.0]],
+                    "score": 0.99,
+                    "words": [
+                        {"text": "PLEASE", "score": 1.0, "box": [[94.0, 97.0], [188.0, 97.0], [188.0, 128.0], [94.0, 128.0]]},
+                        {"text": "FOLLOW", "score": 0.99, "box": [[198.0, 97.0], [292.0, 97.0], [292.0, 128.0], [198.0, 128.0]]}
+                    ]
+                }
+            ]
+        }"#;
+        let resp: HelperResponseJson = serde_json::from_str(json_str).unwrap();
+        assert!(resp.ok);
+        let lines = resp.lines.unwrap();
+        assert_eq!(lines.len(), 1);
+        let words = lines[0].words.as_ref().unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "PLEASE");
+        assert_eq!(words[1].text, "FOLLOW");
+    }
+
+    #[test]
+    fn test_classify_response_id() {
+        assert_eq!(classify_response_id(Some(5), 10), ResponseMatch::Stale);
+        assert_eq!(classify_response_id(Some(10), 10), ResponseMatch::Current);
+        assert_eq!(classify_response_id(None, 10), ResponseMatch::Current);
+        assert_eq!(classify_response_id(Some(15), 10), ResponseMatch::Future);
+    }
+
+    #[tokio::test]
+    async fn test_manga_fixtures_rapidocr_integration() {
+        let mut config = AppConfig::default();
+        config.python_path = "python".to_string();
+        config.helper_timeout_ms = 15000;
+        config.helper_min_score = 0.5;
+        let config_arc = Arc::new(Mutex::new(config));
+        let client = OcrHelperClient::new(config_arc);
+
+        // Ensure helper session is initialized
+        client.init_session().await;
+        if !client.is_ready() {
+            println!("SKIPPED: RapidOCR python helper is not available in this environment.");
+            return;
+        }
+
+        let load_frame = |rel_path: &str| -> Option<CapturedFrame> {
+            let img = image::open(rel_path).ok()?.to_rgba8();
+            let (width, height) = (img.width(), img.height());
+            let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+            for pixel in img.pixels() {
+                bgra.push(pixel[2]);
+                bgra.push(pixel[1]);
+                bgra.push(pixel[0]);
+                bgra.push(pixel[3]);
+            }
+            Some(CapturedFrame {
+                bgra_bytes: bgra,
+                width,
+                height,
+                offset_x: 0,
+                offset_y: 0,
+            })
+        };
+
+        // 1. Fixture: please_follow.png
+        if let Some(frame) = load_frame("tests/fixtures/ocr/please_follow.png") {
+            let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
+            let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(full_text.contains("PLEASE"), "Must contain PLEASE: {}", full_text);
+            assert!(full_text.contains("FOLLOW"), "Must contain FOLLOW: {}", full_text);
+            assert!(full_text.contains("INSTRUCTIONS"), "Must contain INSTRUCTIONS: {}", full_text);
+            assert!(!full_text.contains("4EASE"), "Must NOT contain 4EASE artifact: {}", full_text);
+        }
+
+        // 2. Fixture: utube_shorts.png
+        if let Some(frame) = load_frame("tests/fixtures/ocr/utube_shorts.png") {
+            let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
+            let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(full_text.contains("LET'S") || full_text.contains("POST"), "Must contain LET'S/POST: {}", full_text);
+            assert!(full_text.contains("ON"), "Must contain ON: {}", full_text);
+            assert!(full_text.contains("UTUBE"), "Must contain UTUBE: {}", full_text);
+            assert!(full_text.contains("SHORTS"), "Must contain SHORTS: {}", full_text);
+            assert!(!full_text.contains("bN"), "Must NOT contain bN artifact: {}", full_text);
+        }
+
+        // 3. Fixture: new_era_white_glow.png
+        if let Some(frame) = load_frame("tests/fixtures/ocr/new_era_white_glow.png") {
+            let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
+            let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(full_text.contains("HAS"), "Must contain HAS: {}", full_text);
+            assert!(full_text.contains("ENTERED"), "Must contain ENTERED: {}", full_text);
+            assert!(full_text.contains("NEW ERA"), "Must contain NEW ERA: {}", full_text);
+            assert!(!full_text.contains("•PA"), "Must NOT contain •PA artifact: {}", full_text);
+        }
     }
 }

@@ -146,16 +146,26 @@ def extract_lines_from_result(result) -> List[Dict[str, Any]]:
         boxes = result.boxes
         txts = result.txts
         scores = result.scores
+        word_results = getattr(result, "word_results", None)
         if boxes is not None and txts is not None and scores is not None:
-            for box, text, score in zip(boxes, txts, scores):
+            for idx, (box, text, score) in enumerate(zip(boxes, txts, scores)):
                 box_list = box.tolist() if hasattr(box, "tolist") else list(box)
-                lines.append(
-                    {
-                        "text": str(text),
-                        "box": box_list,
-                        "score": float(score),
-                    }
-                )
+                line_data = {
+                    "text": str(text),
+                    "box": box_list,
+                    "score": float(score),
+                }
+                if word_results and idx < len(word_results) and word_results[idx]:
+                    words = []
+                    for w in word_results[idx]:
+                        w_box = w[2].tolist() if hasattr(w[2], "tolist") else list(w[2])
+                        words.append({
+                            "text": str(w[0]),
+                            "score": float(w[1]),
+                            "box": w_box,
+                        })
+                    line_data["words"] = words
+                lines.append(line_data)
         return lines
 
     # RapidOCR 1.x or tuple/list format: (result_list, elapse) or result_list
@@ -172,13 +182,22 @@ def extract_lines_from_result(result) -> List[Dict[str, Any]]:
                 text = item[1]
                 score = item[2]
                 box_list = box.tolist() if hasattr(box, "tolist") else list(box)
-                lines.append(
-                    {
-                        "text": str(text),
-                        "box": box_list,
-                        "score": float(score),
-                    }
-                )
+                line_data = {
+                    "text": str(text),
+                    "box": box_list,
+                    "score": float(score),
+                }
+                if len(item) >= 4 and isinstance(item[3], (list, tuple)):
+                    words = []
+                    for w in item[3]:
+                        if isinstance(w, dict):
+                            words.append(w)
+                        elif isinstance(w, (list, tuple)) and len(w) >= 3:
+                            w_box = w[2].tolist() if hasattr(w[2], "tolist") else list(w[2])
+                            words.append({"text": str(w[0]), "score": float(w[1]), "box": w_box})
+                    if words:
+                        line_data["words"] = words
+                lines.append(line_data)
     return lines
 
 
@@ -354,8 +373,144 @@ def rescale_boxes_down(
             new_line["box"] = [
                 [float(p[0]) / scale_factor, float(p[1]) / scale_factor] for p in box
             ]
+        words = line.get("words")
+        if words:
+            new_words = []
+            for w in words:
+                nw = dict(w)
+                w_box = w.get("box")
+                if w_box:
+                    nw["box"] = [
+                        [float(p[0]) / scale_factor, float(p[1]) / scale_factor] for p in w_box
+                    ]
+                new_words.append(nw)
+            new_line["words"] = new_words
         rescaled.append(new_line)
     return rescaled
+
+
+def call_engine(ocr_exec, img):
+    """Executes OCR with RapidOCR options if supported, falling back gracefully for mock engines."""
+    try:
+        return ocr_exec(
+            img,
+            return_word_box=True,
+            use_cls=False,
+            box_thresh=0.5,
+            unclip_ratio=1.6,
+            text_score=0.5,
+        )
+    except TypeError:
+        return ocr_exec(img)
+
+
+def _shift_box_coords(item: Dict[str, Any], dx: float, dy: float) -> None:
+    box = item.get("box")
+    if box:
+        item["box"] = [[float(p[0]) + dx, float(p[1]) + dy] for p in box]
+    words = item.get("words")
+    if words:
+        for w in words:
+            w_box = w.get("box")
+            if w_box:
+                w["box"] = [[float(p[0]) + dx, float(p[1]) + dy] for p in w_box]
+
+
+def is_problematic_line(line: Dict[str, Any]) -> bool:
+    score = float(line.get("score", 1.0) or 0.0)
+    text = str(line.get("text", "") or "").strip()
+    if score < 0.85:
+        return True
+    non_spaces = [c for c in text if not c.isspace()]
+    if not non_spaces:
+        return True
+    alnum_count = sum(1 for c in non_spaces if c.isalnum())
+    if (alnum_count / len(non_spaces)) < 0.60:
+        return True
+    for c in text:
+        if c in "•@#$%^&*~`|\\_":
+            return True
+    return False
+
+
+def score_ocr_candidate(text: str, score: float) -> float:
+    trimmed = text.strip()
+    if not trimmed:
+        return 0.0
+    non_spaces = [c for c in trimmed if not c.isspace()]
+    if not non_spaces:
+        return 0.0
+    alnum_count = sum(1 for c in non_spaces if c.isalnum())
+    alnum_ratio = alnum_count / len(non_spaces)
+    symbol_penalty = (1.0 - alnum_ratio) * 0.6
+
+    words = [w.strip(".,!?:;'\"-()").upper() for w in trimmed.split()]
+    common_words = {
+        "A", "AN", "THE", "IN", "ON", "AT", "OF", "TO", "FOR", "WITH",
+        "IS", "ARE", "WAS", "WERE", "BE", "BEEN", "HAS", "HAVE", "HAD",
+        "AND", "OR", "BUT", "NOT", "NEW", "ERA", "ENTERED", "POST", "IT",
+        "FOLLOW", "PLEASE", "INSTRUCTIONS", "SHORTS", "UTUBE", "YOU", "ME",
+        "MY", "HE", "SHE", "THEY", "THIS", "THAT", "WHAT", "WHY", "HOW"
+    }
+    dict_bonus = 0.0
+    for w in words:
+        if len(w) >= 2 and (w in common_words or w.isalpha()):
+            dict_bonus += 0.15
+        elif len(w) == 1 and w in {"A", "I"}:
+            dict_bonus += 0.15
+
+    return score - symbol_penalty + dict_bonus
+
+
+def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str, Any]:
+    box = line.get("box")
+    if not box or len(box) < 4 or cv2 is None or np is None or not isinstance(img_bgr, np.ndarray):
+        return line
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    h_img, w_img = img_bgr.shape[:2]
+    pad = 20
+    x1 = max(0, int(min(xs)) - pad)
+    y1 = max(0, int(min(ys)) - pad)
+    x2 = min(w_img, int(max(xs)) + pad)
+    y2 = min(h_img, int(max(ys)) + pad)
+    if x2 <= x1 + 5 or y2 <= y1 + 5:
+        return line
+
+    crop = img_bgr[y1:y2, x1:x2]
+    if crop.shape[0] < 8 or crop.shape[1] < 8:
+        return line
+
+    best_cand = line
+    best_eval = score_ocr_candidate(line.get("text", ""), float(line.get("score", 0.0) or 0.0))
+
+    min_ch = np.min(crop, axis=2)
+
+    # Variant (b): min(R,G,B) -> negative
+    neg_min = (255 - min_ch).astype(np.uint8)
+    crop_neg = np.stack([neg_min, neg_min, neg_min], axis=2)
+    res_b = call_engine(ocr_exec, crop_neg)
+    lines_b = extract_lines_from_result(res_b)
+    for lb in lines_b:
+        eval_b = score_ocr_candidate(lb.get("text", ""), float(lb.get("score", 0.0) or 0.0))
+        if eval_b > best_eval + 0.05:
+            _shift_box_coords(lb, x1, y1)
+            best_eval = eval_b
+            best_cand = lb
+
+    # Variant (c): bright mask min(R,G,B) >= 220 -> black text on white
+    mask_ch = np.where(min_ch >= 220, 0, 255).astype(np.uint8)
+    crop_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
+    res_c = call_engine(ocr_exec, crop_mask)
+    lines_c = extract_lines_from_result(res_c)
+    for lc in lines_c:
+        eval_c = score_ocr_candidate(lc.get("text", ""), float(lc.get("score", 0.0) or 0.0))
+        if eval_c > best_eval + 0.05:
+            _shift_box_coords(lc, x1, y1)
+            best_eval = eval_c
+            best_cand = lc
+
+    return best_cand
 
 
 def _run_ocr_with_variants(img, ocr_exec):
@@ -520,18 +675,9 @@ def process_request(
             img_up = cv2.resize(
                 img_bgr, (up_w, up_h), interpolation=cv2.INTER_CUBIC
             )
-            lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
-                img_up, ocr_exec
-            )
-
-            # Пересчитываем координаты рамок обратно в систему исходного кадра ДО фильтрации и объединения
-            lines_orig = rescale_boxes_down(lines_orig, UPSCALE_SMALL_FRAMES)
-            lines_inv = rescale_boxes_down(lines_inv, UPSCALE_SMALL_FRAMES)
-            lines_mask = rescale_boxes_down(lines_mask, UPSCALE_SMALL_FRAMES)
-
-            kept_lines = merge_ocr_lines([lines_orig, lines_inv, lines_mask])
-            raw_lines = lines_orig + lines_inv + lines_mask
-            rejected_lines = []
+            result = call_engine(ocr_exec, img_up)
+            raw_lines = extract_lines_from_result(result)
+            raw_lines = rescale_boxes_down(raw_lines, UPSCALE_SMALL_FRAMES)
         elif (
             os.environ.get(SCREEN_TRANSLATOR_OCR_VARIANTS_ENV) == "1"
             and np is not None
@@ -540,13 +686,21 @@ def process_request(
             lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
                 img_bgr, ocr_exec
             )
-            kept_lines = merge_ocr_lines([lines_orig, lines_inv, lines_mask])
             raw_lines = lines_orig + lines_inv + lines_mask
-            rejected_lines = []
         else:
-            result = ocr_exec(img_bgr)
+            result = call_engine(ocr_exec, img_bgr)
             raw_lines = extract_lines_from_result(result)
-            kept_lines, rejected_lines = filter_ocr_lines(raw_lines)
+
+        # Step 3: Targeted retry pass on problematic boxes
+        if np is not None and isinstance(img_bgr, np.ndarray):
+            refined = []
+            for item in raw_lines:
+                if is_problematic_line(item):
+                    item = refine_problematic_box(img_bgr, item, ocr_exec)
+                refined.append(item)
+            raw_lines = refined
+
+        kept_lines, rejected_lines = filter_ocr_lines(raw_lines)
 
         if os.environ.get(SCREEN_TRANSLATOR_OCR_DEBUG_ENV) == "1":
             rejection_map = {id(item): reason for item, reason in rejected_lines}

@@ -454,6 +454,72 @@ pub fn clean_ocr_noise(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Checks whether a text string or sentence is translatable, filtering out OCR garbage
+/// (e.g. strings with < 50% alphanumeric characters, or symbol noise like "I@II#O*$").
+pub fn is_translatable_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let alpha_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    let digit_count = trimmed.chars().filter(|c| c.is_numeric()).count();
+    let total_non_space = trimmed.chars().filter(|c| !c.is_whitespace()).count();
+
+    if total_non_space == 0 {
+        return false;
+    }
+
+    // Pure numbers like "100" or "+50" are legitimate HUD metrics
+    if alpha_count == 0 && digit_count > 0 {
+        return trimmed
+            .trim_matches(|c: char| c == '+' || c == '-' || c == '$' || c == '%' || c == '#')
+            .parse::<f64>()
+            .is_ok();
+    }
+
+    if alpha_count == 0 {
+        return false;
+    }
+
+    let meaningful = alpha_count + digit_count;
+    let ratio = meaningful as f32 / total_non_space as f32;
+    if ratio < 0.50 {
+        return false;
+    }
+
+    // Typical title page / artifact symbols like @, #, $, *, ~, |, \, • (e.g. "I@II#O*$", "•PA")
+    let harsh_symbols = trimmed
+        .chars()
+        .filter(|c| matches!(c, '@' | '#' | '$' | '*' | '~' | '|' | '\\' | '^' | '•' | '·' | '●' | '○'))
+        .count();
+    if harsh_symbols >= 1
+        && (trimmed.chars().any(|c| matches!(c, '•' | '·' | '●' | '○')) || harsh_symbols >= 2)
+        && (harsh_symbols as f32 / total_non_space as f32) >= 0.25
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Checks whether a single token is a valid word for dictionary lookup (only letters, apostrophes, and hyphens).
+/// Tokens containing foreign characters, symbols, or numbers (e.g. "•PA", "4EASE", "I@II#O*$") are rejected.
+pub fn is_valid_dictionary_word(word: &str) -> bool {
+    if word
+        .chars()
+        .any(|c| matches!(c, '@' | '#' | '$' | '*' | '~' | '|' | '\\' | '^' | '•' | '·' | '●' | '○'))
+    {
+        return false;
+    }
+    let w = crate::types::extract_word_token(word);
+    if w.is_empty() {
+        return false;
+    }
+    w.chars()
+        .all(|c| c.is_alphabetic() || c == '\'' || c == '’' || c == '-')
+}
+
 /// Converts comic/game ALL CAPS text into readable, natural sentence casing.
 pub fn normalize_all_caps(text: &str) -> String {
     let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
@@ -976,6 +1042,10 @@ impl TranslatorService {
         api_key: &str,
         context: &str,
     ) -> Result<String, String> {
+        if !is_translatable_text(text) {
+            warn!("translate_deepl: skipping OCR garbage: {:?}", text);
+            return Ok(text.to_string());
+        }
         let mut results = self
             .translate_deepl_batch(&[text], source_lang, target_lang, api_key, context)
             .await?;
@@ -995,6 +1065,24 @@ impl TranslatorService {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Filter out OCR garbage before calling DeepL API
+        let mut translatable_indices = Vec::new();
+        let mut translatable_texts = Vec::new();
+
+        for (i, &t) in texts.iter().enumerate() {
+            if is_translatable_text(t) {
+                translatable_indices.push(i);
+                translatable_texts.push(t);
+            } else {
+                warn!("DeepL batch filter: skipping OCR garbage: {:?}", t);
+            }
+        }
+
+        if translatable_texts.is_empty() {
+            return Ok(texts.iter().map(|s| s.to_string()).collect());
+        }
+
         let endpoint = if api_key.ends_with(":fx") {
             "https://api-free.deepl.com/v2/translate"
         } else {
@@ -1002,7 +1090,7 @@ impl TranslatorService {
         };
 
         let mut body = serde_json::json!({
-            "text": texts,
+            "text": translatable_texts,
             "target_lang": deepl_target_lang(target_lang),
         });
 
@@ -1031,7 +1119,13 @@ impl TranslatorService {
             .await
             .map_err(|e| redact_secrets(&format!("DeepL response error: {:?}", e)))?;
 
-        parse_deepl_batch_response(&body_str, texts.len())
+        let translations = parse_deepl_batch_response(&body_str, translatable_texts.len())?;
+        let mut result = texts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (k, trans) in translations.into_iter().enumerate() {
+            let orig_idx = translatable_indices[k];
+            result[orig_idx] = trans;
+        }
+        Ok(result)
     }
 
     pub async fn translate_gemini(
@@ -1392,7 +1486,15 @@ impl TranslatorService {
         target_lang: &str,
         config: &AppConfig,
     ) -> Result<String, String> {
+        if !is_translatable_text(text) {
+            warn!("translate_text: skipping OCR garbage: {:?}", text);
+            return Ok(text.to_string());
+        }
         let cleaned = clean_ocr_noise(text);
+        if !is_translatable_text(&cleaned) {
+            warn!("translate_text: skipping noisy cleaned text: {:?}", cleaned);
+            return Ok(text.to_string());
+        }
         let normalized = normalize_all_caps(&cleaned);
         self.translate_normalized_text(&normalized, source_lang, target_lang, config, true)
             .await
@@ -1445,7 +1547,17 @@ impl TranslatorService {
         target_lang: &str,
         config: &AppConfig,
     ) -> WordDetails {
-        let clean = clean_ocr_noise(word);
+        if !is_valid_dictionary_word(word) {
+            warn!("lookup_word_details: skipping non-dictionary token: {:?}", word);
+            return WordDetails {
+                primary: word.to_string(),
+                synonyms: Vec::new(),
+                examples: Vec::new(),
+            };
+        }
+
+        let w = crate::types::extract_word_token(word);
+        let clean = clean_ocr_noise(w);
         let trimmed_punct = clean.trim().trim_matches(|c: char| !c.is_alphanumeric());
         let normalized = if !trimmed_punct.is_empty() {
             trimmed_punct
@@ -1642,7 +1754,12 @@ impl TranslatorService {
         let mut all_cached = true;
         let mut cached_results = Vec::with_capacity(blocks.len());
 
-        for text in &cleaned_texts {
+        for (i, text) in cleaned_texts.iter().enumerate() {
+            if !is_translatable_text(text) {
+                warn!("translate_blocks: skipping translation for OCR garbage block: {:?}", blocks[i].text);
+                cached_results.push(Some(blocks[i].text.clone()));
+                continue;
+            }
             let cache_key = format!(
                 "{}:{}:{}:{}",
                 config.provider.as_str(),
@@ -2398,5 +2515,41 @@ mod tests {
         // 4. Mismatch between uncached indices and translations count
         let err = assemble_batch_translations(&cached_partial, &uncached_idx, &[]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_is_translatable_text_and_dictionary_word() {
+        // Translatable speech / UI
+        assert!(is_translatable_text("PLEASE FOLLOW INSTRUCTIONS!"));
+        assert!(is_translatable_text("LET'S POST IT ON UTUBE SHORTS!"));
+        assert!(is_translatable_text("HAS ENTERED A NEW ERA."));
+        assert!(is_translatable_text("+50"));
+        assert!(is_translatable_text("100"));
+
+        // Garbage / title artifacts / symbols
+        assert!(!is_translatable_text("I@II#O*$"));
+        assert!(!is_translatable_text("|| // 1! \\"));
+        assert!(!is_translatable_text("   "));
+        assert!(!is_translatable_text("•PA"));
+
+        // Dictionary word validation
+        assert!(is_valid_dictionary_word("INSTRUCTIONS"));
+        assert!(is_valid_dictionary_word("LET'S"));
+        assert!(is_valid_dictionary_word("don't"));
+        assert!(is_valid_dictionary_word("state-of-the-art"));
+        assert!(is_valid_dictionary_word("PLEASE!"));
+        assert!(is_valid_dictionary_word("café"));
+        assert!(is_valid_dictionary_word("Привет"));
+        assert!(is_valid_dictionary_word("well-known"));
+
+        // Invalid dictionary tokens
+        assert!(!is_valid_dictionary_word("•PA"));
+        assert!(!is_valid_dictionary_word("I@II#O*$"));
+        assert!(!is_valid_dictionary_word("4EASE"));
+        assert!(!is_valid_dictionary_word("126"));
+        assert!(!is_valid_dictionary_word(""));
+        assert!(!is_valid_dictionary_word("..."));
+        assert!(!is_valid_dictionary_word("1ONG"));
+        assert!(!is_valid_dictionary_word("@@"));
     }
 }

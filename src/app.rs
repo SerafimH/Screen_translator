@@ -431,16 +431,28 @@ fn is_ordinal(s: &str) -> bool {
 }
 
 /// Checks whether an OCR-recognized word is suspicious (likely OCR artifact/glitch):
-/// - Trims edge non-alphanumeric characters.
+/// - Returns true if it contains characters outside letters, ['’\-] and valid digits (e.g. •PA, I@II#O*$).
 /// - Returns true if there is a lowercase -> uppercase transition inside the word (e.g. rrOTtcTION, PFOTtCTION).
 /// - Returns true if length >= 3 and it contains both digits and letters, excluding ordinals (e.g. 1ONG, but 2nd / 3D are not suspicious).
 pub fn is_suspicious_word(word: &str) -> bool {
-    let trimmed = word.trim().trim_matches(|c: char| !c.is_alphanumeric());
-    if trimmed.is_empty() {
+    let raw = word.trim();
+    if raw.is_empty() {
         return false;
     }
 
-    // (а) Переход «строчная буква -> заглавная» внутри слова
+    // (а) Содержит символы вне латиницы/букв, апострофов, дефиса и цифр (например, «•PA», «I@II#O*$»)
+    for c in raw.chars() {
+        if !c.is_alphabetic() && c != '\'' && c != '’' && c != '-' && !c.is_ascii_digit() {
+            return true;
+        }
+    }
+
+    let trimmed = raw.trim_matches(|c: char| !c.is_alphanumeric());
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // (б) Переход «строчная буква -> заглавная» внутри слова
     let mut prev_is_lower = false;
     for c in trimmed.chars() {
         if c.is_lowercase() {
@@ -454,7 +466,7 @@ pub fn is_suspicious_word(word: &str) -> bool {
         }
     }
 
-    // (б) Длина >= 3 и содержит и цифры, и буквы (кроме порядковых числительных)
+    // (в) Длина >= 3 и содержит и цифры, и буквы (кроме порядковых числительных)
     if trimmed.chars().count() >= 3 {
         let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
         let has_alpha = trimmed.chars().any(|c| c.is_alphabetic());
@@ -552,8 +564,8 @@ impl AppState {
             }
         };
 
-        let blocks = match self.perform_ocr(&frame, &cfg).await {
-            Ok(b) => b,
+        let (blocks, raw_json) = match self.perform_ocr(&frame, &cfg).await {
+            Ok(res) => res,
             Err(e) => {
                 warn!("OCR error during cursor translation: {}", e);
                 self.overlay
@@ -581,7 +593,24 @@ impl AppState {
             .unwrap_or(false)
             && target.sentence_text.split_whitespace().count() > 1;
 
-        let translation_block = if is_multi_word {
+        let translation_block = if target.word_text.is_none() {
+            // Line found but no resolvable word (e.g. cursor on "..."): translate the whole sentence.
+            let sentence_trans = self
+                .translator
+                .translate_text(&target.sentence_text, &cfg.source_lang, &cfg.target_lang, &cfg)
+                .await
+                .unwrap_or_else(|_| target.sentence_text.clone());
+            TranslationBlock {
+                original_text: target.sentence_text.clone(),
+                translated_text: format!("«{}»\n→ «{}»", target.sentence_text, sentence_trans),
+                rect: ScreenRect::new(
+                    target.sentence_rect.x,
+                    target.sentence_rect.y,
+                    target.sentence_rect.width.max(420),
+                    target.sentence_rect.height,
+                ),
+            }
+        } else if is_multi_word {
             let word = target.word_text.as_ref().unwrap();
             let is_suspicious = is_suspicious_word(word);
 
@@ -595,7 +624,7 @@ impl AppState {
                         &cfg,
                     )
                     .await;
-                let header = format!("Слово: {} (распознано неуверенно)", word);
+                let header = format!("Слово: {} (не удалось распознать)", word);
                 let trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
                 (header, trans)
             } else {
@@ -647,7 +676,7 @@ impl AppState {
             let is_suspicious = is_suspicious_word(word_or_line);
 
             let card_text = if is_suspicious {
-                format!("Слово: {} (распознано неуверенно)", word_or_line)
+                format!("Слово: {} (не удалось распознать)", word_or_line)
             } else {
                 let details = self
                     .translator
@@ -680,6 +709,19 @@ impl AppState {
                 rect: ScreenRect::new(base_rect.x, base_rect.y, card_w, base_rect.height),
             }
         };
+
+        if cfg.dump_ocr {
+            let res_text = format!(
+                "Word: {:?}\nSentence: {}\nResult: {}\n",
+                target.word_text, target.sentence_text, translation_block.translated_text
+            );
+            crate::ocr::dump_ocr_artifacts(
+                &frame,
+                Some((&frame.bgra_bytes, frame.width, frame.height)),
+                &raw_json,
+                &res_text,
+            );
+        }
 
         if !crate::overlay::is_shift_held() {
             info!("Shift was released before translation finished, skipping card display.");
@@ -756,8 +798,8 @@ impl AppState {
         );
         let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
 
-        let blocks = match self.perform_ocr(&frame, &cfg).await {
-            Ok(b) => b,
+        let (blocks, raw_json) = match self.perform_ocr(&frame, &cfg).await {
+            Ok(res) => res,
             Err(e) => {
                 error!("OCR error: {}", e);
                 *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
@@ -831,6 +873,20 @@ impl AppState {
 
         let translations = self.translator.translate_blocks(&valid_blocks, &cfg).await;
 
+        if cfg.dump_ocr {
+            let res_text = translations
+                .iter()
+                .map(|b| format!("ORIG: {}\nTRANS: {}\n", b.original_text, b.translated_text))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            crate::ocr::dump_ocr_artifacts(
+                &frame,
+                Some((&frame.bgra_bytes, frame.width, frame.height)),
+                &raw_json,
+                &res_text,
+            );
+        }
+
         let elapsed = start_time.elapsed().as_millis();
         let status = format!("Переведено {} блоков за {} мс", translations.len(), elapsed);
         info!("{}", status);
@@ -844,7 +900,7 @@ impl AppState {
         &self,
         frame: &CapturedFrame,
         cfg: &AppConfig,
-    ) -> Result<Vec<OcrBlock>, String> {
+    ) -> Result<(Vec<OcrBlock>, String), String> {
         match cfg.ocr_engine {
             OcrMode::WinRt => {
                 self.overlay.set_loading(
@@ -852,7 +908,8 @@ impl AppState {
                     Some("Распознавание текста (WinRT OCR)...".to_string()),
                 );
                 if let Some(ocr) = &self.ocr {
-                    ocr.recognize(frame).await
+                    let blocks = ocr.recognize(frame).await?;
+                    Ok((blocks, "WinRT OCR".to_string()))
                 } else {
                     Err("Системный WinRT OCR недоступен. Установите языковой пакет в Windows или выберите RapidOCR.".to_string())
                 }
@@ -860,8 +917,8 @@ impl AppState {
             OcrMode::Helper => {
                 self.overlay
                     .set_loading(true, Some("Распознавание текста (RapidOCR)...".to_string()));
-                match self.helper_ocr.recognize(frame, &cfg.ocr_lang).await {
-                    Ok(blocks) => Ok(blocks),
+                match self.helper_ocr.recognize_with_raw(frame, &cfg.ocr_lang).await {
+                    Ok((blocks, raw_json)) => Ok((blocks, raw_json)),
                     Err(err) => {
                         warn!("RapidOCR helper failed: {}. Falling back to WinRT...", err);
                         if let Some(ocr) = &self.ocr {
@@ -869,7 +926,8 @@ impl AppState {
                                 true,
                                 Some("RapidOCR недоступен, откат на WinRT OCR...".to_string()),
                             );
-                            ocr.recognize(frame).await
+                            let blocks = ocr.recognize(frame).await?;
+                            Ok((blocks, format!("WinRT Fallback (RapidOCR error: {})", err)))
                         } else {
                             Err(format!(
                                 "RapidOCR helper failed: {}. WinRT OCR также недоступен.",
@@ -882,7 +940,7 @@ impl AppState {
             OcrMode::Auto => {
                 let Some(ocr) = &self.ocr else {
                     // WinRT is not available, directly use RapidOCR helper
-                    return self.helper_ocr.recognize(frame, &cfg.ocr_lang).await;
+                    return self.helper_ocr.recognize_with_raw(frame, &cfg.ocr_lang).await;
                 };
 
                 self.overlay.set_loading(
@@ -907,7 +965,7 @@ impl AppState {
                             frame.offset_y,
                         )),
                     );
-                    Ok(blocks)
+                    Ok((blocks, format!("WinRT Pass 1 (score: {})", pass1_score)))
                 } else {
                     info!(
                         "Auto mode: WinRT Pass 1 score is low ({}), trying RapidOCR helper...",
@@ -915,19 +973,20 @@ impl AppState {
                     );
                     self.overlay
                         .set_loading(true, Some("Auto: пробую RapidOCR помощник...".to_string()));
-                    match self.helper_ocr.recognize(frame, &cfg.ocr_lang).await {
-                        Ok(blocks) if is_helper_result_valid(&blocks) => {
+                    match self.helper_ocr.recognize_with_raw(frame, &cfg.ocr_lang).await {
+                        Ok((blocks, raw_json)) if is_helper_result_valid(&blocks) => {
                             info!(
                                 "Auto mode: RapidOCR helper succeeded with {} blocks",
                                 blocks.len()
                             );
-                            Ok(blocks)
+                            Ok((blocks, raw_json))
                         }
                         _ => {
                             info!(
                                 "Auto mode: RapidOCR yielded no text, falling back to full WinRT multi-pass..."
                             );
-                            ocr.recognize(frame).await
+                            let blocks = ocr.recognize(frame).await?;
+                            Ok((blocks, "WinRT Multi-pass".to_string()))
                         }
                     }
                 }
@@ -1308,6 +1367,9 @@ mod tests {
         assert!(is_suspicious_word("rrOTtcTION"));
         assert!(is_suspicious_word("PFOTtCTION"));
         assert!(is_suspicious_word("1ONG"));
+        assert!(is_suspicious_word("4EASE"));
+        assert!(is_suspicious_word("•PA"));
+        assert!(is_suspicious_word("I@II#O*$"));
 
         // Корректные слова (не должны считаться подозрительными)
         assert!(!is_suspicious_word("PROTECTION"));
@@ -1317,5 +1379,8 @@ mod tests {
         assert!(!is_suspicious_word("GUNGNIR'S"));
         assert!(!is_suspicious_word("2nd"));
         assert!(!is_suspicious_word("3D"));
+        assert!(!is_suspicious_word("café"));
+        assert!(!is_suspicious_word("naïve"));
+        assert!(!is_suspicious_word("Привет"));
     }
 }

@@ -270,6 +270,44 @@ pub fn collect_context_lines(lines: &[RecognizedLine], selected_idx: usize) -> V
     all_indices
 }
 
+/// Trims boundary non-alphanumeric punctuation from a token while preserving internal characters.
+pub fn extract_word_token(token: &str) -> &str {
+    token.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// Resolves the full token under the cursor, expanding 1-2 letter fragments to the full word
+/// if the surrounding line contains a longer token (e.g. "IN" -> "INSTRUCTIONS").
+pub fn resolve_full_word_token<'a>(word_text: &'a str, line_text: &'a str) -> &'a str {
+    let clean_word = extract_word_token(word_text.trim());
+    if clean_word.is_empty() {
+        return clean_word;
+    }
+
+    let tokens: Vec<&str> = line_text.split_whitespace().collect();
+
+    // 1. Direct match with any clean token in the line
+    for tok in &tokens {
+        let clean_tok = extract_word_token(tok);
+        if clean_tok.eq_ignore_ascii_case(clean_word) {
+            return clean_tok;
+        }
+    }
+
+    // 2. If short fragment (1-2 chars), expand to the longer surrounding token in line
+    if clean_word.chars().count() <= 2 {
+        for tok in &tokens {
+            let clean_tok = extract_word_token(tok);
+            if clean_tok.chars().count() > clean_word.chars().count()
+                && clean_tok.to_ascii_uppercase().contains(&clean_word.to_ascii_uppercase())
+            {
+                return clean_tok;
+            }
+        }
+    }
+
+    clean_word
+}
+
 /// Identifies the word or sentence under the cursor given recognized OCR blocks.
 pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<TextUnderCursor> {
     if blocks.is_empty() {
@@ -299,8 +337,9 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         ((dx * dx + dy * dy) as f64).sqrt().round() as i64
     };
 
-    // Максимальный радиус поиска текста вокруг курсора (в пикселях).
-    const MAX_DISTANCE: i64 = 12;
+    // Maximum distance in pixels to search for text around the cursor.
+    const MAX_DISTANCE: i64 = 10;
+    const LINE_MAX_DISTANCE: i64 = 24;
 
     let candidate_score = |r: &ScreenRect| -> (i64, i64, i64) {
         let d = dist_to_rect(r, px, py);
@@ -313,7 +352,7 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
 
     for (idx, line) in all_lines.iter().enumerate() {
         let l_dist = dist_to_rect(&line.rect, px, py);
-        if l_dist <= MAX_DISTANCE {
+        if l_dist <= LINE_MAX_DISTANCE {
             let l_score = candidate_score(&line.rect);
             if let Some((_, best_score)) = best_line_match {
                 if l_score < best_score {
@@ -343,6 +382,24 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         }
     }
 
+    // Если курсор попал в строку, но ни один бокс слова не оказался в пределах MAX_DISTANCE
+    // (например, клик между словами или чуть выше/ниже), ищем ближайшее слово в этой строке
+    if best_word_match.is_none() && !line.words.is_empty() {
+        for word in &line.words {
+            let w_dist = dist_to_rect(&word.rect, px, py);
+            if w_dist <= 24 {
+                let w_score = candidate_score(&word.rect);
+                if let Some((_, best_score)) = best_word_match {
+                    if w_score < best_score {
+                        best_word_match = Some((word, w_score));
+                    }
+                } else {
+                    best_word_match = Some((word, w_score));
+                }
+            }
+        }
+    }
+
     let context_indices = collect_context_lines(&all_lines, best_idx);
     let s_text = context_indices
         .iter()
@@ -360,9 +417,17 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         .fold(line.rect, |acc, &i| acc.union(&all_lines[i].rect));
 
     let (w_text_opt, w_rect_opt) = if let Some((word, _)) = best_word_match {
-        let w_text = word.text.trim();
-        if !w_text.is_empty() {
-            (Some(w_text.to_string()), Some(word.rect))
+        let raw_word = word.text.trim();
+        let expanded = resolve_full_word_token(raw_word, &line.text);
+        if !expanded.is_empty() {
+            // Если токен был расширен, проверяем, есть ли слово с совпадающим текстом в line.words для точного rect
+            let mut resolved_rect = word.rect;
+            if expanded != raw_word {
+                if let Some(matching_word) = line.words.iter().find(|w| extract_word_token(w.text.trim()) == expanded) {
+                    resolved_rect = matching_word.rect;
+                }
+            }
+            (Some(expanded.to_string()), Some(resolved_rect))
         } else {
             (None, None)
         }
@@ -547,6 +612,13 @@ pub struct AppConfig {
     pub font_size: i32,
     pub font_family: String,
     pub overlay_bg_alpha: u8,
+    pub dump_ocr: bool,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct DebugConfigRaw {
+    pub dump_ocr: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -573,6 +645,8 @@ struct AppConfigRaw {
     pub font_size: i32,
     pub font_family: String,
     pub overlay_bg_alpha: u8,
+    pub debug: Option<DebugConfigRaw>,
+    pub dump_ocr: Option<bool>,
 }
 
 impl Default for AppConfigRaw {
@@ -600,6 +674,8 @@ impl Default for AppConfigRaw {
             font_size: def.font_size,
             font_family: def.font_family,
             overlay_bg_alpha: def.overlay_bg_alpha,
+            debug: None,
+            dump_ocr: None,
         }
     }
 }
@@ -656,6 +732,12 @@ impl From<AppConfigRaw> for AppConfig {
             font_size: raw.font_size,
             font_family: raw.font_family,
             overlay_bg_alpha: raw.overlay_bg_alpha,
+            dump_ocr: raw.dump_ocr
+                .or_else(|| raw.debug.and_then(|d| d.dump_ocr))
+                .unwrap_or(false)
+                || std::env::var("SCREEN_TRANSLATOR_DUMP_OCR")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
         }
     }
 }
@@ -707,6 +789,7 @@ impl Default for AppConfig {
             font_size: 16,
             font_family: "Segoe UI".to_string(),
             overlay_bg_alpha: 220,
+            dump_ocr: false,
         }
     }
 }
@@ -743,6 +826,7 @@ impl fmt::Debug for AppConfig {
             .field("font_size", &self.font_size)
             .field("font_family", &self.font_family)
             .field("overlay_bg_alpha", &self.overlay_bg_alpha)
+            .field("dump_ocr", &self.dump_ocr)
             .finish()
     }
 }
@@ -1000,6 +1084,21 @@ mod tests {
     }
 
     #[test]
+    fn test_dump_ocr_config_parsing() {
+        let toml_table = "[debug]\ndump_ocr = true\n";
+        let cfg1 = AppConfig::from_toml_str(toml_table);
+        assert!(cfg1.dump_ocr);
+
+        let toml_flat = "dump_ocr = true\n";
+        let cfg2 = AppConfig::from_toml_str(toml_flat);
+        assert!(cfg2.dump_ocr);
+
+        let toml_off = "[debug]\ndump_ocr = false\n";
+        let cfg3 = AppConfig::from_toml_str(toml_off);
+        assert!(!cfg3.dump_ocr);
+    }
+
+    #[test]
     fn test_toml_hash_in_quotes_and_inline_comments() {
         let toml = r#"
             python_path = "C:/env #1/python.exe"
@@ -1156,7 +1255,7 @@ mod tests {
         assert_eq!(target2.word_text.as_deref(), Some("world"));
         assert_eq!(target2.sentence_text, "Hello world");
 
-        // Cursor in margin (near line/words within 40px)
+        // Cursor in margin (near line/words within 24px)
         let target_near =
             find_text_under_cursor(&blocks, 100, 90).expect("Near target must be found");
         assert_eq!(target_near.word_text.as_deref(), Some("Hello"));
@@ -1251,6 +1350,31 @@ mod tests {
     }
 
     #[test]
+    fn test_find_text_under_cursor_line_max_distance() {
+        let block = OcrBlock {
+            text: "Target".to_string(),
+            rect: ScreenRect::new(100, 100, 100, 30),
+            lines: vec![RecognizedLine {
+                text: "Target".to_string(),
+                rect: ScreenRect::new(100, 100, 100, 30),
+                words: vec![RecognizedWord {
+                    text: "Target".to_string(),
+                    rect: ScreenRect::new(100, 100, 100, 30),
+                }],
+            }],
+        };
+
+        // Cursor at (120, 80) is 20 px above line rect (within LINE_MAX_DISTANCE <= 24)
+        let found = find_text_under_cursor(&[block.clone()], 120, 80)
+            .expect("Line within 20px must be found");
+        assert_eq!(found.word_text.as_deref(), Some("Target"));
+
+        // Cursor at (120, 74) is 26 px above line rect (exceeds LINE_MAX_DISTANCE <= 24)
+        let miss = find_text_under_cursor(&[block], 120, 74);
+        assert!(miss.is_none());
+    }
+
+    #[test]
     fn test_collect_context_lines() {
         let h = 20;
         // 1. Три строки друг под другом (зазор между ними 5px <= 0.8 * 20 = 16)
@@ -1318,5 +1442,60 @@ mod tests {
         assert_eq!(parsed.ocr_lang, def.ocr_lang);
         assert_eq!(parsed.source_lang, def.source_lang);
         assert_eq!(parsed.target_lang, def.target_lang);
+    }
+
+    #[test]
+    fn test_extract_and_resolve_word_token() {
+        assert_eq!(extract_word_token("INSTRUCTIONS!"), "INSTRUCTIONS");
+        assert_eq!(extract_word_token("«HELLO»,"), "HELLO");
+        assert_eq!(extract_word_token("LET'S"), "LET'S");
+        assert_eq!(extract_word_token("don't"), "don't");
+        assert_eq!(extract_word_token("state-of-the-art"), "state-of-the-art");
+        assert_eq!(extract_word_token("Wait…"), "Wait");
+        assert_eq!(extract_word_token("—Hello—"), "Hello");
+        assert_eq!(extract_word_token("Привет!"), "Привет");
+        assert_eq!(extract_word_token("..."), "");
+
+        // Expands 1-2 char fragments to full token from line
+        let line = "PLEASE FOLLOW INSTRUCTIONS!";
+        assert_eq!(resolve_full_word_token("IN", line), "INSTRUCTIONS");
+        assert_eq!(resolve_full_word_token("PL", line), "PLEASE");
+        assert_eq!(resolve_full_word_token("FOLLOW", line), "FOLLOW");
+
+        // Legitimate short words are preserved
+        let line2 = "LET'S POST IT ON UTUBE SHORTS!";
+        assert_eq!(resolve_full_word_token("ON", line2), "ON");
+        assert_eq!(resolve_full_word_token("IT", line2), "IT");
+    }
+
+    #[test]
+    fn test_find_text_under_cursor_expands_fragment() {
+        let block = OcrBlock {
+            text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
+            rect: ScreenRect::new(100, 100, 200, 30),
+            lines: vec![RecognizedLine {
+                text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
+                rect: ScreenRect::new(100, 100, 200, 30),
+                words: vec![
+                    RecognizedWord {
+                        text: "PLEASE".to_string(),
+                        rect: ScreenRect::new(100, 100, 60, 30),
+                    },
+                    RecognizedWord {
+                        text: "FOLLOW".to_string(),
+                        rect: ScreenRect::new(165, 100, 60, 30),
+                    },
+                    RecognizedWord {
+                        text: "IN".to_string(), // 1-2 char fragment
+                        rect: ScreenRect::new(230, 100, 70, 30),
+                    },
+                ],
+            }],
+        };
+
+        // Cursor on the fragment "IN" at (235, 105)
+        let found = find_text_under_cursor(&[block], 235, 105).expect("Should find text under cursor");
+        assert_eq!(found.word_text.as_deref(), Some("INSTRUCTIONS"));
+        assert_eq!(found.sentence_text, "PLEASE FOLLOW INSTRUCTIONS!");
     }
 }

@@ -313,7 +313,7 @@ impl ScreenCapture {
 
         let settings = Settings::new(
             primary_monitor,
-            CursorCaptureSettings::Default,
+            CursorCaptureSettings::WithoutCursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
