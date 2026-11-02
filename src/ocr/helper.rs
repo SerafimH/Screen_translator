@@ -705,29 +705,56 @@ impl OcrHelperClient {
     }
 }
 
+/// Helper: returns proportional character weight for horizontal box partitioning.
+fn char_weight(c: char) -> f32 {
+    if c.is_whitespace() {
+        0.5
+    } else {
+        match c {
+            'i' | 'l' | 'I' | 'j' | 't' | 'f' | 'r' | '!' | '.' | ',' | '\'' | ':' | ';'
+            | '|' | '1' => 0.55,
+            'm' | 'w' | 'M' | 'W' => 1.4,
+            _ => 1.0,
+        }
+    }
+}
+
 /// Splits recognized line text into words and estimates proportional horizontal bounding boxes
 /// across the line rectangle based on character positions and lengths.
 pub fn split_line_words_proportionate(text: &str, line_rect: ScreenRect) -> Vec<RecognizedWord> {
-    let total_chars = text.chars().count().max(1);
+    let total_weight = text.chars().map(char_weight).sum::<f32>();
+    if total_weight <= 0.0 || line_rect.width <= 0 {
+        return Vec::new();
+    }
+
     let mut words = Vec::new();
+    let mut cum_weight = 0.0f32;
     let mut char_cursor = 0usize;
 
     for w_str in text.split_whitespace() {
         if let Some(pos) = text.chars().skip(char_cursor).position(|c| !c.is_whitespace()) {
+            for c in text.chars().skip(char_cursor).take(pos) {
+                cum_weight += char_weight(c);
+            }
             char_cursor += pos;
         }
-        let w_len = w_str.chars().count();
+
+        let w_weight: f32 = w_str.chars().map(char_weight).sum();
         let word_x = line_rect.x
-            + ((char_cursor as f32 / total_chars as f32) * line_rect.width as f32).round() as i32;
-        let word_w = ((w_len as f32 / total_chars as f32) * line_rect.width as f32)
+            + ((cum_weight / total_weight) * line_rect.width as f32).round() as i32;
+        let word_w = ((w_weight / total_weight) * line_rect.width as f32)
             .round()
             .max(1.0) as i32;
+
         words.push(RecognizedWord {
             text: w_str.to_string(),
             rect: ScreenRect::new(word_x, line_rect.y, word_w, line_rect.height),
         });
-        char_cursor += w_len;
+
+        cum_weight += w_weight;
+        char_cursor += w_str.chars().count();
     }
+
     words
 }
 
@@ -758,6 +785,35 @@ mod tests {
         // Combined words must fit inside the line rect
         let last_word_end = words[2].rect.x + words[2].rect.width;
         assert!(last_word_end <= line_rect.x + line_rect.width + 1);
+    }
+
+    #[test]
+    fn test_split_line_words_proportionate_weighted_rules() {
+        // Тест 1: «ILL WOW» — вторая половина (тяжелые буквы W, O, W) должна быть шире первой (легкие I, L, L)
+        let line = "ILL WOW";
+        let line_rect = ScreenRect::new(0, 0, 100, 20);
+        let words = split_line_words_proportionate(line, line_rect);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "ILL");
+        assert_eq!(words[1].text, "WOW");
+        assert!(
+            words[1].rect.width > words[0].rect.width,
+            "Вторая половина (WOW) должна быть шире первой (ILL): {} vs {}",
+            words[1].rect.width,
+            words[0].rect.width
+        );
+
+        // Тест 2: строка из одного слова
+        let single_word = "Hello";
+        let single_words = split_line_words_proportionate(single_word, line_rect);
+        assert_eq!(single_words.len(), 1);
+        assert_eq!(single_words[0].text, "Hello");
+        assert_eq!(single_words[0].rect.x, line_rect.x);
+        assert_eq!(single_words[0].rect.width, line_rect.width);
+
+        // Тест 3: пустая строка
+        let empty_words = split_line_words_proportionate("", line_rect);
+        assert!(empty_words.is_empty());
     }
 
     #[test]

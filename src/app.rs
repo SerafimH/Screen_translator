@@ -381,6 +381,9 @@ where
     }
 }
 
+pub const CURSOR_CAPTURE_WIDTH: i32 = 1000;
+pub const CURSOR_CAPTURE_HEIGHT: i32 = 360;
+
 pub fn cursor_capture_roi(
     pt: POINT,
     active_roi: Option<ScreenRect>,
@@ -392,8 +395,8 @@ pub fn cursor_capture_roi(
     if let Some(roi) = active_roi.filter(|r| r.contains(pt.x, pt.y)) {
         roi
     } else {
-        let cap_w = 800.min((max_x - min_x).max(1));
-        let cap_h = 240.min((max_y - min_y).max(1));
+        let cap_w = CURSOR_CAPTURE_WIDTH.min((max_x - min_x).max(1));
+        let cap_h = CURSOR_CAPTURE_HEIGHT.min((max_y - min_y).max(1));
 
         let cap_x = if max_x > min_x + cap_w {
             (pt.x - cap_w / 2).clamp(min_x, max_x - cap_w)
@@ -409,6 +412,58 @@ pub fn cursor_capture_roi(
 
         ScreenRect::new(cap_x, cap_y, cap_w, cap_h)
     }
+}
+
+fn is_ordinal(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let digits = if let Some(d) = lower.strip_suffix("st") {
+        d
+    } else if let Some(d) = lower.strip_suffix("nd") {
+        d
+    } else if let Some(d) = lower.strip_suffix("rd") {
+        d
+    } else if let Some(d) = lower.strip_suffix("th") {
+        d
+    } else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Checks whether an OCR-recognized word is suspicious (likely OCR artifact/glitch):
+/// - Trims edge non-alphanumeric characters.
+/// - Returns true if there is a lowercase -> uppercase transition inside the word (e.g. rrOTtcTION, PFOTtCTION).
+/// - Returns true if length >= 3 and it contains both digits and letters, excluding ordinals (e.g. 1ONG, but 2nd / 3D are not suspicious).
+pub fn is_suspicious_word(word: &str) -> bool {
+    let trimmed = word.trim().trim_matches(|c: char| !c.is_alphanumeric());
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // (а) Переход «строчная буква -> заглавная» внутри слова
+    let mut prev_is_lower = false;
+    for c in trimmed.chars() {
+        if c.is_lowercase() {
+            prev_is_lower = true;
+        } else if c.is_uppercase() {
+            if prev_is_lower {
+                return true;
+            }
+        } else {
+            prev_is_lower = false;
+        }
+    }
+
+    // (б) Длина >= 3 и содержит и цифры, и буквы (кроме порядковых числительных)
+    if trimmed.chars().count() >= 3 {
+        let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = trimmed.chars().any(|c| c.is_alphabetic());
+        if has_digit && has_alpha && !is_ordinal(trimmed) {
+            return true;
+        }
+    }
+
+    false
 }
 
 impl AppState {
@@ -528,31 +583,48 @@ impl AppState {
 
         let translation_block = if is_multi_word {
             let word = target.word_text.as_ref().unwrap();
-            let word_fut =
-                self.translator
+            let is_suspicious = is_suspicious_word(word);
+
+            let (card_header, sentence_trans) = if is_suspicious {
+                let sentence_res = self
+                    .translator
+                    .translate_text(
+                        &target.sentence_text,
+                        &cfg.source_lang,
+                        &cfg.target_lang,
+                        &cfg,
+                    )
+                    .await;
+                let header = format!("Слово: {} (распознано неуверенно)", word);
+                let trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
+                (header, trans)
+            } else {
+                let word_fut = self
+                    .translator
                     .lookup_word_details(word, &cfg.source_lang, &cfg.target_lang, &cfg);
-            let sentence_fut = self.translator.translate_text(
-                &target.sentence_text,
-                &cfg.source_lang,
-                &cfg.target_lang,
-                &cfg,
-            );
-            let (details, sentence_res) = tokio::join!(word_fut, sentence_fut);
+                let sentence_fut = self.translator.translate_text(
+                    &target.sentence_text,
+                    &cfg.source_lang,
+                    &cfg.target_lang,
+                    &cfg,
+                );
+                let (details, sentence_res) = tokio::join!(word_fut, sentence_fut);
 
-            let sentence_trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
-
-            let mut card_text = format!("Слово: {} → {}", word, details.primary);
-            if !details.synonyms.is_empty() {
-                card_text.push_str(&format!(" ({})", details.synonyms.join(", ")));
-            }
-
-            if !details.examples.is_empty() {
-                card_text.push_str("\n\nПримеры:");
-                for ex in &details.examples {
-                    card_text.push_str(&format!("\n• {}", ex));
+                let trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
+                let mut header = format!("Слово: {} → {}", word, details.primary);
+                if !details.synonyms.is_empty() {
+                    header.push_str(&format!(" ({})", details.synonyms.join(", ")));
                 }
-            }
+                if !details.examples.is_empty() {
+                    header.push_str("\n\nПримеры:");
+                    for ex in &details.examples {
+                        header.push_str(&format!("\n• {}", ex));
+                    }
+                }
+                (header, trans)
+            };
 
+            let mut card_text = card_header;
             card_text.push_str("\n\nВ контексте предложения:\n«");
             card_text.push_str(&target.sentence_text);
             card_text.push_str("»\n→ «");
@@ -572,22 +644,28 @@ impl AppState {
             }
         } else {
             let word_or_line = target.word_text.as_ref().unwrap_or(&target.sentence_text);
+            let is_suspicious = is_suspicious_word(word_or_line);
 
-            let details = self
-                .translator
-                .lookup_word_details(word_or_line, &cfg.source_lang, &cfg.target_lang, &cfg)
-                .await;
+            let card_text = if is_suspicious {
+                format!("Слово: {} (распознано неуверенно)", word_or_line)
+            } else {
+                let details = self
+                    .translator
+                    .lookup_word_details(word_or_line, &cfg.source_lang, &cfg.target_lang, &cfg)
+                    .await;
 
-            let mut card_text = format!("Слово: {} → {}", word_or_line, details.primary);
-            if !details.synonyms.is_empty() {
-                card_text.push_str(&format!(" ({})", details.synonyms.join(", ")));
-            }
-            if !details.examples.is_empty() {
-                card_text.push_str("\n\nПримеры:");
-                for ex in &details.examples {
-                    card_text.push_str(&format!("\n• {}", ex));
+                let mut text = format!("Слово: {} → {}", word_or_line, details.primary);
+                if !details.synonyms.is_empty() {
+                    text.push_str(&format!(" ({})", details.synonyms.join(", ")));
                 }
-            }
+                if !details.examples.is_empty() {
+                    text.push_str("\n\nПримеры:");
+                    for ex in &details.examples {
+                        text.push_str(&format!("\n• {}", ex));
+                    }
+                }
+                text
+            };
 
             let card_w = target
                 .word_rect
@@ -1151,29 +1229,29 @@ mod tests {
         // Primary monitor: pt=(500, 300), min=(0, 0), max=(1920, 1080)
         let pt_primary = POINT { x: 500, y: 300 };
         let roi_primary = cursor_capture_roi(pt_primary, None, 0, 0, 1920, 1080);
-        assert_eq!(roi_primary.x, 100);
-        assert_eq!(roi_primary.y, 180);
-        assert_eq!(roi_primary.width, 800);
-        assert_eq!(roi_primary.height, 240);
+        assert_eq!(roi_primary.x, 0);
+        assert_eq!(roi_primary.y, 120);
+        assert_eq!(roi_primary.width, 1000);
+        assert_eq!(roi_primary.height, 360);
 
-        // Right edge of primary monitor: pt=(1850, 300) -> must clamp cap_x to 1920 - 800 = 1120
+        // Right edge of primary monitor: pt=(1850, 300) -> must clamp cap_x to 1920 - 1000 = 920
         let pt_right = POINT { x: 1850, y: 300 };
         let roi_right = cursor_capture_roi(pt_right, None, 0, 0, 1920, 1080);
-        assert_eq!(roi_right.x, 1120);
-        assert_eq!(roi_right.y, 180);
+        assert_eq!(roi_right.x, 920);
+        assert_eq!(roi_right.y, 120);
         assert_eq!(roi_right.x + roi_right.width, 1920);
 
         // Secondary monitor to the left: pt=(-1000, 200), min=(-1920, 0), max=(0, 1080)
         let pt_left = POINT { x: -1000, y: 200 };
         let roi_left = cursor_capture_roi(pt_left, None, -1920, 0, 0, 1080);
-        assert_eq!(roi_left.x, -1400);
-        assert_eq!(roi_left.y, 80);
+        assert_eq!(roi_left.x, -1500);
+        assert_eq!(roi_left.y, 20);
 
         // Secondary monitor to the top-left: pt=(-1800, -500), min=(-1920, -1080), max=(0, 0)
         let pt_topleft = POINT { x: -1800, y: -500 };
         let roi_topleft = cursor_capture_roi(pt_topleft, None, -1920, -1080, 0, 0);
         assert_eq!(roi_topleft.x, -1920); // clamped to min_x
-        assert_eq!(roi_topleft.y, -620);
+        assert_eq!(roi_topleft.y, -680);
 
         // If manual active ROI contains pt, it takes precedence
         let active = ScreenRect::new(-1200, 100, 400, 300);
@@ -1222,5 +1300,22 @@ mod tests {
             lines: Vec::new(),
         };
         assert!(!is_helper_result_valid(&[garbage_block]));
+    }
+
+    #[test]
+    fn test_is_suspicious_word() {
+        // Подозрительные слова (артефакты OCR)
+        assert!(is_suspicious_word("rrOTtcTION"));
+        assert!(is_suspicious_word("PFOTtCTION"));
+        assert!(is_suspicious_word("1ONG"));
+
+        // Корректные слова (не должны считаться подозрительными)
+        assert!(!is_suspicious_word("PROTECTION"));
+        assert!(!is_suspicious_word("Hello"));
+        assert!(!is_suspicious_word("I"));
+        assert!(!is_suspicious_word("of"));
+        assert!(!is_suspicious_word("GUNGNIR'S"));
+        assert!(!is_suspicious_word("2nd"));
+        assert!(!is_suspicious_word("3D"));
     }
 }

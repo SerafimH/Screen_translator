@@ -122,9 +122,162 @@ pub struct TextUnderCursor {
     pub sentence_rect: ScreenRect,
 }
 
+/// Collects line indices that form a coherent vertical speech bubble or paragraph
+/// above and below the selected line index:
+/// - h = height of the selected line;
+/// - candidate line is valid if vertical gap <= 0.8 * h and horizontal overlap >= 30% of the narrower width;
+/// - among matching candidates, picks the closest by center;
+/// - up to 6 lines in each direction.
+/// Returns indices of lines sorted top-to-bottom.
+pub fn collect_context_lines(lines: &[RecognizedLine], selected_idx: usize) -> Vec<usize> {
+    if selected_idx >= lines.len() {
+        return Vec::new();
+    }
+
+    let h = lines[selected_idx].rect.height as f32;
+    if h <= 0.0 {
+        return vec![selected_idx];
+    }
+
+    let mut up_indices = Vec::new();
+    let mut curr_idx = selected_idx;
+
+    // Идём вверх (не более 6 строк)
+    for _ in 0..6 {
+        let curr = &lines[curr_idx];
+        let curr_cy = curr.rect.y as f32 + curr.rect.height as f32 / 2.0;
+        let curr_cx = curr.rect.x as f32 + curr.rect.width as f32 / 2.0;
+
+        let mut best_cand: Option<(usize, f32)> = None;
+
+        for (i, cand) in lines.iter().enumerate() {
+            if i == curr_idx || i == selected_idx || up_indices.contains(&i) {
+                continue;
+            }
+            let cand_cy = cand.rect.y as f32 + cand.rect.height as f32 / 2.0;
+            // Кандидат должен быть выше текущей строки
+            if cand_cy >= curr_cy {
+                continue;
+            }
+
+            // Вертикальный зазор между кандидатом (сверху) и текущей строкой:
+            // gap = curr.y - (cand.y + cand.height)
+            let gap = (curr.rect.y - (cand.rect.y + cand.rect.height)) as f32;
+            if gap > 0.8 * h {
+                continue;
+            }
+
+            // Горизонтальное перекрытие >= 30% ширины более узкой из двух строк
+            let x1 = cand.rect.x.max(curr.rect.x);
+            let x2 = (cand.rect.x + cand.rect.width).min(curr.rect.x + curr.rect.width);
+            let h_overlap = (x2 - x1).max(0) as f32;
+            let min_w = cand.rect.width.min(curr.rect.width) as f32;
+            if min_w <= 0.0 || h_overlap < 0.3 * min_w {
+                continue;
+            }
+
+            // Ближайший по центру
+            let cand_cx = cand.rect.x as f32 + cand.rect.width as f32 / 2.0;
+            let dx = cand_cx - curr_cx;
+            let dy = cand_cy - curr_cy;
+            let dist_sq = dx * dx + dy * dy;
+
+            if let Some((_, best_dist)) = best_cand {
+                if dist_sq < best_dist {
+                    best_cand = Some((i, dist_sq));
+                }
+            } else {
+                best_cand = Some((i, dist_sq));
+            }
+        }
+
+        if let Some((cand_i, _)) = best_cand {
+            up_indices.push(cand_i);
+            curr_idx = cand_i;
+        } else {
+            break;
+        }
+    }
+
+    let mut down_indices = Vec::new();
+    curr_idx = selected_idx;
+
+    // Идём вниз (не более 6 строк)
+    for _ in 0..6 {
+        let curr = &lines[curr_idx];
+        let curr_cy = curr.rect.y as f32 + curr.rect.height as f32 / 2.0;
+        let curr_cx = curr.rect.x as f32 + curr.rect.width as f32 / 2.0;
+
+        let mut best_cand: Option<(usize, f32)> = None;
+
+        for (i, cand) in lines.iter().enumerate() {
+            if i == curr_idx
+                || i == selected_idx
+                || up_indices.contains(&i)
+                || down_indices.contains(&i)
+            {
+                continue;
+            }
+            let cand_cy = cand.rect.y as f32 + cand.rect.height as f32 / 2.0;
+            // Кандидат должен быть ниже текущей строки
+            if cand_cy <= curr_cy {
+                continue;
+            }
+
+            // Вертикальный зазор между текущей строкой и кандидатом (снизу):
+            // gap = cand.y - (curr.y + curr.height)
+            let gap = (cand.rect.y - (curr.rect.y + curr.rect.height)) as f32;
+            if gap > 0.8 * h {
+                continue;
+            }
+
+            // Горизонтальное перекрытие >= 30% ширины более узкой из двух строк
+            let x1 = cand.rect.x.max(curr.rect.x);
+            let x2 = (cand.rect.x + cand.rect.width).min(curr.rect.x + curr.rect.width);
+            let h_overlap = (x2 - x1).max(0) as f32;
+            let min_w = cand.rect.width.min(curr.rect.width) as f32;
+            if min_w <= 0.0 || h_overlap < 0.3 * min_w {
+                continue;
+            }
+
+            // Ближайший по центру
+            let cand_cx = cand.rect.x as f32 + cand.rect.width as f32 / 2.0;
+            let dx = cand_cx - curr_cx;
+            let dy = cand_cy - curr_cy;
+            let dist_sq = dx * dx + dy * dy;
+
+            if let Some((_, best_dist)) = best_cand {
+                if dist_sq < best_dist {
+                    best_cand = Some((i, dist_sq));
+                }
+            } else {
+                best_cand = Some((i, dist_sq));
+            }
+        }
+
+        if let Some((cand_i, _)) = best_cand {
+            down_indices.push(cand_i);
+            curr_idx = cand_i;
+        } else {
+            break;
+        }
+    }
+
+    let mut all_indices = up_indices;
+    all_indices.push(selected_idx);
+    all_indices.extend(down_indices);
+    all_indices.sort_by_key(|&i| (lines[i].rect.y, lines[i].rect.x));
+    all_indices
+}
+
 /// Identifies the word or sentence under the cursor given recognized OCR blocks.
 pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<TextUnderCursor> {
     if blocks.is_empty() {
+        return None;
+    }
+
+    let all_lines: Vec<RecognizedLine> = blocks.iter().flat_map(|b| b.lines.clone()).collect();
+    if all_lines.is_empty() {
         return None;
     }
 
@@ -146,66 +299,83 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         ((dx * dx + dy * dy) as f64).sqrt().round() as i64
     };
 
-    const MAX_DISTANCE: i64 = 40;
+    // Максимальный радиус поиска текста вокруг курсора (в пикселях).
+    const MAX_DISTANCE: i64 = 12;
 
-    let mut best_word_match: Option<(&RecognizedWord, &RecognizedLine, i64)> = None;
-    let mut best_line_match: Option<(&RecognizedLine, i64)> = None;
+    let candidate_score = |r: &ScreenRect| -> (i64, i64, i64) {
+        let d = dist_to_rect(r, px, py);
+        let dy_center = (2 * r.y as i64 + r.height as i64 - 2 * py as i64).abs();
+        let dx_center = (2 * r.x as i64 + r.width as i64 - 2 * px as i64).abs();
+        (d, dy_center, dx_center)
+    };
 
-    for block in blocks {
-        for line in &block.lines {
-            let l_dist = dist_to_rect(&line.rect, px, py);
-            if l_dist <= MAX_DISTANCE {
-                if let Some((_, best_d)) = best_line_match {
-                    if l_dist < best_d {
-                        best_line_match = Some((line, l_dist));
-                    }
-                } else {
-                    best_line_match = Some((line, l_dist));
+    let mut best_line_match: Option<(usize, (i64, i64, i64))> = None;
+
+    for (idx, line) in all_lines.iter().enumerate() {
+        let l_dist = dist_to_rect(&line.rect, px, py);
+        if l_dist <= MAX_DISTANCE {
+            let l_score = candidate_score(&line.rect);
+            if let Some((_, best_score)) = best_line_match {
+                if l_score < best_score {
+                    best_line_match = Some((idx, l_score));
                 }
-            }
-
-            for word in &line.words {
-                let w_dist = dist_to_rect(&word.rect, px, py);
-                if w_dist <= MAX_DISTANCE {
-                    if let Some((_, _, best_d)) = best_word_match {
-                        if w_dist < best_d {
-                            best_word_match = Some((word, line, w_dist));
-                        }
-                    } else {
-                        best_word_match = Some((word, line, w_dist));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some((word, line, _)) = best_word_match {
-        let w_text = word.text.trim();
-        let s_text = line.text.trim();
-        Some(TextUnderCursor {
-            word_text: if !w_text.is_empty() {
-                Some(w_text.to_string())
             } else {
-                None
-            },
-            word_rect: Some(word.rect),
-            sentence_text: s_text.to_string(),
-            sentence_rect: line.rect,
-        })
-    } else if let Some((line, _)) = best_line_match {
-        let s_text = line.text.trim();
-        if s_text.is_empty() {
-            return None;
+                best_line_match = Some((idx, l_score));
+            }
         }
-        Some(TextUnderCursor {
-            word_text: None,
-            word_rect: None,
-            sentence_text: s_text.to_string(),
-            sentence_rect: line.rect,
-        })
-    } else {
-        None
     }
+
+    let (best_idx, _) = best_line_match?;
+    let line = &all_lines[best_idx];
+
+    let mut best_word_match: Option<(&RecognizedWord, (i64, i64, i64))> = None;
+    for word in &line.words {
+        let w_dist = dist_to_rect(&word.rect, px, py);
+        if w_dist <= MAX_DISTANCE {
+            let w_score = candidate_score(&word.rect);
+            if let Some((_, best_score)) = best_word_match {
+                if w_score < best_score {
+                    best_word_match = Some((word, w_score));
+                }
+            } else {
+                best_word_match = Some((word, w_score));
+            }
+        }
+    }
+
+    let context_indices = collect_context_lines(&all_lines, best_idx);
+    let s_text = context_indices
+        .iter()
+        .map(|&i| all_lines[i].text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if s_text.is_empty() {
+        return None;
+    }
+
+    let s_rect = context_indices
+        .iter()
+        .fold(line.rect, |acc, &i| acc.union(&all_lines[i].rect));
+
+    let (w_text_opt, w_rect_opt) = if let Some((word, _)) = best_word_match {
+        let w_text = word.text.trim();
+        if !w_text.is_empty() {
+            (Some(w_text.to_string()), Some(word.rect))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    Some(TextUnderCursor {
+        word_text: w_text_opt,
+        word_rect: w_rect_opt,
+        sentence_text: s_text,
+        sentence_rect: s_rect,
+    })
 }
 
 /// Status of the application
@@ -998,6 +1168,136 @@ mod tests {
         // Extreme multi-monitor coordinates (|dx| > 46341) must not overflow i32 or panic
         let target_overflow = find_text_under_cursor(&blocks, 60000, 60000);
         assert!(target_overflow.is_none());
+    }
+
+    #[test]
+    fn test_find_text_under_cursor_selection_rules() {
+        // Case 1: две строки с перекрывающимися рамками и курсор в верхней части — выбирается верхняя;
+        // в нижней части — выбирается нижняя.
+        let block_overlap = OcrBlock {
+            text: "Top line\nBottom line".to_string(),
+            rect: ScreenRect::new(100, 100, 200, 50),
+            lines: vec![
+                RecognizedLine {
+                    text: "Top line".to_string(),
+                    rect: ScreenRect::new(100, 100, 200, 30), // Y: 100..130, center Y = 115
+                    words: vec![
+                        RecognizedWord {
+                            text: "Top".to_string(),
+                            rect: ScreenRect::new(100, 100, 90, 30),
+                        },
+                        RecognizedWord {
+                            text: "line".to_string(),
+                            rect: ScreenRect::new(200, 100, 100, 30),
+                        },
+                    ],
+                },
+                RecognizedLine {
+                    text: "Bottom line".to_string(),
+                    rect: ScreenRect::new(100, 120, 200, 30), // Y: 120..150, center Y = 135
+                    words: vec![
+                        RecognizedWord {
+                            text: "Bottom".to_string(),
+                            rect: ScreenRect::new(100, 120, 90, 30),
+                        },
+                        RecognizedWord {
+                            text: "line".to_string(),
+                            rect: ScreenRect::new(200, 120, 100, 30),
+                        },
+                    ],
+                },
+            ],
+        };
+        // Курсор в области перекрытия строк (120..130), в верхней части (Y = 122).
+        // Расстояние до обеих строк = 0. До центра верхней: |115 - 122| = 7. До центра нижней: |135 - 122| = 13.
+        let target_top = find_text_under_cursor(&[block_overlap.clone()], 120, 122)
+            .expect("Top line must be selected");
+        assert_eq!(target_top.word_text.as_deref(), Some("Top"));
+        assert_eq!(target_top.sentence_text, "Top line Bottom line");
+
+        // Курсор в области перекрытия, но в нижней части (Y = 128).
+        // До центра верхней: 13. До центра нижней: 7.
+        let target_bottom = find_text_under_cursor(&[block_overlap], 120, 128)
+            .expect("Bottom line must be selected");
+        assert_eq!(target_bottom.word_text.as_deref(), Some("Bottom"));
+        assert_eq!(target_bottom.sentence_text, "Top line Bottom line");
+
+        let single_word_block = OcrBlock {
+            text: "Target".to_string(),
+            rect: ScreenRect::new(100, 100, 100, 30),
+            lines: vec![RecognizedLine {
+                text: "Target".to_string(),
+                rect: ScreenRect::new(100, 100, 100, 30),
+                words: vec![RecognizedWord {
+                    text: "Target".to_string(),
+                    rect: ScreenRect::new(100, 100, 100, 30),
+                }],
+            }],
+        };
+
+        // Case 2: курсор в 8 px от слова — выбирается это слово
+        let target_8px = find_text_under_cursor(&[single_word_block.clone()], 100, 92)
+            .expect("Word must be selected within 8px");
+        assert_eq!(target_8px.word_text.as_deref(), Some("Target"));
+
+        // Case 3: курсор в 30 px от всего — None
+        let target_30px = find_text_under_cursor(&[single_word_block.clone()], 100, 70);
+        assert!(target_30px.is_none(), "Cursor at 30px must return None");
+
+        // Case 4: курсор внутри рамки слова — выбирается оно
+        let target_inside = find_text_under_cursor(&[single_word_block], 120, 115)
+            .expect("Word must be selected when cursor is inside");
+        assert_eq!(target_inside.word_text.as_deref(), Some("Target"));
+    }
+
+    #[test]
+    fn test_collect_context_lines() {
+        let h = 20;
+        // 1. Три строки друг под другом (зазор между ними 5px <= 0.8 * 20 = 16)
+        let line0 = RecognizedLine {
+            text: "Line 1".to_string(),
+            rect: ScreenRect::new(100, 100, 200, h),
+            words: Vec::new(),
+        };
+        let line1 = RecognizedLine {
+            text: "Line 2".to_string(),
+            rect: ScreenRect::new(100, 125, 200, h),
+            words: Vec::new(),
+        };
+        let line2 = RecognizedLine {
+            text: "Line 3".to_string(),
+            rect: ScreenRect::new(100, 150, 200, h),
+            words: Vec::new(),
+        };
+
+        let lines_three = vec![line0.clone(), line1.clone(), line2.clone()];
+        // Выбираем среднюю строку (index 1)
+        let collected = collect_context_lines(&lines_three, 1);
+        assert_eq!(collected, vec![0, 1, 2]);
+
+        // 2. Строка далеко справа (не входит)
+        let line_far_right = RecognizedLine {
+            text: "Far Right".to_string(),
+            rect: ScreenRect::new(800, 125, 200, h),
+            words: Vec::new(),
+        };
+        let lines_with_right = vec![line0.clone(), line1.clone(), line_far_right];
+        let collected_right = collect_context_lines(&lines_with_right, 1);
+        assert_eq!(collected_right, vec![0, 1]); // line_far_right не вошла
+
+        // 3. Строка ниже с зазором 3 * h (не входит)
+        let line_far_below = RecognizedLine {
+            text: "Far Below".to_string(),
+            rect: ScreenRect::new(100, 100 + h + 3 * h, 200, h), // gap = 3 * h = 60 > 16
+            words: Vec::new(),
+        };
+        let lines_with_gap = vec![line0.clone(), line_far_below];
+        let collected_gap = collect_context_lines(&lines_with_gap, 0);
+        assert_eq!(collected_gap, vec![0]); // line_far_below не вошла
+
+        // 4. Выбранная строка одна (возвращается она сама)
+        let collected_single = collect_context_lines(&[line0], 0);
+        assert_eq!(collected_single, vec![0]);
     }
 
     #[test]

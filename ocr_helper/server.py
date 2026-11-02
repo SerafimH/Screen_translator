@@ -30,6 +30,10 @@ except ImportError:
 SCREEN_TRANSLATOR_OCR_DEBUG_ENV = "SCREEN_TRANSLATOR_OCR_DEBUG"
 SCREEN_TRANSLATOR_OCR_VARIANTS_ENV = "SCREEN_TRANSLATOR_OCR_VARIANTS"
 
+# Пороги масштабирования малых кадров
+SMALL_FRAME_PIXELS = 1_500_000
+UPSCALE_SMALL_FRAMES = 2
+
 # Пороги фильтрации мусора
 MIN_SCORE = 0.60              # Минимальная уверенность RapidOCR (меньше -> "low_score")
 MIN_SINGLE_CHAR_SCORE = 0.85  # Повышенная уверенность для односимвольных строк (меньше -> "too_short")
@@ -331,6 +335,46 @@ def merge_ocr_lines(variant_groups):
     return merged
 
 
+def should_upscale_frame(width: int, height: int, cv2_available: bool) -> bool:
+    """Определяет, нужно ли увеличивать кадр для улучшения распознавания мелкого текста."""
+    return cv2_available and (width * height <= SMALL_FRAME_PIXELS)
+
+
+def rescale_boxes_down(
+    lines: List[Dict[str, Any]], scale_factor: float
+) -> List[Dict[str, Any]]:
+    """Пересчитывает координаты 4-точечных рамок найденных строк обратно в систему исходного кадра."""
+    if scale_factor <= 1.0 or not lines:
+        return lines
+    rescaled = []
+    for line in lines:
+        new_line = dict(line)
+        box = line.get("box")
+        if box:
+            new_line["box"] = [
+                [float(p[0]) / scale_factor, float(p[1]) / scale_factor] for p in box
+            ]
+        rescaled.append(new_line)
+    return rescaled
+
+
+def _run_ocr_with_variants(img, ocr_exec):
+    """Прогоняет OCR на изображении и двух его вариантах (инверсия и белая маска)."""
+    res_orig = ocr_exec(img)
+    lines_orig = extract_lines_from_result(res_orig)
+
+    img_inv = 255 - img
+    res_inv = ocr_exec(img_inv)
+    lines_inv = extract_lines_from_result(res_inv)
+
+    is_white = np.min(img, axis=2) >= 200
+    mask_ch = np.where(is_white, 0, 255).astype(np.uint8)
+    img_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
+    res_mask = ocr_exec(img_mask)
+    lines_mask = extract_lines_from_result(res_mask)
+    return lines_orig, lines_inv, lines_mask
+
+
 def save_ocr_debug_dump(
     img_bgr, lines_with_status: List[Dict[str, Any]], req_id: Any
 ) -> None:
@@ -464,27 +508,38 @@ def process_request(
         else:
             ocr_exec = engine
 
-        if (
+        use_upscale = should_upscale_frame(
+            width,
+            height,
+            cv2 is not None and np is not None and isinstance(img_bgr, np.ndarray),
+        )
+
+        if use_upscale:
+            up_w = width * UPSCALE_SMALL_FRAMES
+            up_h = height * UPSCALE_SMALL_FRAMES
+            img_up = cv2.resize(
+                img_bgr, (up_w, up_h), interpolation=cv2.INTER_CUBIC
+            )
+            lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
+                img_up, ocr_exec
+            )
+
+            # Пересчитываем координаты рамок обратно в систему исходного кадра ДО фильтрации и объединения
+            lines_orig = rescale_boxes_down(lines_orig, UPSCALE_SMALL_FRAMES)
+            lines_inv = rescale_boxes_down(lines_inv, UPSCALE_SMALL_FRAMES)
+            lines_mask = rescale_boxes_down(lines_mask, UPSCALE_SMALL_FRAMES)
+
+            kept_lines = merge_ocr_lines([lines_orig, lines_inv, lines_mask])
+            raw_lines = lines_orig + lines_inv + lines_mask
+            rejected_lines = []
+        elif (
             os.environ.get(SCREEN_TRANSLATOR_OCR_VARIANTS_ENV) == "1"
             and np is not None
             and isinstance(img_bgr, np.ndarray)
         ):
-            # 1. Оригинальный кадр
-            res_orig = ocr_exec(img_bgr)
-            lines_orig = extract_lines_from_result(res_orig)
-
-            # 2. Вариант «инверсия»: 255 минус значения пикселей
-            img_inv = 255 - img_bgr
-            res_inv = ocr_exec(img_inv)
-            lines_inv = extract_lines_from_result(res_inv)
-
-            # 3. Вариант «белая маска»: min(R,G,B) >= 200 -> 0 (чёрный), иначе 255 (белый)
-            is_white = np.min(img_bgr, axis=2) >= 200
-            mask_ch = np.where(is_white, 0, 255).astype(np.uint8)
-            img_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
-            res_mask = ocr_exec(img_mask)
-            lines_mask = extract_lines_from_result(res_mask)
-
+            lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
+                img_bgr, ocr_exec
+            )
             kept_lines = merge_ocr_lines([lines_orig, lines_inv, lines_mask])
             raw_lines = lines_orig + lines_inv + lines_mask
             rejected_lines = []

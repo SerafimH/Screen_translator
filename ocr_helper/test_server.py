@@ -14,15 +14,19 @@ from ocr_helper.server import (
     RAPIDOCR_LANG_MAP,
     SCREEN_TRANSLATOR_OCR_DEBUG_ENV,
     SCREEN_TRANSLATOR_OCR_VARIANTS_ENV,
+    SMALL_FRAME_PIXELS,
+    UPSCALE_SMALL_FRAMES,
     create_ocr_engine,
     extract_lines_from_result,
     filter_ocr_lines,
     merge_ocr_lines,
     process_request,
     read_exact,
+    rescale_boxes_down,
     resolve_models_dir,
     run_server,
     save_ocr_debug_dump,
+    should_upscale_frame,
 )
 
 
@@ -180,8 +184,8 @@ class TestOcrHelperProtocol(unittest.TestCase):
             self.assertTrue(os.path.isdir(models_dir))
 
     def test_engine_manager_dispatch(self):
-        eng_en = MockEngine([[[[0, 0], [10, 0], [10, 10], [0, 10]], "English", 0.99]])
-        eng_ja = MockEngine([[[[0, 0], [10, 0], [10, 10], [0, 10]], "日本語", 0.99]])
+        eng_en = MockEngine([[[[0, 0], [20, 0], [20, 20], [0, 20]], "English", 0.99]])
+        eng_ja = MockEngine([[[[0, 0], [20, 0], [20, 20], [0, 20]], "日本語", 0.99]])
         mgr = EngineManager()
         mgr.engines["en"] = eng_en
         mgr.engines["ja"] = eng_ja
@@ -394,6 +398,56 @@ class TestOcrHelperProtocol(unittest.TestCase):
             self.assertTrue(resp["ok"])
             self.assertEqual(len(resp["lines"]), 1)
             self.assertEqual(resp["lines"][0]["text"], "Variant recognized")
+
+
+    def test_should_upscale_frame(self):
+        self.assertTrue(should_upscale_frame(1000, 360, cv2_available=True))
+        self.assertTrue(should_upscale_frame(800, 600, cv2_available=True))
+        # 1920 * 1080 = 2_073_600 > 1_500_000
+        self.assertFalse(should_upscale_frame(1920, 1080, cv2_available=True))
+        # If cv2 is not available, never upscale
+        self.assertFalse(should_upscale_frame(1000, 360, cv2_available=False))
+
+    def test_rescale_boxes_down(self):
+        lines = [
+            {
+                "text": "Sample",
+                "box": [[20.0, 40.0], [100.0, 40.0], [100.0, 80.0], [20.0, 80.0]],
+                "score": 0.95,
+            }
+        ]
+        rescaled = rescale_boxes_down(lines, 2.0)
+        expected_box = [[10.0, 20.0], [50.0, 20.0], [50.0, 40.0], [10.0, 40.0]]
+        self.assertEqual(rescaled[0]["box"], expected_box)
+        self.assertEqual(rescaled[0]["text"], "Sample")
+        self.assertEqual(rescaled[0]["score"], 0.95)
+
+        # Scale factor <= 1.0 or empty lines
+        self.assertEqual(rescale_boxes_down([], 2.0), [])
+        self.assertEqual(rescale_boxes_down(lines, 1.0), lines)
+
+    def test_process_request_small_frame_upscale(self):
+        # 4x4 frame <= SMALL_FRAME_PIXELS -> should trigger upscale 2x and return rescaled box
+        received_shapes = []
+
+        class RecordingEngine:
+            def __call__(self, img_bgr):
+                if hasattr(img_bgr, "shape"):
+                    received_shapes.append(img_bgr.shape)
+                box_up = [[20.0, 20.0], [60.0, 20.0], [60.0, 40.0], [20.0, 40.0]]
+                return [{"box": box_up, "text": "Upscaled text", "score": 0.90}]
+
+        engine = RecordingEngine()
+        raw_bgr = b"\x00" * (4 * 4 * 3)
+        resp = process_request({"id": 10, "width": 4, "height": 4, "lang": "en"}, raw_bgr, engine)
+        self.assertTrue(resp["ok"])
+        self.assertEqual(len(resp["lines"]), 1)
+        # Coordinates must be divided by 2
+        expected_box = [[10.0, 10.0], [30.0, 10.0], [30.0, 20.0], [10.0, 20.0]]
+        self.assertEqual(resp["lines"][0]["box"], expected_box)
+        # Verify engine received upscaled 8x8 image (4*2, 4*2)
+        if received_shapes:
+            self.assertEqual(received_shapes[0][:2], (8, 8))
 
 
 if __name__ == "__main__":
