@@ -330,6 +330,16 @@ impl App {
                     self.state.dispatch_cursor_translation_task(pt);
                 }
 
+                AppEvent::SaveCard(card) => {
+                    let result = tokio::task::spawn_blocking(move || crate::cards::save_card(&card)).await;
+                    let status = match result {
+                        Ok(Ok(path)) => format!("Карточка добавлена: {}", path.display()),
+                        Ok(Err(e)) => format!("Не удалось сохранить карточку: {}", e),
+                        Err(e) => format!("Ошибка сохранения карточки: {}", e),
+                    };
+                    self.state.overlay.set_loading(false, Some(status));
+                }
+
                 AppEvent::ShiftReleased => {
                     if let Some(prev) = self
                         .state

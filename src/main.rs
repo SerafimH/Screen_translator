@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cards;
 pub mod capture;
 pub mod ocr;
 pub mod overlay;

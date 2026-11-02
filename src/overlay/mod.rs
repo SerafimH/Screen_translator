@@ -16,12 +16,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
     GWL_EXSTYLE, GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT,
-    LLKHF_ALTDOWN, LLKHF_UP, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    LLKHF_ALTDOWN, LLKHF_UP, LoadCursorW, MSG, MSLLHOOKSTRUCT, PostMessageW, PostQuitMessage, RegisterClassW,
     SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG, SW_SHOW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetCursor, SetForegroundWindow,
     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
-    TranslateMessage, UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_APP,
+    TranslateMessage, UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -46,6 +46,54 @@ const HTCLIENT: isize = 1;
 
 static HOOK_TX: Mutex<Option<UnboundedSender<AppEvent>>> = Mutex::new(None);
 static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+static SAVE_BUTTON: Mutex<SaveButtonState> = Mutex::new(SaveButtonState {
+    target: None,
+    pressed: None,
+});
+
+#[derive(Default)]
+struct SaveButtonState {
+    target: Option<(ScreenRect, TranslationBlock)>,
+    pressed: Option<(ScreenRect, TranslationBlock)>,
+}
+
+impl SaveButtonState {
+    fn mouse_event(&mut self, msg: u32, pt: POINT) -> (bool, Option<TranslationBlock>) {
+        if msg == WM_LBUTTONDOWN {
+            if let Some((rect, card)) = &self.target
+                && rect.contains(pt.x, pt.y)
+            {
+                self.pressed = Some((*rect, card.clone()));
+                return (true, None);
+            }
+        } else if msg == WM_LBUTTONUP
+            && let Some((rect, card)) = self.pressed.take()
+        {
+            let save = self.target.is_some() && rect.contains(pt.x, pt.y);
+            return (true, save.then_some(card));
+        }
+        (false, None)
+    }
+}
+
+unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let msg = wparam.0 as u32;
+    if code >= 0 && lparam.0 != 0 && matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP) {
+        let mouse = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        let (handled, card) = SAVE_BUTTON.lock().unwrap_or_else(|e| e.into_inner())
+            .mouse_event(msg, mouse.pt);
+        if let Some(card) = card
+            && let Some(tx) = HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            let _ = tx.send(AppEvent::SaveCard(card));
+        }
+        // The layered overlay is click-through; consume only clicks on the visible save button.
+        if handled {
+            return LRESULT(1);
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
 
 pub fn is_shift_held() -> bool {
     SHIFT_HELD.load(Ordering::SeqCst)
@@ -108,6 +156,7 @@ pub enum AppEvent {
     Clear,
     Quit,
     TranslateUnderCursor(POINT),
+    SaveCard(TranslationBlock),
     ShiftReleased,
 }
 
@@ -293,6 +342,7 @@ struct WindowThreadState {
     event_tx: UnboundedSender<AppEvent>,
     // Low-level keyboard hook handle for Shift word/sentence translation
     keyboard_hook: HHOOK,
+    mouse_hook: HHOOK,
     // Previously focused window to restore after selection mode
     previous_foreground_hwnd: HWND,
 }
@@ -473,6 +523,19 @@ impl OverlayManager {
                     }
                 };
 
+                let mouse_hook = match SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(low_level_mouse_proc),
+                    Some(hinstance.into()),
+                    0,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Failed to install flashcard mouse hook: {:?}", e);
+                        HHOOK(core::ptr::null_mut())
+                    }
+                };
+
                 let state = Box::new(WindowThreadState {
                     hwnd,
                     renderer,
@@ -487,6 +550,7 @@ impl OverlayManager {
                     shared_state: shared_for_thread,
                     event_tx,
                     keyboard_hook,
+                    mouse_hook,
                     previous_foreground_hwnd: HWND(core::ptr::null_mut()),
                 });
 
@@ -543,6 +607,7 @@ fn render_current_scene(state: &mut WindowThreadState) {
     let scene = RenderScene {
         blocks: &shared.current_blocks,
         cursor_card: shared.cursor_card.as_ref(),
+        save_button_enabled: !state.mouse_hook.is_invalid(),
         active_roi: shared.active_roi,
         auto_mode: shared.auto_mode,
         provider_name: &shared.provider_name,
@@ -553,9 +618,14 @@ fn render_current_scene(state: &mut WindowThreadState) {
         is_loading: shared.is_loading,
     };
 
-    if let Err(e) = state.renderer.render(state.hwnd, &scene) {
-        error!("Direct2D/LayeredWindow render error: {:?}", e);
-    }
+    let button = match state.renderer.render(state.hwnd, &scene) {
+        Ok(rect) => rect.zip(shared.cursor_card),
+        Err(e) => {
+            error!("Direct2D/LayeredWindow render error: {:?}", e);
+            None
+        }
+    };
+    SAVE_BUTTON.lock().unwrap_or_else(|e| e.into_inner()).target = button;
 }
 
 unsafe extern "system" fn overlay_wndproc(
@@ -716,6 +786,9 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_DESTROY => {
+            if !state.mouse_hook.is_invalid() {
+                let _ = unsafe { UnhookWindowsHookEx(state.mouse_hook) };
+            }
             if !state.keyboard_hook.is_invalid() {
                 let _ = unsafe { UnhookWindowsHookEx(state.keyboard_hook) };
             }
@@ -731,6 +804,7 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_NCDESTROY => {
+            *SAVE_BUTTON.lock().unwrap_or_else(|e| e.into_inner()) = SaveButtonState::default();
             // Clear global hook sender on window destruction
             *HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
@@ -830,6 +904,35 @@ fn exit_selection_mode(state: &mut WindowThreadState) {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    #[test]
+    fn test_save_button_consumes_only_its_click_and_keeps_the_clicked_card() {
+        let rect = ScreenRect::new(-100, 20, 28, 28);
+        let card = TranslationBlock {
+            original_text: "word (context)".to_string(),
+            translated_text: "translation".to_string(), rect,
+        };
+        let mut button = SaveButtonState { target: Some((rect, card)), pressed: None };
+        let inside = POINT { x: -90, y: 30 };
+        let outside = POINT { x: 0, y: 0 };
+        assert!(!button.mouse_event(WM_LBUTTONDOWN, outside).0);
+        assert!(!button.mouse_event(WM_LBUTTONUP, inside).0);
+        let (handled, saved) = button.mouse_event(WM_LBUTTONDOWN, inside);
+        assert!(handled && saved.is_none());
+        button.target.as_mut().unwrap().1.original_text = "new word".to_string();
+        let (handled, saved) = button.mouse_event(WM_LBUTTONUP, inside);
+        assert!(handled);
+        assert_eq!(saved.unwrap().original_text, "word (context)");
+        assert!(!button.mouse_event(WM_LBUTTONUP, inside).0);
+        assert!(button.mouse_event(WM_LBUTTONDOWN, inside).0);
+        let (handled, saved) = button.mouse_event(WM_LBUTTONUP, outside);
+        assert!(handled && saved.is_none());
+        assert!(button.mouse_event(WM_LBUTTONDOWN, inside).0);
+        button.target = None;
+        let (handled, saved) = button.mouse_event(WM_LBUTTONUP, inside);
+        assert!(handled && saved.is_none());
+        assert!(!button.mouse_event(WM_LBUTTONDOWN, inside).0);
+    }
 
     #[test]
     #[cfg(windows)]

@@ -31,6 +31,7 @@ use crate::types::{AppMode, ScreenRect, TranslationBlock};
 pub struct RenderScene<'a> {
     pub blocks: &'a [TranslationBlock],
     pub cursor_card: Option<&'a TranslationBlock>,
+    pub save_button_enabled: bool,
     pub active_roi: Option<ScreenRect>,
     pub auto_mode: bool,
     pub provider_name: &'a str,
@@ -382,7 +383,8 @@ impl OverlayRenderer {
     }
 
     /// Renders the complete scene (translation cards, HUD bar, ROI selection) and flushes to DWM.
-    pub fn render(&mut self, hwnd: HWND, scene: &RenderScene) -> Result<()> {
+    pub fn render(&mut self, hwnd: HWND, scene: &RenderScene) -> Result<Option<ScreenRect>> {
+        let mut save_button = None;
         unsafe {
             let bind_rect = RECT {
                 left: 0,
@@ -454,10 +456,14 @@ impl OverlayRenderer {
                 }
 
                 // 3. Draw Translation Blocks as floating rounded cards with DirectWrite TextLayout
-                for block in scene.blocks.iter().chain(scene.cursor_card) {
+                for (block, is_cursor_card) in scene.blocks.iter().map(|b| (b, false))
+                    .chain(scene.cursor_card.map(|b| (b, true)))
+                {
+                    let show_button = is_cursor_card && scene.save_button_enabled;
+                    let button_space = if show_button { 34.0 } else { 0.0 };
                     let pad = 8.0;
                     let min_width = 140.0;
-                    let max_layout_w = (self.width as f32 - 40.0).max(200.0);
+                    let max_layout_w = (self.width as f32 - 40.0 - button_space).max(200.0);
                     let target_layout_w = (block.rect.width as f32).max(180.0).min(max_layout_w);
                     let max_layout_h = (self.height as f32 - 40.0).max(200.0);
 
@@ -481,7 +487,7 @@ impl OverlayRenderer {
 
                     let left = (block_screen_x - pad)
                         .max(4.0)
-                        .min((self.width as f32 - card_w - 4.0).max(4.0));
+                        .min((self.width as f32 - card_w - button_space - 4.0).max(4.0));
                     let top = (block_screen_y - pad)
                         .max(4.0)
                         .min((self.height as f32 - card_h - 4.0).max(4.0));
@@ -523,6 +529,32 @@ impl OverlayRenderer {
                         &self.brush_text,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                     );
+
+                    if show_button {
+                        let button = D2D_RECT_F {
+                            left: right + 6.0,
+                            top,
+                            right: right + 34.0,
+                            bottom: top + 28.0,
+                        };
+                        let rounded = D2D1_ROUNDED_RECT { rect: button, radiusX: 5.0, radiusY: 5.0 };
+                        self.dc_rt.FillRoundedRectangle(&rounded, &self.brush_card_bg);
+                        self.dc_rt.DrawRoundedRectangle(&rounded, &self.brush_card_border, 1.2, None);
+                        let label_rect = D2D_RECT_F {
+                            left: button.left + 8.0,
+                            top: button.top + 4.0,
+                            ..button
+                        };
+                        self.dc_rt.DrawText(
+                            &['+' as u16], &self.text_format_hud, &label_rect,
+                            &self.brush_text, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        save_button = Some(ScreenRect::new(
+                            self.origin_x + button.left.floor() as i32,
+                            self.origin_y + button.top.floor() as i32,
+                            28, 28,
+                        ));
+                    }
                 }
             }
 
@@ -575,7 +607,7 @@ impl OverlayRenderer {
             }
         }
 
-        Ok(())
+        Ok(save_button)
     }
 
     fn draw_hud(&self, scene: &RenderScene<'_>) -> Result<()> {
@@ -720,5 +752,40 @@ mod tests {
         assert!(!renderer.hdc_mem.0.is_null());
         assert!(!renderer.hbitmap.0.is_null());
         drop(renderer);
+    }
+
+    #[test]
+    fn test_save_button_rendering_and_screen_bounds() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_POPUP,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(WS_EX_LAYERED, w!("STATIC"), w!("Flashcard render test"),
+                WS_POPUP, -800, -200, 800, 600, None, None, None, None).unwrap()
+        };
+        let mut renderer = OverlayRenderer::new(-800, -200, 800, 600, "Segoe UI", 16.0, 0.92).unwrap();
+        let card = TranslationBlock {
+            original_text: "word (context)".to_string(),
+            translated_text: "Word translation\nContext sentence and translation".to_string(),
+            rect: ScreenRect::new(-40, 380, 420, 30),
+        };
+        let mut scene = RenderScene {
+            blocks: &[], cursor_card: Some(&card), save_button_enabled: true,
+            active_roi: None, auto_mode: false, provider_name: "Google", ocr_engine_name: "WinRT",
+            mode: AppMode::Normal, selection_rect: None, status_msg: None, is_loading: false,
+        };
+        let button = renderer.render(hwnd, &scene).unwrap().expect("Cursor card must have a save button");
+        assert_eq!((button.width, button.height), (28, 28));
+        assert!(button.x >= -800 && button.x + button.width <= 0);
+        assert!(button.y >= -200 && button.y + button.height <= 400);
+        scene.save_button_enabled = false;
+        assert!(renderer.render(hwnd, &scene).unwrap().is_none());
+        scene.save_button_enabled = true;
+        scene.mode = AppMode::SelectingRoi;
+        assert!(renderer.render(hwnd, &scene).unwrap().is_none());
+        scene.mode = AppMode::Normal;
+        scene.cursor_card = None;
+        assert!(renderer.render(hwnd, &scene).unwrap().is_none());
+        unsafe { DestroyWindow(hwnd).unwrap(); }
     }
 }

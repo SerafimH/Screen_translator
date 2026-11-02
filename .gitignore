@@ -33,3 +33,4 @@ ocr_helper/models/
 __pycache__/
 *.pyc
 .pytest_cache/
+cards.txt
