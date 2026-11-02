@@ -1,0 +1,1494 @@
+import copy
+import dataclasses
+import os
+import pathlib
+import string
+import sys
+import types
+import warnings
+from enum import Enum
+from textwrap import dedent
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    get_type_hints,
+)
+
+import yaml
+
+from . import _key_path
+from ._missing import (
+    _EscapedMissing,
+    _has_missing_spelling,
+)
+from .errors import (
+    ConfigIndexError,
+    ConfigTypeError,
+    ConfigValueError,
+    GrammarParseError,
+    OmegaConfBaseException,
+    ValidationError,
+)
+from .grammar_parser import SIMPLE_INTERPOLATION_PATTERN, parse
+
+_ESCAPABLE = _key_path._ESCAPABLE
+split_key = _key_path.split_key
+
+try:
+    import attr
+
+except ImportError:  # pragma: no cover
+    attr = None  # type: ignore # pragma: no cover
+
+try:
+    from yaml import CDumper
+
+    BaseDumper = CDumper
+except ImportError:  # pragma: no cover
+    BaseDumper = yaml.Dumper
+
+if TYPE_CHECKING:
+    import attr
+    from attr import Attribute as AttrAttribute
+
+    from .basecontainer import BaseContainer
+
+
+NoneType: type[None] = type(None)
+
+# (module, qualname) pairs for dict types that are treated as primitive dicts,
+# enabling whitelisting of other dict types without pulling in extra dependencies.
+_PRIMITIVE_DICT_TYPES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("builtins", "dict"),
+        ("collections", "OrderedDict"),
+    }
+)
+
+BUILTIN_VALUE_TYPES: tuple[type[Any], ...] = (
+    int,
+    float,
+    bool,
+    str,
+    bytes,
+    NoneType,
+)
+
+# source: https://yaml.org/type/bool.html
+YAML_BOOL_TYPES = [
+    "y",
+    "Y",
+    "yes",
+    "Yes",
+    "YES",
+    "n",
+    "N",
+    "no",
+    "No",
+    "NO",
+    "true",
+    "True",
+    "TRUE",
+    "false",
+    "False",
+    "FALSE",
+    "on",
+    "On",
+    "ON",
+    "off",
+    "Off",
+    "OFF",
+]
+
+
+class Marker:
+    def __init__(self, desc: str):
+        self.desc = desc
+
+    def __repr__(self) -> str:
+        return self.desc
+
+
+# To be used as default value when `None` is not an option.
+_DEFAULT_MARKER_: Any = Marker("_DEFAULT_MARKER_")
+
+
+class OmegaConfDumper(BaseDumper):  # type: ignore
+    str_representer_added = False
+    pathlib_representers_added = False
+    tuple_representer_added = False
+
+    @staticmethod
+    def str_representer(dumper: yaml.Dumper, data: str) -> yaml.ScalarNode:
+        with_quotes = yaml_is_bool(data) or is_int(data) or is_float(data)
+        return dumper.represent_scalar(
+            yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG,
+            data,
+            style=("'" if with_quotes else None),
+        )
+
+    @staticmethod
+    def pathlib_path_representer(dumper: yaml.Dumper, data: Any) -> yaml.Node:
+        # Use old pathlib.Path tag for cross-version compatibility
+        # Extract constructor args from __reduce__ and use sequence representation
+        return dumper.represent_sequence(  # pragma: no cover
+            "tag:yaml.org,2002:python/object/apply:pathlib.Path",
+            [str(data)],
+        )
+
+    @staticmethod
+    def pathlib_posix_path_representer(dumper: yaml.Dumper, data: Any) -> yaml.Node:
+        # Use old pathlib.PosixPath tag for cross-version compatibility
+        return dumper.represent_sequence(
+            "tag:yaml.org,2002:python/object/apply:pathlib.PosixPath",
+            [str(data)],
+        )
+
+    @staticmethod
+    def pathlib_windows_path_representer(dumper: yaml.Dumper, data: Any) -> yaml.Node:
+        # Use old pathlib.WindowsPath tag for cross-version compatibility
+        return dumper.represent_sequence(  # pragma: no cover
+            "tag:yaml.org,2002:python/object/apply:pathlib.WindowsPath",
+            [str(data)],
+        )
+
+    @staticmethod
+    def tuple_representer(dumper: yaml.Dumper, data: Any) -> yaml.Node:
+        return dumper.represent_sequence(
+            yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG, data
+        )
+
+
+def get_omega_conf_dumper() -> type[OmegaConfDumper]:
+    if not OmegaConfDumper.str_representer_added:
+        OmegaConfDumper.add_representer(str, OmegaConfDumper.str_representer)
+        OmegaConfDumper.str_representer_added = True
+
+    # Add representers for pathlib types to ensure cross-version compatibility.
+    # Python 3.13+ uses pathlib._local.* internally, so we normalize to old pathlib.* tags
+    if not OmegaConfDumper.pathlib_representers_added:
+        from pathlib import Path, PosixPath, WindowsPath
+
+        OmegaConfDumper.add_representer(Path, OmegaConfDumper.pathlib_path_representer)
+        OmegaConfDumper.add_representer(
+            PosixPath, OmegaConfDumper.pathlib_posix_path_representer
+        )
+        OmegaConfDumper.add_representer(
+            WindowsPath, OmegaConfDumper.pathlib_windows_path_representer
+        )
+        OmegaConfDumper.pathlib_representers_added = True
+
+    if not OmegaConfDumper.tuple_representer_added:
+        OmegaConfDumper.add_representer(tuple, OmegaConfDumper.tuple_representer)
+        OmegaConfDumper.tuple_representer_added = True
+
+    return OmegaConfDumper
+
+
+def yaml_is_bool(b: str) -> bool:
+    return b in YAML_BOOL_TYPES
+
+
+def _get_class(module_path: str, class_name: str) -> type:
+    from importlib import import_module
+
+    if not module_path or not class_name:
+        raise ValueError(
+            f"Invalid module/class specification: {module_path!r}, {class_name!r}"
+        )
+
+    obj: Any = import_module(module_path)
+    for attr_name in class_name.split("."):
+        try:
+            obj = getattr(obj, attr_name)
+        except AttributeError:
+            raise ImportError(f"Class {attr_name} is not in module {module_path}")
+
+    assert isinstance(obj, type)
+    return obj
+
+
+def is_union_annotation(type_: Any) -> bool:
+    if isinstance(type_, types.UnionType):
+        return True
+    return getattr(type_, "__origin__", None) is Union
+
+
+def _resolve_type_alias(type_: Any) -> Any:
+    if sys.version_info >= (3, 12):  # pragma: no cover
+        import typing  # lgtm [py/import-and-import-from]
+
+        seen = set()
+        while id(type_) not in seen:
+            seen.add(id(type_))
+            if isinstance(type_, typing.TypeAliasType):
+                bare_alias = True
+                origin = type_
+                arguments: tuple[Any, ...] = ()
+            else:
+                bare_alias = False
+                origin = typing.get_origin(type_)
+                if not isinstance(origin, typing.TypeAliasType):
+                    break
+                arguments = typing.get_args(type_)
+
+            parameters = origin.__type_params__
+            variadic = [
+                parameter
+                for parameter in parameters
+                if isinstance(parameter, typing.TypeVarTuple)
+            ]
+            if len(variadic) > 1:
+                break
+
+            if bare_alias:
+                substitutions = {}
+            elif variadic:
+                variadic_index = parameters.index(variadic[0])
+                trailing = len(parameters) - variadic_index - 1
+                if len(arguments) < len(parameters) - 1:
+                    break
+                substitutions = dict(zip(parameters[:variadic_index], arguments))
+                substitutions[variadic[0]] = arguments[
+                    variadic_index : len(arguments) - trailing if trailing else None
+                ]
+                if trailing:
+                    substitutions.update(
+                        zip(parameters[-trailing:], arguments[-trailing:])
+                    )
+            else:
+                if len(arguments) > len(parameters):
+                    break
+                substitutions = dict(zip(parameters, arguments))
+
+            def substitution_args(value: Any) -> tuple[Any, ...]:
+                result = []
+                for parameter in getattr(value, "__parameters__", ()):
+                    argument = substitutions[parameter]
+                    if isinstance(parameter, typing.TypeVarTuple):
+                        result.extend(argument)
+                    else:
+                        result.append(argument)
+                return tuple(result)
+
+            no_default = getattr(typing, "NoDefault", None)
+            for parameter in parameters:
+                if parameter in substitutions:
+                    continue
+                default: Any = getattr(parameter, "__default__", no_default)
+                if default is no_default:
+                    break
+
+                for known_parameter, argument in substitutions.items():
+                    if default is known_parameter:
+                        default = argument
+                        break
+                else:
+                    default_parameters = getattr(default, "__parameters__", ())
+                    if default_parameters:
+                        try:
+                            default_arguments = substitution_args(default)
+                        except KeyError:
+                            break
+                        default = default[default_arguments]
+                if isinstance(parameter, typing.TypeVarTuple):
+                    default_args = typing.get_args(default)
+                    if typing.get_origin(default) is typing.Unpack and default_args:
+                        default = typing.get_args(default_args[0])
+                substitutions[parameter] = default
+            else:
+                value = origin.__value__
+                for parameter, argument in substitutions.items():
+                    if value is parameter:
+                        value = argument
+                        break
+                else:
+                    value_parameters = getattr(value, "__parameters__", ())
+                    if value_parameters:
+                        try:
+                            value_arguments = substitution_args(value)
+                        except KeyError:
+                            break
+                        value = value[value_arguments]
+                type_ = value
+                continue
+            break
+    return type_
+
+
+def _resolve_optional(type_: Any) -> tuple[bool, Any]:
+    """Normalize aliases and check whether `type_` accepts None."""
+    type_ = _resolve_type_alias(type_)
+    if is_union_annotation(type_):
+        optional = False
+        args = []
+        for arg in type_.__args__:
+            arg_optional, arg_type = _resolve_optional(arg)
+            if arg_type is Any:
+                return True, Any
+            optional = optional or arg_optional
+            if arg_type is NoneType:
+                continue
+            args.append(arg_type)
+
+        if len(args) == 1:
+            return optional, args[0]
+        elif len(args) >= 2:
+            return optional, Union[tuple(args)]  # pyrefly: ignore[not-a-type]
+        else:
+            # Only distinct PEP 695 aliases that all resolve to None can reach this.
+            return True, NoneType  # pragma: no cover
+
+    if type_ is Any:
+        return True, Any
+
+    if type_ in (None, NoneType):
+        return True, NoneType
+
+    return False, type_
+
+
+def _is_optional(obj: Any, key: int | str | None = None) -> bool:
+    """Check `obj` metadata to see if the given node is optional."""
+    from .base import Container, Node
+
+    if key is not None:
+        assert isinstance(obj, Container)
+        obj = obj._get_node(key)
+    assert isinstance(obj, Node)
+    return obj._is_optional()
+
+
+def _resolve_forward(
+    type_: type[Any],
+    module: str,
+    preserve_container_origin: bool = False,
+    type_alias_guard: set[int] | None = None,
+) -> type[Any]:
+    import typing  # lgtm [py/import-and-import-from]
+
+    if sys.version_info >= (3, 12):  # pragma: no cover
+        type_alias = (
+            type_
+            if isinstance(type_, typing.TypeAliasType)
+            else typing.get_origin(type_)
+        )
+        if isinstance(type_alias, typing.TypeAliasType):
+            if type_alias_guard is None:
+                type_alias_guard = set()
+            if id(type_alias) in type_alias_guard:
+                raise ValidationError(
+                    f"Recursive type alias '{type_alias.__name__}' is not supported"
+                )
+            type_alias_guard = type_alias_guard | {id(type_alias)}
+
+    type_ = _resolve_type_alias(type_)
+    forward = typing.ForwardRef if hasattr(typing, "ForwardRef") else typing._ForwardRef  # type: ignore
+    if type(type_) is forward:
+        return _get_class(module, type_.__forward_arg__)
+    elif isinstance(type_, str):
+        return _get_class(module, type_)
+    elif is_union_annotation(type_):
+        is_optional, type_ = _resolve_optional(type_)
+        if type_ is Any:
+            return Any
+        if is_union_annotation(type_):
+            args = tuple(
+                _resolve_forward(
+                    arg,
+                    module=module,
+                    preserve_container_origin=True,
+                    type_alias_guard=type_alias_guard,
+                )
+                for arg in type_.__args__
+            )
+            type_ = Union[args]  # pyrefly: ignore[not-a-type]
+        else:
+            type_ = _resolve_forward(
+                type_,
+                module=module,
+                preserve_container_origin=True,
+                type_alias_guard=type_alias_guard,
+            )
+        return Optional[type_] if is_optional else type_
+    else:
+        if is_dict_annotation(type_):
+            if preserve_container_origin and (
+                type_ in (dict, Dict) or getattr(type_, "__origin__", None) is None
+            ):
+                return type_
+            kt, vt = get_dict_key_value_types(type_)
+            if kt is not None:
+                kt = _resolve_forward(
+                    kt,
+                    module=module,
+                    preserve_container_origin=preserve_container_origin,
+                    type_alias_guard=type_alias_guard,
+                )
+            if vt is not None:
+                vt = _resolve_forward(
+                    vt,
+                    module=module,
+                    preserve_container_origin=preserve_container_origin,
+                    type_alias_guard=type_alias_guard,
+                )
+            if preserve_container_origin and isinstance(type_, types.GenericAlias):
+                return dict[kt, vt]  # type: ignore
+            return Dict[kt, vt]  # type: ignore
+        if is_list_annotation(type_):
+            if preserve_container_origin and type_ in (list, List):
+                return type_
+            et = get_list_element_type(type_)
+            if et is not None:
+                et = _resolve_forward(
+                    et,
+                    module=module,
+                    preserve_container_origin=preserve_container_origin,
+                    type_alias_guard=type_alias_guard,
+                )
+            if preserve_container_origin and isinstance(type_, types.GenericAlias):
+                return list[et]  # type: ignore
+            return List[et]  # type: ignore
+        if is_tuple_annotation(type_):
+            if preserve_container_origin and type_ in (tuple, Tuple):
+                return type_
+            its = get_tuple_item_types(type_)
+            its = tuple(
+                _resolve_forward(
+                    it,
+                    module=module,
+                    preserve_container_origin=preserve_container_origin,
+                    type_alias_guard=type_alias_guard,
+                )
+                for it in its
+            )
+            if preserve_container_origin and isinstance(type_, types.GenericAlias):
+                return tuple[its]  # type: ignore
+            return Tuple[its]  # type: ignore
+
+        return type_
+
+
+def extract_dict_subclass_data(obj: Any, parent: Any) -> dict[str, Any] | None:
+    """Check if obj is an instance of a subclass of Dict. If so, extract the Dict keys/values."""
+    from omegaconf.omegaconf import _maybe_wrap
+
+    is_type = isinstance(obj, type)
+    obj_type = obj if is_type else type(obj)
+    subclasses_dict = is_dict_subclass(obj_type)
+
+    if subclasses_dict:
+        warnings.warn(
+            f"Class `{obj_type.__name__}` subclasses `Dict`."
+            + " Subclassing `Dict` in Structured Config classes is deprecated,"
+            + " see github.com/hydra-ecosystem/omegaconf/issues/663",
+            UserWarning,
+            stacklevel=9,
+        )
+
+    if is_type:
+        return None
+    elif subclasses_dict:
+        dict_subclass_data = {}
+        key_type, element_type = get_dict_key_value_types(obj_type)
+        for name, value in obj.items():
+            is_optional, type_ = _resolve_optional(element_type)
+            type_ = _resolve_forward(type_, obj.__module__)
+            try:
+                dict_subclass_data[name] = _maybe_wrap(
+                    ref_type=type_,
+                    is_optional=is_optional,
+                    key=name,
+                    value=value,
+                    parent=parent,
+                )
+            except ValidationError as ex:
+                format_and_raise(
+                    node=None, key=name, value=value, cause=ex, msg=str(ex)
+                )
+        return dict_subclass_data
+    else:
+        return None
+
+
+def get_attr_class_fields(obj: Any) -> list["AttrAttribute[Any]"]:
+    assert attr is not None  # help type-checkers
+    is_type = isinstance(obj, type)
+    obj_type = obj if is_type else type(obj)
+    fields = attr.fields_dict(obj_type).values()
+    return [f for f in fields if f.metadata.get("omegaconf_ignore") is not True]
+
+
+def get_attr_data(
+    obj: Any,
+    allow_objects: bool | None = None,
+    parent: "BaseContainer | None" = None,
+) -> dict[str, Any]:
+    from omegaconf.base import Node
+    from omegaconf.omegaconf import OmegaConf, _maybe_wrap
+
+    flags = {"allow_objects": allow_objects} if allow_objects is not None else {}
+
+    from omegaconf import MISSING
+
+    d = {}
+    is_type = isinstance(obj, type)
+    obj_type = obj if is_type else type(obj)
+    dummy_parent = OmegaConf.create({}, flags=flags)
+    dummy_parent._metadata.object_type = obj_type
+    if parent is not None:
+        dummy_parent._set_key(parent._key())
+        dummy_parent._set_parent(parent._get_parent())
+    resolved_hints = get_type_hints(obj_type)
+
+    for attrib in get_attr_class_fields(obj):
+        assert attr is not None  # help type-checkers
+        name = attrib.name
+        is_optional, type_ = _resolve_optional(resolved_hints[name])
+        type_ = _resolve_forward(type_, obj.__module__)
+        if not is_type:
+            value = getattr(obj, name)
+        else:
+            default = attrib.default
+            if default == attr.NOTHING:
+                value = MISSING
+            elif isinstance(default, attr.Factory):  # type: ignore[arg-type]
+                assert default is not None
+                if default.takes_self:
+                    e = ConfigValueError(
+                        "'takes_self' in attrs attributes is not supported\n"
+                        + f"{name}: {type_str(type_)}"
+                    )
+                    format_and_raise(
+                        node=None, key=None, value=default, cause=e, msg=str(e)
+                    )
+                value = default.factory()
+            else:
+                value = default
+        if isinstance(value, Node):
+            value = copy.deepcopy(value)
+        if is_union_annotation(type_) and not is_supported_union_annotation(type_):
+            e = ConfigValueError(
+                f"Unsupported type annotation in Union:\n{name}: {type_str(type_)}"  # noqa: E231
+            )
+            format_and_raise(node=None, key=None, value=value, cause=e, msg=str(e))
+
+        try:
+            d[name] = _maybe_wrap(
+                ref_type=type_,
+                is_optional=is_optional,
+                key=name,
+                value=value,
+                parent=dummy_parent,
+            )
+        except (ValidationError, GrammarParseError) as ex:
+            format_and_raise(
+                node=dummy_parent, key=name, value=value, cause=ex, msg=str(ex)
+            )
+        d[name]._set_parent(None)
+    dict_subclass_data = extract_dict_subclass_data(obj=obj, parent=dummy_parent)
+    if dict_subclass_data is not None:
+        d.update(dict_subclass_data)
+    return d
+
+
+def get_dataclass_fields(obj: Any) -> list["dataclasses.Field[Any]"]:
+    fields = dataclasses.fields(obj)
+    return [f for f in fields if f.metadata.get("omegaconf_ignore") is not True]
+
+
+def get_dataclass_data(
+    obj: Any,
+    allow_objects: bool | None = None,
+    parent: "BaseContainer | None" = None,
+) -> dict[str, Any]:
+    from omegaconf.base import Node
+    from omegaconf.omegaconf import MISSING, OmegaConf, _maybe_wrap
+
+    flags = {"allow_objects": allow_objects} if allow_objects is not None else {}
+    d = {}
+    is_type = isinstance(obj, type)
+    obj_type = get_type_of(obj)
+    dummy_parent = OmegaConf.create({}, flags=flags)
+    dummy_parent._metadata.object_type = obj_type
+    if parent is not None:
+        dummy_parent._set_key(parent._key())
+        dummy_parent._set_parent(parent._get_parent())
+    resolved_hints = get_type_hints(obj_type)
+    for field in get_dataclass_fields(obj):
+        name = field.name
+        is_optional, type_ = _resolve_optional(resolved_hints[field.name])
+        type_ = _resolve_forward(type_, obj.__module__)
+        has_default = field.default != dataclasses.MISSING
+        has_default_factory = field.default_factory != dataclasses.MISSING
+
+        if not is_type:
+            value = getattr(obj, name)
+        else:
+            if has_default:
+                value = field.default
+            elif has_default_factory:
+                value = field.default_factory()  # type: ignore
+            else:
+                value = MISSING
+        if isinstance(value, Node):
+            value = copy.deepcopy(value)
+
+        if is_union_annotation(type_) and not is_supported_union_annotation(type_):
+            e = ConfigValueError(
+                f"Unsupported type annotation in Union:\n{name}: {type_str(type_)}"  # noqa: E231
+            )
+            format_and_raise(node=None, key=None, value=value, cause=e, msg=str(e))
+        try:
+            d[name] = _maybe_wrap(
+                ref_type=type_,
+                is_optional=is_optional,
+                key=name,
+                value=value,
+                parent=dummy_parent,
+            )
+        except (ValidationError, GrammarParseError) as ex:
+            format_and_raise(
+                node=dummy_parent, key=name, value=value, cause=ex, msg=str(ex)
+            )
+        d[name]._set_parent(None)
+    dict_subclass_data = extract_dict_subclass_data(obj=obj, parent=dummy_parent)
+    if dict_subclass_data is not None:
+        d.update(dict_subclass_data)
+    return d
+
+
+def is_dataclass(obj: Any) -> bool:
+    from omegaconf.base import Node
+
+    if isinstance(obj, Node):
+        return False
+    is_dataclass = dataclasses.is_dataclass(obj)
+    assert isinstance(is_dataclass, bool)
+    return is_dataclass
+
+
+def is_attr_class(obj: Any) -> bool:
+    from omegaconf.base import Node
+
+    if attr is None or isinstance(obj, Node):
+        return False
+    return attr.has(obj)
+
+
+def is_structured_config(obj: Any) -> bool:
+    return is_attr_class(obj) or is_dataclass(obj)
+
+
+def is_dataclass_frozen(type_: Any) -> bool:
+    return type_.__dataclass_params__.frozen  # type: ignore
+
+
+def is_attr_frozen(type_: type) -> bool:
+    # This is very hacky and probably fragile as well.
+    # Unfortunately currently there isn't an official API in attr that can detect that.
+    # noinspection PyProtectedMember
+    return type_.__setattr__ == attr._make._frozen_setattrs  # type: ignore
+
+
+def get_type_of(class_or_object: Any) -> type[Any]:
+    type_ = class_or_object
+    if not isinstance(type_, type):
+        type_ = type(class_or_object)
+    assert isinstance(type_, type)
+    return type_
+
+
+def is_structured_config_frozen(obj: Any) -> bool:
+    type_ = get_type_of(obj)
+
+    if is_dataclass(type_):
+        return is_dataclass_frozen(type_)
+    if is_attr_class(type_):
+        return is_attr_frozen(type_)
+    return False
+
+
+def _find_attrs_init_field_alias(field: Any) -> str:
+    # New versions of attrs, after 22.2.0, have the alias explicitly defined.
+    # Previous versions implicitly strip the underscore in the init parameter.
+    if hasattr(field, "alias"):
+        assert isinstance(field.alias, str)
+        return field.alias
+    else:  # pragma: no cover
+        assert isinstance(field.name, str)
+        return field.name.lstrip("_")
+
+
+def get_structured_config_init_field_aliases(obj: Any) -> dict[str, str]:
+    fields: list["dataclasses.Field[Any]"] | list["AttrAttribute[Any]"]
+    if is_dataclass(obj):
+        fields = get_dataclass_fields(obj)
+        return {f.name: f.name for f in fields if f.init}
+    elif is_attr_class(obj):
+        fields = get_attr_class_fields(obj)
+        return {f.name: _find_attrs_init_field_alias(f) for f in fields if f.init}
+    else:
+        raise ValueError(f"Unsupported type: {type(obj).__name__}")
+
+
+def get_structured_config_data(
+    obj: Any,
+    allow_objects: bool | None = None,
+    parent: "BaseContainer | None" = None,
+) -> dict[str, Any]:
+    if is_dataclass(obj):
+        return get_dataclass_data(obj, allow_objects=allow_objects, parent=parent)
+    elif is_attr_class(obj):
+        return get_attr_data(obj, allow_objects=allow_objects, parent=parent)
+    else:
+        raise ValueError(f"Unsupported type: {type(obj).__name__}")
+
+
+class ValueKind(Enum):
+    VALUE = 0
+    MANDATORY_MISSING = 1
+    INTERPOLATION = 2
+
+
+class _TuplePlaceholder:
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+        self.value: tuple[Any, ...] | None = None
+
+
+def _convert_opaque_missing(
+    value: Any, encode: bool, memo: dict[int, Any] | None = None
+) -> Any:
+    """Export native resolver leaves as plain or YAML-encoded strings."""
+    if memo is None:
+        memo = {}
+    tuple_placeholders: list[_TuplePlaceholder] = []
+
+    def convert(item: Any) -> Any:
+        if isinstance(item, Enum):
+            return item
+        if isinstance(item, str):
+            if encode and _has_missing_spelling(item):
+                return "\\" + str(item)
+            return str(item) if isinstance(item, _EscapedMissing) else item
+
+        item_id = id(item)
+        if item_id in memo:
+            return memo[item_id]
+        if isinstance(item, list):
+            converted_list: list[Any] = []
+            memo[item_id] = converted_list
+            converted_list.extend(convert(child) for child in item)
+            return converted_list
+        if isinstance(item, tuple):
+            placeholder = _TuplePlaceholder()
+            memo[item_id] = placeholder
+            tuple_placeholders.append(placeholder)
+            placeholder.items.extend(convert(child) for child in item)
+            return placeholder
+        if isinstance(item, dict):
+            converted_dict = {}
+            memo[item_id] = converted_dict
+            converted_dict.update(
+                (
+                    str(key) if isinstance(key, _EscapedMissing) else key,
+                    convert(child),
+                )
+                for key, child in item.items()
+            )
+            return converted_dict
+        return item
+
+    processed_mutables: set[int] = set()
+
+    def resolve_tuple(placeholder: _TuplePlaceholder) -> tuple[Any, ...]:
+        if placeholder.value is None:
+            items = [
+                resolve_tuple(item) if isinstance(item, _TuplePlaceholder) else item
+                for item in placeholder.items
+            ]
+            placeholder.value = tuple(items)
+        return placeholder.value
+
+    def resolve_mutable(item: Any) -> Any:
+        if isinstance(item, _TuplePlaceholder):
+            return resolve_tuple(item)
+        item_id = id(item)
+        if item_id in processed_mutables:
+            return item
+        if isinstance(item, list):
+            processed_mutables.add(item_id)
+            for index, child in enumerate(item):
+                item[index] = resolve_mutable(child)
+        elif isinstance(item, dict):
+            processed_mutables.add(item_id)
+            entries = list(item.items())
+            item.clear()
+            for key, child in entries:
+                item[resolve_mutable(key)] = resolve_mutable(child)
+        return item
+
+    converted = convert(value)
+    if isinstance(converted, _TuplePlaceholder):
+        result = resolve_tuple(converted)
+    else:
+        result = resolve_mutable(converted)
+    for placeholder in tuple_placeholders:
+        for item in placeholder.items:
+            resolve_mutable(item)
+    return result
+
+
+def _is_missing_value(value: Any) -> bool:
+    from omegaconf import Node
+
+    if isinstance(value, Node):
+        value = value._value()
+    return _is_missing_literal(value)
+
+
+def _is_missing_literal(value: Any) -> bool:
+    # Uses literal '???' instead of the MISSING const for performance reasons.
+    return (
+        isinstance(value, str)
+        and not isinstance(value, _EscapedMissing)
+        and value == "???"
+    )
+
+
+def _is_none(
+    value: Any, resolve: bool = False, throw_on_resolution_failure: bool = True
+) -> bool:
+    from omegaconf import Node
+
+    if not isinstance(value, Node):
+        return value is None
+
+    if resolve:
+        value = value._maybe_dereference_node(
+            throw_on_resolution_failure=throw_on_resolution_failure
+        )
+        if not throw_on_resolution_failure and value is None:
+            # Resolution failure: consider that it is *not* None.
+            return False
+        assert isinstance(value, Node)
+
+    return value._is_none()
+
+
+def get_value_kind(
+    value: Any, strict_interpolation_validation: bool = False
+) -> ValueKind:
+    """
+    Determine the kind of a value
+    Examples:
+    VALUE: "10", "20", True
+    MANDATORY_MISSING: "???"
+    INTERPOLATION: "${foo.bar}", "${foo.${bar}}", "${foo:bar}", "[${foo}, ${bar}]",
+                   "ftp://${host}/path", "${foo:${bar}, [true], {'baz': ${baz}}}"
+
+    :param value: Input to classify.
+    :param strict_interpolation_validation: If `True`, then when `value` is a string
+        containing "${", it is parsed to validate the interpolation syntax. If `False`,
+        this parsing step is skipped: this is more efficient, but will not detect errors.
+    """
+
+    if _is_missing_value(value):
+        return ValueKind.MANDATORY_MISSING
+
+    if _is_interpolation(value, strict_interpolation_validation):
+        return ValueKind.INTERPOLATION
+
+    return ValueKind.VALUE
+
+
+def _is_interpolation(v: Any, strict_interpolation_validation: bool = False) -> bool:
+    from omegaconf import Node
+
+    if isinstance(v, Node):
+        v = v._value()
+
+    if isinstance(v, str) and _is_interpolation_string(
+        v, strict_interpolation_validation
+    ):
+        return True
+    return False
+
+
+def _is_interpolation_string(value: str, strict_interpolation_validation: bool) -> bool:
+    # We identify potential interpolations by the presence of "${" in the string.
+    # Note that escaped interpolations (ex: "esc: \${bar}") are identified as
+    # interpolations: this is intended, since they must be processed as interpolations
+    # for the string to be properly un-escaped.
+    # Keep in mind that invalid interpolations will only be detected when
+    # `strict_interpolation_validation` is True.
+    if "${" in value:
+        if strict_interpolation_validation:
+            # First try the cheap regex matching that detects common interpolations.
+            if SIMPLE_INTERPOLATION_PATTERN.match(value) is None:
+                # If no match, do the more expensive grammar parsing to detect errors.
+                parse(value)
+        return True
+    return False
+
+
+def _is_special(value: Any) -> bool:
+    """Special values are None, MISSING, and interpolation."""
+    return _is_none(value) or get_value_kind(value) in (
+        ValueKind.MANDATORY_MISSING,
+        ValueKind.INTERPOLATION,
+    )
+
+
+def is_float(st: str) -> bool:
+    try:
+        float(st)
+        return True
+    except ValueError:
+        return False
+
+
+def is_int(st: str) -> bool:
+    try:
+        int(st)
+        return True
+    except ValueError:
+        return False
+
+
+def is_primitive_list(obj: Any) -> bool:
+    return isinstance(obj, (list, tuple))
+
+
+def is_primitive_dict(obj: Any) -> bool:
+    t = get_type_of(obj)
+    return (t.__module__, t.__qualname__) in _PRIMITIVE_DICT_TYPES
+
+
+def is_dict_annotation(type_: Any) -> bool:
+    if type_ in (dict, Dict):
+        return True
+    origin = getattr(type_, "__origin__", None)
+    # type_dict is a bit hard to detect.
+    # this support is tentative, if it eventually causes issues in other areas it may be dropped.
+    typed_dict = hasattr(type_, "__base__") and type_.__base__ == dict
+    return origin is dict or typed_dict
+
+
+def is_list_annotation(type_: Any) -> bool:
+    if type_ in (list, List):
+        return True
+    origin = getattr(type_, "__origin__", None)
+    return origin is list
+
+
+def is_tuple_annotation(type_: Any) -> bool:
+    if type_ in (tuple, Tuple):
+        return True
+    origin = getattr(type_, "__origin__", None)
+    return origin is tuple
+
+
+def is_supported_union_annotation(obj: Any) -> bool:
+    """Supported value annotations can be used as members of Unions."""
+    obj = _resolve_type_alias(obj)
+    if not is_union_annotation(obj):
+        return False
+    _, obj = _resolve_optional(obj)
+    if obj is Any:
+        return True
+    args = obj.__args__ if is_union_annotation(obj) else (obj,)
+    return all(
+        is_primitive_type_annotation(arg)
+        or is_literal_annotation(arg)
+        or is_structured_config(arg)
+        or is_container_annotation(arg)
+        for arg in args
+    )
+
+
+def select_structured_config_union_member(
+    value: Any, candidates: list[Any]
+) -> Any | None:
+    from omegaconf.dictconfig import DictConfig
+
+    if isinstance(value, DictConfig):
+        value_type = value._metadata.object_type
+    elif is_structured_config(value):
+        value_type = get_type_of(value)
+    else:
+        return None
+
+    if not is_structured_config(value_type):
+        return None
+
+    candidate_set = set(candidates)
+    return next(
+        (base for base in value_type.__mro__ if base in candidate_set),
+        None,
+    )
+
+
+def is_literal_annotation(type_: Any) -> bool:
+    origin = getattr(type_, "__origin__", None)
+    return origin is Literal
+
+
+def type_hint_contains_none_literal(type_: Any) -> bool:
+    if is_literal_annotation(type_):
+        return any(arg is None for arg in type_.__args__)
+    return is_union_annotation(type_) and any(
+        type_hint_contains_none_literal(arg) for arg in type_.__args__
+    )
+
+
+def is_dict_subclass(type_: Any) -> bool:
+    return type_ is not None and isinstance(type_, type) and issubclass(type_, Dict)
+
+
+def is_dict(obj: Any) -> bool:
+    return is_primitive_dict(obj) or is_dict_annotation(obj) or is_dict_subclass(obj)
+
+
+def is_primitive_container(obj: Any) -> bool:
+    return is_primitive_list(obj) or is_primitive_dict(obj)
+
+
+def get_list_element_type(ref_type: type[Any] | None) -> Any:
+    args = getattr(ref_type, "__args__", None)
+    if ref_type is not List and args is not None:
+        element_type = args[0]
+        if element_type is None:
+            element_type = NoneType
+    else:
+        element_type = Any
+    return element_type
+
+
+def get_tuple_item_types(ref_type: type[Any]) -> tuple[Any, ...]:
+    args = getattr(ref_type, "__args__", None)
+    if ref_type in (tuple, Tuple) or args is None:
+        args = (Any, ...)
+    elif args == ((),):
+        args = ()
+    assert isinstance(args, tuple)
+    return args
+
+
+def normalize_tuple_annotation(ref_type: Any) -> Any:
+    if not is_tuple_annotation(ref_type):
+        raise ValidationError(f"Unsupported tuple type: '{type_str(ref_type)}'")
+
+    if ref_type in (tuple, Tuple):
+        return Tuple[Any, ...]
+
+    args = get_tuple_item_types(ref_type)
+    if Ellipsis in args and not (len(args) == 2 and args[1] is Ellipsis):
+        raise ValidationError(f"Unsupported tuple type: '{type_str(ref_type)}'")
+
+    for item_type in args:
+        origin = getattr(item_type, "__origin__", None)
+        if (
+            getattr(origin, "__module__", None),
+            getattr(origin, "__qualname__", None),
+        ) in (("typing", "Unpack"), ("typing_extensions", "Unpack")):
+            raise ValidationError(f"Unsupported tuple type: '{type_str(ref_type)}'")
+
+    return ref_type
+
+
+def is_variadic_tuple_annotation(ref_type: Any) -> bool:
+    args = get_tuple_item_types(normalize_tuple_annotation(ref_type))
+    return len(args) == 2 and args[1] is Ellipsis
+
+
+def make_tuple_annotation(item_types: tuple[Any, ...]) -> Any:
+    return Tuple[item_types]  # type: ignore[valid-type]
+
+
+def get_dict_key_value_types(ref_type: Any) -> tuple[Any, Any]:
+    args = getattr(ref_type, "__args__", None)
+    if args is None:
+        bases = getattr(ref_type, "__orig_bases__", None)
+        if bases is not None and len(bases) > 0:
+            for base in bases:
+                if is_dict_annotation(base):
+                    args = getattr(base, "__args__", None)
+                    break
+
+    key_type: Any
+    element_type: Any
+    if ref_type is None or ref_type == Dict:
+        key_type = Any
+        element_type = Any
+    else:
+        if args is not None and len(args) == 2:
+            key_type = args[0]
+            element_type = args[1]
+            if element_type is None:
+                element_type = NoneType
+        else:
+            key_type = Any
+            element_type = Any
+
+    return key_type, element_type
+
+
+def is_valid_value_annotation(type_: Any) -> bool:
+    _, type_ = _resolve_optional(type_)
+    return (
+        type_ is Any
+        or is_primitive_type_annotation(type_)
+        or is_literal_annotation(type_)
+        or is_structured_config(type_)
+        or is_container_annotation(type_)
+        or is_supported_union_annotation(type_)
+    )
+
+
+def _valid_dict_key_annotation_type(type_: Any) -> bool:
+    from omegaconf import DictKeyType
+
+    return type_ is None or type_ is Any or issubclass(type_, DictKeyType.__args__)  # type: ignore
+
+
+def is_primitive_type_annotation(type_: Any) -> bool:
+    if isinstance(type_, _EscapedMissing):
+        return True
+    type_ = get_type_of(type_)
+    return issubclass(type_, (Enum, pathlib.Path)) or type_ in BUILTIN_VALUE_TYPES
+
+
+def _get_value(value: Any) -> Any:
+    from .base import Container, UnionNode
+    from .nodes import ValueNode
+
+    if isinstance(value, ValueNode):
+        return value._value()
+    elif isinstance(value, Container):
+        boxed = value._value()
+        if boxed is None or _is_missing_literal(boxed) or _is_interpolation(boxed):
+            return boxed
+    elif isinstance(value, UnionNode):
+        boxed = value._value()
+        if boxed is None or _is_missing_literal(boxed) or _is_interpolation(boxed):
+            return boxed
+        else:
+            return _get_value(boxed)  # pass through value of boxed node
+
+    # return primitives and regular OmegaConf Containers as is
+    return value
+
+
+def get_type_hint(obj: Any, key: Any = None) -> type[Any] | None:
+    from omegaconf import Container, Node
+
+    if isinstance(obj, Container):
+        if key is not None:
+            obj = obj._get_node(key)
+    else:
+        if key is not None:
+            raise ValueError("Key must only be provided when obj is a container")
+
+    if isinstance(obj, Node):
+        ref_type = obj._metadata.ref_type
+        if obj._is_optional() and ref_type is not Any:
+            return Optional[ref_type]  # type: ignore
+        else:
+            return ref_type
+    else:
+        return Any  # type: ignore
+
+
+def _is_full_backtrace_enabled() -> bool:
+    # Set the environment variable OC_CAUSE=1 to get a stacktrace that includes the
+    # causing exception.
+    env_var = os.environ["OC_CAUSE"] if "OC_CAUSE" in os.environ else None
+    debugging = sys.gettrace() is not None
+    return (debugging and not env_var == "0") or (env_var == "1")
+
+
+def _raise(ex: Exception, cause: Exception) -> None:
+    full_backtrace = _is_full_backtrace_enabled()
+    if full_backtrace:
+        # In the alias case (`cause is ex`), assigning `ex.__cause__ = cause`
+        # would create a self-reference cycle that pins `ex` (and transitively
+        # its traceback frames and locals) until cyclic GC runs. Use a shallow
+        # clone so `__cause__` is non-None for the OC_CAUSE=1 contract while
+        # remaining a distinct object that doesn't loop back to `ex`.
+        ex.__cause__ = copy.copy(cause) if cause is ex else cause
+    else:
+        ex.__cause__ = None
+    try:
+        # Set env var OC_CAUSE=1 for full trace. In normal mode, avoid
+        # preserving the active traceback because it can retain caller frame
+        # locals until cyclic GC runs.
+        if full_backtrace:
+            raise ex.with_traceback(sys.exc_info()[2])
+        raise ex.with_traceback(None) from None
+    finally:
+        # Follow https://peps.python.org/pep-3110/ to break
+        # the exception reference cycle.
+        if cause is ex:
+            del cause
+        del ex
+
+
+def format_and_raise(
+    node: Any,
+    key: Any,
+    value: Any,
+    msg: str,
+    cause: Exception,
+    type_override: Any = None,
+) -> None:
+    from omegaconf import OmegaConf
+    from omegaconf.base import Node
+
+    if isinstance(cause, AssertionError):
+        raise
+
+    if isinstance(cause, OmegaConfBaseException) and cause._initialized:
+        ex = cause
+        if type_override is not None:
+            ex = type_override(str(cause))
+            ex.__dict__ = copy.deepcopy(cause.__dict__)
+        try:
+            _raise(ex, cause)
+        finally:
+            # Follow https://peps.python.org/pep-3110/ to break
+            # the exception reference cycle.
+            if cause is ex:
+                del cause
+            del ex
+        # Unreachable: `_raise` always raises. The explicit `return` lets static
+        # analysis see that the conditional `del cause` above does not escape
+        # this branch, so `cause` stays bound for the rest of the function.
+        return  # pragma: no cover
+
+    object_type: type[Any] | None
+    object_type_str: str | None = None
+    ref_type: type[Any] | None
+    ref_type_str: str | None
+
+    child_node: Node | None = None
+    if node is None:
+        full_key = key if key is not None else ""
+        object_type = None
+        ref_type = None
+        ref_type_str = None
+    else:
+        if key is not None and not node._is_none():
+            child_node = node._get_node(key, validate_access=False)
+
+        try:
+            full_key = node._get_full_key(key=key)
+        except Exception as exc:
+            # Since we are handling an exception, raising a different one here would
+            # be misleading. Instead, we display it in the key.
+            full_key = f"<unresolvable due to {type(exc).__name__}: {exc}>"
+
+        object_type = OmegaConf.get_type(node)
+        object_type_str = type_str(object_type)
+
+        ref_type = get_type_hint(node)
+        ref_type_str = type_str(ref_type)
+
+    msg = string.Template(msg).safe_substitute(
+        REF_TYPE=ref_type_str,
+        OBJECT_TYPE=object_type_str,
+        KEY=key,
+        FULL_KEY=full_key,
+        VALUE=value,
+        VALUE_TYPE=type_str(type(value), include_module_name=True),
+        KEY_TYPE=f"{type(key).__name__}",
+    )
+
+    if ref_type not in (None, Any):
+        template = dedent("""\
+            $MSG
+                full_key: $FULL_KEY
+                reference_type=$REF_TYPE
+                object_type=$OBJECT_TYPE""")
+    else:
+        template = dedent("""\
+            $MSG
+                full_key: $FULL_KEY
+                object_type=$OBJECT_TYPE""")
+    s = string.Template(template=template)
+
+    message = s.substitute(
+        REF_TYPE=ref_type_str, OBJECT_TYPE=object_type_str, MSG=msg, FULL_KEY=full_key
+    )
+    exception_type = type(cause) if type_override is None else type_override
+    if exception_type == TypeError:
+        exception_type = ConfigTypeError
+    elif exception_type == IndexError:
+        exception_type = ConfigIndexError
+
+    ex = exception_type(f"{message}")
+    if issubclass(exception_type, OmegaConfBaseException):
+        assert isinstance(ex, OmegaConfBaseException)  # help type-checkers
+        ex._initialized = True
+        ex.msg = message
+        ex.parent_node = node
+        ex.child_node = child_node
+        ex.key = key
+        ex.full_key = full_key
+        ex.value = value
+        ex.object_type = object_type
+        ex.object_type_str = object_type_str
+        ex.ref_type = ref_type
+        ex.ref_type_str = ref_type_str
+
+    try:
+        _raise(ex, cause)
+    finally:
+        # Follow https://peps.python.org/pep-3110/ to break
+        # the exception reference cycle.
+        del ex
+
+
+def type_str(t: Any, include_module_name: bool = False) -> str:
+    is_optional, t = _resolve_optional(t)
+    if t is NoneType:
+        return str(t.__name__)
+    if t is Any:
+        return "Any"
+    if t is ...:
+        return "..."
+
+    if hasattr(t, "__name__"):
+        name = str(t.__name__)
+    elif getattr(t, "_name", None) is not None:  # pragma: no cover
+        name = str(t._name)
+    elif getattr(t, "__origin__", None) is not None:  # pragma: no cover
+        name = type_str(t.__origin__)
+    else:
+        name = str(t)
+        if name.startswith("typing."):  # pragma: no cover
+            name = name[len("typing.") :]
+
+    args = getattr(t, "__args__", None)
+    if args is not None:
+        args = ", ".join(
+            [type_str(t, include_module_name=include_module_name) for t in t.__args__]
+        )
+        ret = f"{name}[{args}]"
+    else:
+        ret = name
+    if include_module_name:
+        if (
+            hasattr(t, "__module__")
+            and t.__module__ != "builtins"
+            and t.__module__ != "typing"
+            and not t.__module__.startswith("omegaconf.")
+        ):
+            module_name = str(t.__module__)
+            if isinstance(t, type) and issubclass(t, pathlib.PurePath):
+                # Python 3.13+ uses pathlib._local internally, normalize to pathlib for # Path types
+                # Normalize pathlib._local to pathlib for cross-version compatibility
+                if module_name == "pathlib._local":  # pragma: no cover
+                    module_name = "pathlib"
+
+            module_prefix = module_name + "."
+        else:
+            module_prefix = ""
+        ret = module_prefix + ret
+    if is_optional:
+        return f"Optional[{ret}]"
+    else:
+        return ret
+
+
+def _ensure_container(target: Any) -> Any:
+    from omegaconf import OmegaConf
+
+    if is_primitive_container(target):
+        assert isinstance(target, (list, tuple, dict))
+        target = OmegaConf.create(target)
+    elif is_structured_config(target):
+        target = OmegaConf.structured(target)
+    elif not OmegaConf.is_config(target):
+        raise ValueError(
+            "Invalid input. Supports one of "
+            + "[dict,list,tuple,DictConfig,ListConfig,TupleConfig,dataclass,dataclass instance,attr class,attr class instance]"
+        )
+
+    return target
+
+
+def is_generic_list(type_: Any) -> bool:
+    """
+    Checks if a type is a generic list, for example:
+    list returns False
+    typing.List returns False
+    typing.List[T] returns True
+
+    :param type_: variable type
+    :return: bool
+    """
+    return is_list_annotation(type_) and get_list_element_type(type_) is not None
+
+
+def is_generic_dict(type_: Any) -> bool:
+    """
+    Checks if a type is a generic dict, for example:
+    list returns False
+    typing.List returns False
+    typing.List[T] returns True
+
+    :param type_: variable type
+    :return: bool
+    """
+    return is_dict_annotation(type_) and len(get_dict_key_value_types(type_)) > 0
+
+
+def is_container_annotation(type_: Any) -> bool:
+    return (
+        is_list_annotation(type_)
+        or is_tuple_annotation(type_)
+        or is_dict_annotation(type_)
+    )
+
+
+def _find_eq(s: str) -> int:
+    r"""Return the index of the first *unescaped* '=' in s, or -1 if none.
+
+    Used by from_dotlist / from_cli to split a dotlist entry like ``"a.b=1"``
+    into key (``"a.b"``) and value (``"1"``).  The split must be escape-aware
+    so that keys containing literal '=' can be expressed as ``r"a\\=b=value"``.
+
+    Escape rule (same as split_key slow path): a backslash followed by a
+    character in _ESCAPABLE (. [ ] =) consumes both characters and skips the
+    second one for matching purposes.  A backslash before any other character
+    is NOT a recognised escape and does not shield the following character —
+    so ``r"a\b=1"`` still splits at the '='.
+
+    Examples:
+        "a=1"       ->  1   (plain key=value)
+        "a.b=1"     ->  3   (dot in key is not a delimiter here)
+        r"a\=b=1"   ->  4   (first = is escaped, second = is the separator)
+        "a=x=y"     ->  1   (only the *first* unescaped = is the separator;
+                             the value "x=y" is left intact)
+        "a"         -> -1   (no '=' at all → key-only entry, value is None)
+    """
+    if "=" not in s:  # fast path: no '=' at all
+        return -1
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n and s[i + 1] in _ESCAPABLE:
+            i += 2  # skip escaped character, it cannot be the separator
+        elif s[i] == "=":
+            return i
+        else:
+            i += 1
+    return -1

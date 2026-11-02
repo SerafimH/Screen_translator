@@ -1,0 +1,1473 @@
+import copy
+import sys
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, NoReturn, Optional
+
+from ._conversion_warnings import _conversion_warning_mode, _conversion_warnings
+from ._key_path import NodeInterpolationKey, split_key
+from ._missing import _decode_missing_escape
+from ._utils import (
+    _DEFAULT_MARKER_,
+    NoneType,
+    ValueKind,
+    _get_value,
+    _is_full_backtrace_enabled,
+    _is_interpolation,
+    _is_missing_value,
+    _is_special,
+    format_and_raise,
+    get_value_kind,
+    is_dict_annotation,
+    is_list_annotation,
+    is_structured_config,
+    is_tuple_annotation,
+    is_union_annotation,
+    is_valid_value_annotation,
+    select_structured_config_union_member,
+    type_hint_contains_none_literal,
+    type_str,
+)
+from .errors import (
+    ConfigKeyError,
+    ConfigTypeError,
+    InterpolationKeyError,
+    InterpolationResolutionError,
+    InterpolationToMissingValueError,
+    InterpolationValidationError,
+    KeyValidationError,
+    MissingMandatoryValue,
+    OmegaConfBaseException,
+    UnsupportedInterpolationType,
+    ValidationError,
+)
+from .grammar_parser import parse
+from .grammar_visitor import GrammarVisitor
+from .typing import Antlr4ParserRuleContext
+
+DictKeyType = str | bytes | int | Enum | float | bool
+
+
+@dataclass
+class Metadata:
+    ref_type: type[Any] | Any
+
+    object_type: type[Any] | Any
+
+    optional: bool
+
+    key: Any
+
+    # Flags have 3 modes:
+    #   unset : inherit from parent (None if no parent specifies)
+    #   set to true: flag is true
+    #   set to false: flag is false
+    flags: dict[str, bool] | None = None
+
+    # If True, when checking the value of a flag, if the flag is not set None is returned
+    # otherwise, the parent node is queried.
+    flags_root: bool = False
+
+    resolver_cache: dict[str, Any] = field(default_factory=lambda: defaultdict(dict))
+
+    def __post_init__(self) -> None:
+        if self.flags is None:
+            self.flags = {}
+
+    @property
+    def type_hint(self) -> type[Any] | Any:
+        """Compute `type_hint` from `self.optional` and `self.ref_type`"""
+        # For compatibility with pickled OmegaConf objects created using older
+        # versions of OmegaConf, we store `ref_type` and `object_type`
+        # separately (rather than storing `type_hint` directly).
+        if self.optional:
+            return Optional[self.ref_type]
+        else:
+            return self.ref_type
+
+
+@dataclass
+class ContainerMetadata(Metadata):
+    key_type: Any = None
+    element_type: Any = None
+
+    def __post_init__(self) -> None:
+        if self.ref_type is None:
+            self.ref_type = Any
+        assert self.key_type is Any or isinstance(self.key_type, type)
+        if self.element_type is not None:
+            if not is_valid_value_annotation(self.element_type):
+                raise ValidationError(
+                    f"Unsupported value type: '{type_str(self.element_type, include_module_name=True)}'"
+                )
+
+        if self.flags is None:
+            self.flags = {}
+
+
+class Node(ABC):
+    _metadata: Metadata
+
+    _parent: "Box | None"
+    _flags_cache: dict[str, bool | None] | None
+
+    def __init__(self, parent: "Box | None", metadata: Metadata):
+        self.__dict__["_metadata"] = metadata
+        self.__dict__["_parent"] = parent
+        self.__dict__["_flags_cache"] = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Overridden to ensure that the flags cache is cleared on serialization.
+        state_dict = copy.copy(self.__dict__)
+        del state_dict["_flags_cache"]
+        return state_dict
+
+    def __setstate__(self, state_dict: dict[str, Any]) -> None:
+        self.__dict__.update(state_dict)
+        self.__dict__["_flags_cache"] = None
+
+    def _set_parent(self, parent: "Box | None") -> None:
+        assert parent is None or isinstance(parent, Box)
+        self.__dict__["_parent"] = parent
+        self._invalidate_flags_cache()
+
+    def _invalidate_flags_cache(self) -> None:
+        self.__dict__["_flags_cache"] = None
+
+    def _get_parent(self) -> "Box | None":
+        parent = self.__dict__["_parent"]
+        assert parent is None or isinstance(parent, Box)
+        return parent
+
+    def _get_parent_container(self) -> "Container | None":
+        """
+        Like _get_parent, but returns the grandparent
+        in the case where `self` is wrapped by a UnionNode.
+        """
+        parent = self.__dict__["_parent"]
+        assert parent is None or isinstance(parent, Box)
+
+        if isinstance(parent, UnionNode):
+            grandparent = parent.__dict__["_parent"]
+            assert grandparent is None or isinstance(grandparent, Container)
+            return grandparent
+        else:
+            assert parent is None or isinstance(parent, Container)
+            return parent
+
+    def _set_flag(
+        self,
+        flags: list[str] | str,
+        values: list[bool | None] | bool | None,
+    ) -> "Node":
+        if isinstance(flags, str):
+            flags = [flags]
+
+        if values is None or isinstance(values, bool):
+            values = [values]
+
+        if len(values) == 1:
+            values = len(flags) * values
+
+        if len(flags) != len(values):
+            raise ValueError("Inconsistent lengths of input flag names and values")
+
+        for idx, flag in enumerate(flags):
+            value = values[idx]
+            if value is None:
+                assert self._metadata.flags is not None
+                if flag in self._metadata.flags:
+                    del self._metadata.flags[flag]
+            else:
+                assert self._metadata.flags is not None
+                self._metadata.flags[flag] = value
+        self._invalidate_flags_cache()
+        return self
+
+    def _get_node_flag(self, flag: str) -> bool | None:
+        """
+        :param flag: flag to inspect
+        :return: the state of the flag on this node.
+        """
+        assert self._metadata.flags is not None
+        return self._metadata.flags.get(flag)
+
+    def _get_flag(self, flag: str) -> bool | None:
+        cache = self.__dict__["_flags_cache"]
+        if cache is None:
+            cache = self.__dict__["_flags_cache"] = {}
+
+        ret = cache.get(flag, _DEFAULT_MARKER_)
+        if ret is _DEFAULT_MARKER_:
+            ret = self._get_flag_no_cache(flag)
+            cache[flag] = ret
+        assert ret is None or isinstance(ret, bool)
+        return ret
+
+    def _get_flag_no_cache(self, flag: str) -> bool | None:
+        """
+        Returns True if this config node flag is set
+        A flag is set if node.set_flag(True) was called
+        or one if it's parents is flag is set
+        :return:
+        """
+        flags = self._metadata.flags
+        assert flags is not None
+        if flag in flags and flags[flag] is not None:
+            return flags[flag]
+
+        if self._is_flags_root():
+            return None
+
+        parent = self._get_parent()
+        if parent is None:
+            return None
+        else:
+            # noinspection PyProtectedMember
+            return parent._get_flag(flag)
+
+    def _format_and_raise(
+        self,
+        key: Any,
+        value: Any,
+        cause: Exception,
+        msg: str | None = None,
+        type_override: Any = None,
+    ) -> NoReturn:
+        if (
+            type_override is None
+            and isinstance(cause, OmegaConfBaseException)
+            and cause._initialized
+        ):
+            if not _is_full_backtrace_enabled():
+                cause.__traceback__ = None
+                cause.__context__ = None
+            # Keep the re-raise in this common wrapper so callers do not need
+            # to remember traceback cleanup before forwarding OmegaConf errors.
+            raise
+        format_and_raise(
+            node=self,
+            key=key,
+            value=value,
+            msg=str(cause) if msg is None else msg,
+            cause=cause,
+            type_override=type_override,
+        )
+        assert False
+
+    @abstractmethod
+    def _get_full_key(self, key: DictKeyType | int | None) -> str: ...
+
+    def _dereference_node(self) -> "Node":
+        node = self._dereference_node_impl(throw_on_resolution_failure=True)
+        assert node is not None
+        return node
+
+    def _maybe_dereference_node(
+        self,
+        throw_on_resolution_failure: bool = False,
+        memo: set[int] | None = None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> "Node | None":
+        return self._dereference_node_impl(
+            throw_on_resolution_failure=throw_on_resolution_failure,
+            memo=memo,
+            resolved_node_cache=resolved_node_cache,
+        )
+
+    def _dereference_node_impl(
+        self,
+        throw_on_resolution_failure: bool,
+        memo: set[int] | None = None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> "Node | None":
+        if not self._is_interpolation():
+            return self
+
+        parent = self._get_parent_container()
+        if parent is None:
+            if throw_on_resolution_failure:
+                raise InterpolationResolutionError(
+                    "Cannot resolve interpolation for a node without a parent"
+                )
+            return None
+        assert parent is not None
+        key = self._key()
+        return parent._resolve_interpolation_from_parse_tree(
+            parent=parent,
+            key=key,
+            value=self,
+            parse_tree=parse(_get_value(self)),
+            throw_on_resolution_failure=throw_on_resolution_failure,
+            memo=memo,
+            resolved_node_cache=resolved_node_cache,
+        )
+
+    def _get_root(self) -> "Container":
+        root: Box | None = self._get_parent()
+        if root is None:
+            assert isinstance(self, Container)
+            return self
+        assert root is not None and isinstance(root, Box)
+        while root._get_parent() is not None:
+            root = root._get_parent()
+            assert root is not None and isinstance(root, Box)
+        assert root is not None and isinstance(root, Container)
+        return root
+
+    def _is_missing(self) -> bool:
+        """
+        Check if the node's value is `???` (does *not* resolve interpolations).
+        """
+        return _is_missing_value(self)
+
+    def _is_none(self) -> bool:
+        """
+        Check if the node's value is `None` (does *not* resolve interpolations).
+        """
+        return self._value() is None
+
+    @abstractmethod
+    def __eq__(self, other: Any) -> bool: ...
+
+    @abstractmethod
+    def __ne__(self, other: Any) -> bool: ...
+
+    @abstractmethod
+    def __hash__(self) -> int: ...
+
+    @abstractmethod
+    def _value(self) -> Any: ...
+
+    @abstractmethod
+    def _set_value(self, value: Any, flags: dict[str, bool] | None = None) -> None: ...
+
+    @abstractmethod
+    def _is_optional(self) -> bool: ...
+
+    @abstractmethod
+    def _is_interpolation(self) -> bool: ...
+
+    def _key(self) -> Any:
+        return self._metadata.key
+
+    def _set_key(self, key: Any) -> None:
+        self._metadata.key = key
+
+    def _is_flags_root(self) -> bool:
+        return self._metadata.flags_root
+
+    def _set_flags_root(self, flags_root: bool) -> None:
+        if self._metadata.flags_root != flags_root:
+            self._metadata.flags_root = flags_root
+            self._invalidate_flags_cache()
+
+    def _has_ref_type(self) -> bool:
+        return self._metadata.ref_type is not Any
+
+
+class Box(Node):
+    """
+    Base class for nodes that can contain other nodes.
+    Concrete subclasses include DictConfig, ListConfig, TupleConfig, and UnionNode.
+    """
+
+    _content: Any
+
+    def __init__(self, parent: "Box | None", metadata: Metadata):
+        super().__init__(parent=parent, metadata=metadata)
+        self.__dict__["_content"] = None
+
+    def __copy__(self) -> Any:
+        # real shallow copy is impossible because of the reference to the parent.
+        return copy.deepcopy(self)
+
+    def _re_parent(self) -> None:
+        from .dictconfig import DictConfig
+        from .listconfig import ListConfig
+        from .tupleconfig import TupleConfig
+
+        # update parents of first level Config nodes to self
+
+        if isinstance(self, DictConfig):
+            content = self.__dict__["_content"]
+            if isinstance(content, dict):
+                for _key, value in self.__dict__["_content"].items():
+                    if value is not None:
+                        value._set_parent(self)
+                    if isinstance(value, Box):
+                        value._re_parent()
+        elif isinstance(self, (ListConfig, TupleConfig)):
+            content = self.__dict__["_content"]
+            if isinstance(content, list):
+                for item in self.__dict__["_content"]:
+                    if item is not None:
+                        item._set_parent(self)
+                    if isinstance(item, Box):
+                        item._re_parent()
+        elif isinstance(self, UnionNode):
+            content = self.__dict__["_content"]
+            if isinstance(content, Node):
+                content._set_parent(self)
+                if isinstance(content, Box):
+                    content._re_parent()
+
+
+class Container(Box):
+    """
+    Container tagging interface
+    """
+
+    _metadata: ContainerMetadata  # pyrefly: ignore[bad-override]
+
+    @abstractmethod
+    def _get_child(
+        self,
+        key: Any,
+        validate_access: bool = True,
+        validate_key: bool = True,
+        throw_on_missing_value: bool = False,
+        throw_on_missing_key: bool = False,
+    ) -> list[Node | None] | Node | None: ...
+
+    @abstractmethod
+    def _get_node(
+        self,
+        key: Any,
+        validate_access: bool = True,
+        validate_key: bool = True,
+        throw_on_missing_value: bool = False,
+        throw_on_missing_key: bool = False,
+    ) -> list[Node | None] | Node | None: ...
+
+    @abstractmethod
+    def __delitem__(self, key: Any) -> None: ...
+
+    @abstractmethod
+    def __setitem__(self, key: Any, value: Any) -> None: ...
+
+    @abstractmethod
+    def __iter__(self) -> Iterator[Any]: ...
+
+    @abstractmethod
+    def __getitem__(self, key_or_index: Any) -> Any: ...
+
+    def _resolve_key_and_root(
+        self, key: str | NodeInterpolationKey
+    ) -> tuple["Container", str]:
+        if isinstance(key, NodeInterpolationKey):
+            root = self if key.relative_dots else self._get_root()
+            for _ in range(max(0, key.relative_dots - 1)):
+                parent = root._get_parent_container()
+                if parent is None:
+                    raise ConfigKeyError(f"Error resolving key '{key.raw}'")
+                root = parent
+            prefix = "." * key.relative_dots
+            return root, key.raw[len(prefix) :] if key.raw.startswith(
+                prefix
+            ) else key.raw
+        orig = key
+        if not key.startswith("."):
+            return self._get_root(), key
+        else:
+            root: Container | None = self
+            assert key.startswith(".")
+            while True:
+                assert root is not None
+                key = key[1:]
+                if not key.startswith("."):
+                    break
+                root = root._get_parent_container()
+                if root is None:
+                    raise ConfigKeyError(f"Error resolving key '{orig}'")
+
+            return root, key
+
+    def _select_impl(
+        self,
+        key: str | tuple[str, ...],
+        throw_on_missing: bool,
+        throw_on_resolution_failure: bool,
+        memo: set[int] | None = None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> tuple["Container | None", str | None, Node | None]:
+        """
+        Select a value using dot separated key sequence
+        """
+        from .omegaconf import _select_one
+
+        if key == "" or key == ():
+            return self, "", self
+
+        split = split_key(key) if isinstance(key, str) else list(key)
+        root: Container | None = self
+        for i in range(len(split) - 1):
+            if root is None:
+                break
+
+            k = split[i]
+            ret, _ = _select_one(
+                c=root,
+                key=k,
+                throw_on_missing=throw_on_missing,
+                throw_on_type_error=throw_on_resolution_failure,
+            )
+            if isinstance(ret, Node):
+                source = ret
+                ret = source._maybe_dereference_node(
+                    throw_on_resolution_failure=throw_on_resolution_failure,
+                    memo=memo,
+                    resolved_node_cache=resolved_node_cache,
+                )
+                if isinstance(ret, Node) and source._is_interpolation():
+                    from ._impl import (
+                        _eager_resolution,
+                        _materialize_resolver_container,
+                    )
+                    from ._utils import is_primitive_container
+                    from .nodes import InterpolationResultNode
+
+                    if _eager_resolution.get():
+                        if isinstance(ret, InterpolationResultNode):
+                            result = _get_value(ret)
+                            if is_primitive_container(result) or is_structured_config(
+                                result
+                            ):
+                                producer = ret._get_parent_container()
+                                assert producer is not None
+                                ret = _materialize_resolver_container(
+                                    producer, ret._key(), result
+                                )
+                        elif isinstance(ret, Container):
+                            producer = ret._get_parent_container()
+                            if (
+                                producer is not None
+                                and producer._get_child(ret._key()) is not ret
+                            ):
+                                ret = _materialize_resolver_container(
+                                    producer, ret._key(), ret
+                                )
+                            else:
+                                from .grammar_visitor import OmegaConfGrammarParser
+
+                                tree = parse(_get_value(source))
+                                assert isinstance(
+                                    tree, OmegaConfGrammarParser.ConfigValueContext
+                                )
+                                parsed_text = tree.text()
+                                assert parsed_text is not None
+                                if any(
+                                    interpolation.interpolationResolver() is not None
+                                    for interpolation in parsed_text.interpolation()
+                                ):
+                                    producer = source._get_parent_container()
+                                    assert producer is not None
+                                    ret = _materialize_resolver_container(
+                                        producer, source._key(), ret
+                                    )
+
+            if ret is not None and not isinstance(ret, Container):
+                parent_key = ".".join(split[0 : i + 1])
+                child_key = split[i + 1]
+                raise ConfigTypeError(
+                    f"Error trying to access {key if isinstance(key, str) else '.'.join(key)}: node `{parent_key}` "
+                    f"is not a container and thus cannot contain `{child_key}`"
+                )
+            root = ret
+
+        if root is None:
+            return None, None, None
+
+        last_key = split[-1]
+        value, _ = _select_one(
+            c=root,
+            key=last_key,
+            throw_on_missing=throw_on_missing,
+            throw_on_type_error=throw_on_resolution_failure,
+        )
+        if value is None:
+            return root, last_key, None
+
+        value_id = id(value)
+        if resolved_node_cache is not None and value_id in resolved_node_cache:
+            return root, last_key, resolved_node_cache[value_id]
+
+        if memo is not None:
+            if value_id in memo:
+                raise InterpolationResolutionError("Recursive interpolation detected")
+            # push to memo "stack"
+            memo.add(value_id)
+
+        try:
+            value = root._maybe_resolve_interpolation(
+                parent=root,
+                key=last_key,
+                value=value,
+                throw_on_resolution_failure=throw_on_resolution_failure,
+                memo=memo,
+                resolved_node_cache=resolved_node_cache,
+            )
+        finally:
+            if memo is not None:
+                # pop from memo "stack"
+                memo.remove(value_id)
+
+        if isinstance(value, Node):
+            from ._impl import _eager_resolution, _materialize_resolver_container
+
+            if _eager_resolution.get():
+                from ._utils import is_primitive_container
+                from .nodes import InterpolationResultNode
+
+                if isinstance(value, InterpolationResultNode):
+                    result = _get_value(value)
+                    if is_primitive_container(result) or is_structured_config(result):
+                        producer = value._get_parent_container()
+                        assert producer is not None
+                        value = _materialize_resolver_container(
+                            producer, value._key(), result
+                        )
+                elif isinstance(value, Container):
+                    producer = value._get_parent_container()
+                    if (
+                        producer is root
+                        and value._key() == last_key
+                        and producer._get_child(last_key) is not value
+                    ):
+                        value = _materialize_resolver_container(
+                            producer, last_key, value
+                        )
+
+        if resolved_node_cache is not None and value is not None:
+            resolved_node_cache[value_id] = value
+
+        return root, last_key, value
+
+    def _resolve_interpolation_from_parse_tree(
+        self,
+        parent: "Container | None",
+        value: "Node",
+        key: Any,
+        parse_tree: Antlr4ParserRuleContext,
+        throw_on_resolution_failure: bool,
+        memo: set[int] | None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> "Node | None":
+        """
+        Resolve an interpolation.
+
+        This happens in two steps:
+            1. The parse tree is visited, which outputs either a `Node` (e.g.,
+               for node interpolations "${foo}"), a string (e.g., for string
+               interpolations "hello ${name}", or any other arbitrary value
+               (e.g., or custom interpolations "${foo:bar}").
+            2. This output is potentially validated and converted when the node
+               being resolved (`value`) is typed.
+
+        If an error occurs in one of the above steps, an `InterpolationResolutionError`
+        (or a subclass of it) is raised, *unless* `throw_on_resolution_failure` is set
+        to `False` (in which case the return value is `None`).
+
+        :param parent: Parent of the node being resolved.
+        :param value: Node being resolved.
+        :param key: The associated key in the parent.
+        :param parse_tree: The parse tree as obtained from `grammar_parser.parse()`.
+        :param throw_on_resolution_failure: If `False`, then exceptions raised during
+            the resolution of the interpolation are silenced, and instead `None` is
+            returned.
+
+        :return: A `Node` that contains the interpolation result. This may be an existing
+            node in the config (in the case of a node interpolation "${foo}"), or a new
+            node that is created to wrap the interpolated value. It is `None` if and only if
+            `throw_on_resolution_failure` is `False` and an error occurs during resolution.
+        """
+
+        try:
+            resolved = self.resolve_parse_tree(
+                parse_tree=parse_tree,
+                node=value,
+                key=key,
+                memo=memo,
+                resolved_node_cache=resolved_node_cache,
+            )
+        except InterpolationResolutionError:
+            if throw_on_resolution_failure:
+                raise
+            return None
+
+        return self._validate_and_convert_interpolation_result(
+            parent=parent,
+            value=value,
+            key=key,
+            resolved=resolved,
+            throw_on_resolution_failure=throw_on_resolution_failure,
+        )
+
+    def _validate_and_convert_interpolation_result(
+        self,
+        parent: "Container | None",
+        value: "Node",
+        key: Any,
+        resolved: Any,
+        throw_on_resolution_failure: bool,
+    ) -> "Node | None":
+        from ._utils import _is_missing_literal
+        from .nodes import AnyNode, InterpolationResultNode, ValueNode
+
+        if not isinstance(resolved, Node):
+            resolved = _decode_missing_escape(resolved)
+            if _is_missing_literal(resolved):
+                if throw_on_resolution_failure:
+                    raise InterpolationToMissingValueError(
+                        "Interpolation resolved to a missing value"
+                    )
+                return None
+
+        # If the output is not a Node already (e.g., because it is the output of a
+        # custom resolver), then we will need to wrap it within a Node.
+        must_wrap = not isinstance(resolved, Node)
+
+        # If the node is typed, validate (and possibly convert) the result.
+        if isinstance(value, ValueNode) and not isinstance(value, AnyNode):
+            res_value = _get_value(resolved)
+            try:
+                conv_value = value.validate_and_convert(res_value)
+            except ValidationError as e:
+                if throw_on_resolution_failure:
+                    self._format_and_raise(
+                        key=key,
+                        value=res_value,
+                        cause=e,
+                        msg=f"While dereferencing interpolation '{value}': {e}",
+                        type_override=InterpolationValidationError,
+                    )
+                return None
+
+            # If the converted value is of the same type, it means that no conversion
+            # was actually needed. As a result, we can keep the original `resolved`
+            # (and otherwise, the converted value must be wrapped into a new node).
+            if type(conv_value) is not type(res_value):
+                must_wrap = True
+                resolved = conv_value
+        elif isinstance(value, Container) and value._has_ref_type():
+            from ._utils import _convert_opaque_missing, is_primitive_container
+            from .omegaconf import _node_wrap
+
+            if not (
+                isinstance(resolved, type(value))
+                and resolved._metadata.type_hint == value._metadata.type_hint
+            ):
+                if isinstance(resolved, Container) and not (
+                    is_structured_config(value._metadata.ref_type)
+                    and is_structured_config(resolved._metadata.object_type)
+                ):
+                    from .basecontainer import BaseContainer
+
+                    res_value = BaseContainer._to_content(
+                        resolved,
+                        resolve=False,
+                        throw_on_missing=False,
+                        encode_missing_literals=True,
+                    )
+                else:
+                    res_value = _get_value(resolved)
+                if not isinstance(resolved, Node) and is_primitive_container(res_value):
+                    from ._impl import _is_recursive_container
+
+                    if _is_recursive_container(res_value):
+                        if throw_on_resolution_failure:
+                            self._format_and_raise(
+                                key=key,
+                                value=res_value,
+                                cause=InterpolationResolutionError(
+                                    "Cannot materialize a recursive resolver result"
+                                ),
+                                type_override=InterpolationResolutionError,
+                            )
+                        return None
+                    res_value = _convert_opaque_missing(res_value, encode=True)
+                try:
+                    with _conversion_warnings(False):
+                        resolved = _node_wrap(
+                            parent=value,
+                            is_optional=value._is_optional(),
+                            value=res_value,
+                            key=None,
+                            ref_type=value._metadata.ref_type,
+                        )
+                except (ValidationError, KeyValidationError) as e:
+                    if throw_on_resolution_failure:
+                        self._format_and_raise(
+                            key=key,
+                            value=res_value,
+                            cause=e,
+                            msg=f"While dereferencing interpolation '{value}': {e}",
+                            type_override=InterpolationValidationError,
+                        )
+                    return None
+                resolved._set_parent(parent)
+                resolved._set_key(key)
+                must_wrap = False
+        elif isinstance(value, UnionNode):
+            res_value = _get_value(resolved)
+            try:
+                with _conversion_warnings(False):
+                    candidate = UnionNode(
+                        content="???",
+                        ref_type=value._metadata.ref_type,
+                        is_optional=value._is_optional(),
+                        parent=parent,
+                        key=key,
+                    )
+                    candidate._set_flag("convert", value._get_flag("convert"))
+                    candidate._set_value(res_value)
+            except ValidationError as e:
+                if throw_on_resolution_failure:
+                    self._format_and_raise(
+                        key=key,
+                        value=res_value,
+                        cause=e,
+                        msg=f"While dereferencing interpolation '{value}': {e}",
+                        type_override=InterpolationValidationError,
+                    )
+                return None
+
+            selected = candidate._value()
+            if not isinstance(selected, Node):
+                if must_wrap:
+                    return InterpolationResultNode(
+                        value=selected, key=key, parent=parent
+                    )
+                return resolved
+            if isinstance(resolved, Node) and (
+                isinstance(resolved, type(selected))
+                and resolved._metadata.type_hint == selected._metadata.type_hint
+            ):
+                return resolved
+            if isinstance(selected, Container):
+                selected._set_parent(parent)
+                selected._set_key(key)
+                return selected
+            resolved = _get_value(selected)
+            must_wrap = True
+
+        if must_wrap:
+            return InterpolationResultNode(value=resolved, key=key, parent=parent)
+        else:
+            assert isinstance(resolved, Node)
+            return resolved
+
+    def _validate_not_dereferencing_to_parent(self, node: Node, target: Node) -> None:
+        parent: Node | None = node
+        while parent is not None:
+            if parent is target:
+                raise InterpolationResolutionError(
+                    "Interpolation to parent node detected"
+                )
+            parent = parent._get_parent()
+
+    def _resolve_node_interpolation(
+        self,
+        inter_key: str | NodeInterpolationKey,
+        memo: set[int] | None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> "Node":
+        """A node interpolation is of the form `${foo.bar}`"""
+        original_inter_key = (
+            inter_key.raw if isinstance(inter_key, NodeInterpolationKey) else inter_key
+        )
+        try:
+            root_node, relative_key = self._resolve_key_and_root(inter_key)
+        except ConfigKeyError as exc:
+            raise InterpolationKeyError(
+                f"ConfigKeyError while resolving interpolation: {exc}"
+            ).with_traceback(sys.exc_info()[2])
+
+        try:
+            parent, last_key, value = root_node._select_impl(
+                inter_key.parts
+                if isinstance(inter_key, NodeInterpolationKey)
+                else relative_key,
+                throw_on_missing=True,
+                throw_on_resolution_failure=True,
+                memo=memo,
+                resolved_node_cache=resolved_node_cache,
+            )
+        except MissingMandatoryValue as exc:
+            raise InterpolationToMissingValueError(
+                f"MissingMandatoryValue while resolving interpolation: {exc}"
+            ).with_traceback(sys.exc_info()[2])
+
+        if parent is None or value is None:
+            msg = f"Interpolation key '{relative_key}' not found"
+            if original_inter_key != relative_key:
+                try:
+                    resolved_inter_key = root_node._get_full_key(relative_key)
+                except Exception as exc:
+                    resolved_inter_key = (
+                        f"<unresolvable due to {type(exc).__name__}: {exc}>"
+                    )
+                msg = (
+                    f"Interpolation key '{original_inter_key}' not found"
+                    f" (resolved to '{resolved_inter_key}')"
+                )
+            raise InterpolationKeyError(msg)
+        else:
+            self._validate_not_dereferencing_to_parent(node=self, target=value)
+            return value
+
+    def _evaluate_custom_resolver(
+        self,
+        key: Any,
+        node: Node,
+        inter_type: str,
+        inter_args: tuple[Any, ...],
+        inter_args_str: tuple[str, ...],
+    ) -> Any:
+        from omegaconf import OmegaConf
+        from omegaconf._utils import (
+            _is_missing_literal,
+            is_primitive_container,
+        )
+
+        resolver = OmegaConf._get_resolver(inter_type)
+        if resolver is not None:
+            root_node = self._get_root()
+            result = resolver(
+                root_node,
+                self,
+                node,
+                inter_args,
+                inter_args_str,
+            )
+            if not isinstance(result, Node):
+                if not is_primitive_container(result):
+                    result = _decode_missing_escape(result)
+                if _is_missing_literal(result):
+                    raise InterpolationToMissingValueError(
+                        "Interpolation resolved to a missing value"
+                    )
+            return result
+        else:
+            raise UnsupportedInterpolationType(
+                f"Unsupported interpolation type {inter_type}"
+            )
+
+    def _maybe_resolve_interpolation(
+        self,
+        parent: "Container | None",
+        key: Any,
+        value: Node,
+        throw_on_resolution_failure: bool,
+        memo: set[int] | None = None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> Node | None:
+        value_kind = get_value_kind(value)
+        if value_kind != ValueKind.INTERPOLATION:
+            return value
+
+        parse_tree = parse(_get_value(value))
+        return self._resolve_interpolation_from_parse_tree(
+            parent=parent,
+            value=value,
+            key=key,
+            parse_tree=parse_tree,
+            throw_on_resolution_failure=throw_on_resolution_failure,
+            memo=memo if memo is not None else set(),
+            resolved_node_cache=resolved_node_cache,
+        )
+
+    def resolve_parse_tree(
+        self,
+        parse_tree: Antlr4ParserRuleContext,
+        node: Node,
+        memo: set[int] | None = None,
+        key: Any | None = None,
+        resolved_node_cache: dict[int, "Node"] | None = None,
+    ) -> Any:
+        """
+        Resolve a given parse tree into its value.
+
+        We make no assumption here on the type of the tree's root, so that the
+        return value may be of any type.
+        """
+
+        def node_interpolation_callback(
+            inter_key: NodeInterpolationKey, memo: set[int] | None
+        ) -> "Node | None":
+            return self._resolve_node_interpolation(
+                inter_key=inter_key,
+                memo=memo,
+                resolved_node_cache=resolved_node_cache,
+            )
+
+        def resolver_interpolation_callback(
+            name: str, args: tuple[Any, ...], args_str: tuple[str, ...]
+        ) -> Any:
+            return self._evaluate_custom_resolver(
+                key=key,
+                node=node,
+                inter_type=name,
+                inter_args=args,
+                inter_args_str=args_str,
+            )
+
+        visitor = GrammarVisitor(
+            node_interpolation_callback=node_interpolation_callback,
+            resolver_interpolation_callback=resolver_interpolation_callback,
+            memo=memo,
+        )
+        try:
+            return visitor.visit(parse_tree)
+        except InterpolationResolutionError:
+            raise
+        except Exception as exc:
+            # Other kinds of exceptions are wrapped in an `InterpolationResolutionError`.
+            raise InterpolationResolutionError(
+                f"{type(exc).__name__} raised while resolving interpolation: {exc}"
+            ).with_traceback(sys.exc_info()[2])
+
+    def _invalidate_flags_cache(self) -> None:
+        from .dictconfig import DictConfig
+        from .listconfig import ListConfig
+        from .tupleconfig import TupleConfig
+
+        # invalidate subtree cache only if the cache is initialized in this node.
+
+        if self.__dict__["_flags_cache"] is not None:
+            self.__dict__["_flags_cache"] = None
+            if isinstance(self, DictConfig):
+                content = self.__dict__["_content"]
+                if isinstance(content, dict):
+                    for value in self.__dict__["_content"].values():
+                        value._invalidate_flags_cache()
+            elif isinstance(self, (ListConfig, TupleConfig)):
+                content = self.__dict__["_content"]
+                if isinstance(content, list):
+                    for item in self.__dict__["_content"]:
+                        item._invalidate_flags_cache()
+
+
+class SCMode(Enum):
+    DICT = 1  # Convert to plain dict
+    DICT_CONFIG = 2  # Keep as OmegaConf DictConfig
+    INSTANTIATE = 3  # Create a dataclass or attrs class instance
+
+
+class UnionNode(Box):
+    """
+    This class handles Union type hints. The `_content` attribute is either a
+    child node that is compatible with the given Union ref_type, or it is a
+    special value (None or MISSING or interpolation).
+
+    Much of the logic for e.g. value assignment and type validation is
+    delegated to the child node. As such, UnionNode functions as a
+    "pass-through" node. User apps and downstream libraries should not need to
+    know about UnionNode (assuming they only use OmegaConf's public API).
+    """
+
+    _parent: Container | None  # pyrefly: ignore[bad-override]
+    _content: Node | str | None
+
+    def __init__(
+        self,
+        content: Any,
+        ref_type: Any,
+        is_optional: bool = True,
+        key: Any = None,
+        parent: Box | None = None,
+    ) -> None:
+        try:
+            if not is_union_annotation(ref_type):  # pragma: no cover
+                msg = (
+                    f"UnionNode got unexpected ref_type {ref_type}. Please file a bug"
+                    + " report at https://github.com/hydra-ecosystem/omegaconf/issues"
+                )
+                raise AssertionError(msg)
+            if not isinstance(parent, (Container, NoneType)):
+                raise ConfigTypeError("Parent type is not omegaconf.Container")
+            super().__init__(
+                parent=parent,
+                metadata=Metadata(
+                    ref_type=ref_type,
+                    object_type=None,
+                    optional=is_optional,
+                    key=key,
+                    flags={"convert": False},
+                ),
+            )
+            self._set_value(content)
+        except Exception as ex:
+            format_and_raise(node=None, key=key, value=content, msg=str(ex), cause=ex)
+
+    def _get_full_key(self, key: DictKeyType | int | None) -> str:
+        parent = self._get_parent()
+        if parent is None:
+            if self._metadata.key is None:
+                return ""
+            else:
+                return str(self._metadata.key)
+        else:
+            return parent._get_full_key(self._metadata.key)
+
+    def _invalidate_flags_cache(self) -> None:
+        if self.__dict__["_flags_cache"] is not None:
+            super()._invalidate_flags_cache()
+            content = self.__dict__["_content"]
+            if isinstance(content, Node):
+                content._invalidate_flags_cache()
+
+    def __eq__(self, other: Any) -> bool:
+        content = self.__dict__["_content"]
+        if isinstance(content, Node):
+            ret = content.__eq__(other)
+        elif isinstance(other, Node):
+            ret = other.__eq__(content)
+        else:
+            ret = content.__eq__(other)
+        assert isinstance(ret, (bool, type(NotImplemented)))
+        return ret
+
+    def __ne__(self, other: Any) -> bool:
+        x = self.__eq__(other)
+        if x is NotImplemented:
+            return NotImplemented
+        return not x
+
+    def __hash__(self) -> int:
+        return hash(self.__dict__["_content"])
+
+    def _value(self) -> Node | str | None:
+        content = self.__dict__["_content"]
+        assert isinstance(content, (Node, NoneType, str))
+        return content
+
+    def _set_value(self, value: Any, flags: dict[str, bool] | None = None) -> None:
+        previous_content = self.__dict__["_content"]
+        previous_metadata = self.__dict__["_metadata"]
+        try:
+            self._set_value_impl(value, flags)
+        except Exception as e:
+            self.__dict__["_content"] = previous_content
+            self.__dict__["_metadata"] = previous_metadata
+            raise e
+
+    def _set_value_impl(self, value: Any, flags: dict[str, bool] | None = None) -> None:
+        from omegaconf._utils import is_literal_annotation
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.omegaconf import _node_wrap
+        from omegaconf.tupleconfig import TupleConfig
+
+        ref_type = self._metadata.ref_type
+        type_hint = self._metadata.type_hint
+
+        value = _get_value(value)
+        if _is_special(value) and not (
+            value is None
+            and not self._is_optional()
+            and type_hint_contains_none_literal(ref_type)
+        ):
+            assert isinstance(value, (str, NoneType))
+            if value is None and not self._is_optional():
+                raise ValidationError(
+                    f"Value '$VALUE' is incompatible with type hint '{type_str(type_hint)}'"
+                )
+            self.__dict__["_content"] = value
+        elif is_structured_config(value):
+            structured_candidates = [
+                t for t in ref_type.__args__ if is_structured_config(t)
+            ]
+            selected = select_structured_config_union_member(
+                value=value, candidates=structured_candidates
+            )
+            if selected is None:
+                raise ValidationError(
+                    f"Value '$VALUE' of type '$VALUE_TYPE' is incompatible with type hint '{type_str(type_hint)}'"
+                )
+            self._set_structured_config_value(value=value, ref_type=selected)
+        elif isinstance(value, (list, tuple, ListConfig, TupleConfig)):
+            sequence_candidates = [
+                t
+                for t in ref_type.__args__
+                if is_list_annotation(t) or is_tuple_annotation(t)
+            ]
+            input_is_tuple = isinstance(value, (tuple, TupleConfig))
+            preferred_candidates = [
+                t
+                for t in sequence_candidates
+                if is_tuple_annotation(t) == input_is_tuple
+            ]
+            fallback_candidates = [
+                t for t in sequence_candidates if t not in preferred_candidates
+            ]
+            self._set_container_value(
+                value=value,
+                candidates=preferred_candidates,
+                fallback_candidates=fallback_candidates,
+                type_hint=type_hint,
+            )
+        elif isinstance(value, (dict, Container)):
+            self._set_mapping_value(value=value, type_hint=type_hint)
+        else:
+            # An exact Literal match takes precedence over a broader scalar type.
+            candidates = sorted(
+                ref_type.__args__, key=lambda t: not is_literal_annotation(t)
+            )
+            for candidate_ref_type in candidates:
+                try:
+                    self.__dict__["_content"] = _node_wrap(
+                        value=value,
+                        ref_type=candidate_ref_type,
+                        is_optional=False,
+                        key=None,
+                        parent=self,
+                    )
+                    break
+                except ValidationError:
+                    continue
+            else:
+                raise ValidationError(
+                    f"Value '$VALUE' of type '$VALUE_TYPE' is incompatible with type hint '{type_str(type_hint)}'"
+                )
+
+    def _set_mapping_value(self, value: Any, type_hint: Any) -> None:
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.omegaconf import _node_wrap
+
+        ref_type = self._metadata.ref_type
+        structured_candidates = [
+            t for t in ref_type.__args__ if is_structured_config(t)
+        ]
+        dict_candidates = [t for t in ref_type.__args__ if is_dict_annotation(t)]
+
+        if not structured_candidates:
+            self._set_container_value(
+                value=value,
+                candidates=dict_candidates,
+                type_hint=type_hint,
+            )
+            return
+
+        selected = select_structured_config_union_member(
+            value=value, candidates=structured_candidates
+        )
+        if selected is not None:
+            self._set_structured_config_value(value=value, ref_type=selected)
+            return
+
+        is_explicitly_typed_dict = isinstance(value, DictConfig) and (
+            value._metadata.ref_type not in (Any, dict)
+            or value._metadata.key_type is not Any
+            or value._metadata.element_type is not Any
+        )
+        if is_explicitly_typed_dict and dict_candidates:
+            self._set_container_value(
+                value=value,
+                candidates=dict_candidates,
+                type_hint=type_hint,
+            )
+            return
+
+        content = self.__dict__["_content"]
+        if isinstance(content, DictConfig):
+            active_ref_type = content._metadata.ref_type
+            if is_structured_config(active_ref_type):
+                self._set_structured_config_value(value=value, ref_type=active_ref_type)
+                return
+            if active_ref_type in dict_candidates:
+                node = _node_wrap(
+                    value=value,
+                    ref_type=active_ref_type,
+                    is_optional=False,
+                    key=None,
+                    parent=None,
+                )
+                node._set_parent(self)
+                self.__dict__["_content"] = node
+                return
+
+        mapping_candidates = structured_candidates + dict_candidates
+        if len(mapping_candidates) == 1:
+            self._set_structured_config_value(
+                value=value, ref_type=mapping_candidates[0]
+            )
+            return
+
+        matching_types = ", ".join(type_str(t) for t in mapping_candidates)
+        raise ValidationError(
+            f"Ambiguous assignment to {type_str(type_hint)}. "
+            f"Mapping value matches multiple union members: {matching_types}. "
+            f"Use a typed value to select a branch."
+        )
+
+    def _set_structured_config_value(self, value: Any, ref_type: Any) -> None:
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.omegaconf import _node_wrap, flag_override
+
+        value_is_mapping = isinstance(value, (dict, DictConfig)) and not (
+            isinstance(value, DictConfig)
+            and is_structured_config(value._metadata.object_type)
+        )
+        with flag_override(self, "convert", True):
+            if value_is_mapping:
+                node = _node_wrap(
+                    value=ref_type,
+                    ref_type=ref_type,
+                    is_optional=False,
+                    key=None,
+                    parent=self,
+                )
+            else:
+                node = _node_wrap(
+                    value=value,
+                    ref_type=ref_type,
+                    is_optional=False,
+                    key=None,
+                    parent=self,
+                )
+            assert isinstance(node, DictConfig)
+            node._set_flag("convert", True)
+            if value_is_mapping:
+                node._merge_with(value, _allow_readonly_target=True)
+        self.__dict__["_content"] = node
+
+    def _set_container_value(
+        self,
+        value: Any,
+        candidates: list[Any],
+        type_hint: Any,
+        fallback_candidates: list[Any] | None = None,
+    ) -> None:
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.omegaconf import _node_wrap
+        from omegaconf.tupleconfig import TupleConfig
+
+        from ._utils import (
+            get_dict_key_value_types,
+            get_list_element_type,
+            get_tuple_item_types,
+            normalize_tuple_annotation,
+        )
+
+        # For an already-typed container (from typed_list/typed_dict or another
+        # structured config), use its element-type metadata to narrow candidates
+        # before falling back to content-based validation. This makes empty
+        # containers unambiguous when the metadata uniquely identifies one branch.
+        def narrow_by_metadata(candidate_types: list[Any]) -> list[Any]:
+            meta_candidates: list[Any] = []
+            if (
+                isinstance(value, ListConfig)
+                and value._metadata.element_type is not Any
+            ):
+                meta_candidates = [
+                    t
+                    for t in candidate_types
+                    if is_list_annotation(t)
+                    and get_list_element_type(t) == value._metadata.element_type
+                ]
+            elif isinstance(value, TupleConfig):
+                value_type = normalize_tuple_annotation(value._metadata.ref_type)
+                value_item_types = get_tuple_item_types(value_type)
+                meta_candidates = [
+                    t
+                    for t in candidate_types
+                    if is_tuple_annotation(t)
+                    and get_tuple_item_types(normalize_tuple_annotation(t))
+                    == value_item_types
+                ]
+            elif isinstance(value, Container) and not isinstance(
+                value, (ListConfig, TupleConfig)
+            ):
+                vkey, vval = get_dict_key_value_types(value._metadata.ref_type)
+                if vkey is not Any or vval is not Any:
+                    meta_candidates = [
+                        t
+                        for t in candidate_types
+                        if is_dict_annotation(t)
+                        and get_dict_key_value_types(t) == (vkey, vval)
+                    ]
+            return meta_candidates or candidate_types
+
+        def find_matches(candidate_types: list[Any]) -> list[Node]:
+            matches: list[Node] = []
+            for candidate_ref_type in narrow_by_metadata(candidate_types):
+                try:
+                    with _conversion_warnings(False):
+                        node = _node_wrap(
+                            value=value,
+                            ref_type=candidate_ref_type,
+                            is_optional=False,
+                            key=None,
+                            parent=self,
+                        )
+                    matches.append(node)
+                    if len(matches) > 1:
+                        break
+                except Exception:
+                    continue
+            return matches
+
+        matches = find_matches(candidates)
+        if len(matches) == 0 and fallback_candidates:
+            matches = find_matches(fallback_candidates)
+
+        if len(matches) == 0:
+            raise ValidationError(
+                f"Value '$VALUE' of type '$VALUE_TYPE' is incompatible with type hint '{type_str(type_hint)}'"
+            )
+        elif len(matches) == 1:
+            selected = matches[0]
+            if _conversion_warning_mode.get() is True:
+                selected = _node_wrap(
+                    value=value,
+                    ref_type=selected._metadata.ref_type,
+                    is_optional=False,
+                    key=None,
+                    parent=self,
+                )
+            self.__dict__["_content"] = selected
+        else:
+            matching_types = ", ".join(type_str(n._metadata.ref_type) for n in matches)
+            raise ValidationError(
+                f"Ambiguous assignment to {type_str(type_hint)}. "
+                f"Value '$VALUE' matches multiple union members: {matching_types}. "
+                f"Use an explicitly typed container to disambiguate."
+            )
+
+    def _is_optional(self) -> bool:
+        return self.__dict__["_metadata"].optional is True
+
+    def _is_interpolation(self) -> bool:
+        return _is_interpolation(self.__dict__["_content"])
+
+    def __str__(self) -> str:
+        return str(self.__dict__["_content"])
+
+    def __repr__(self) -> str:
+        return repr(self.__dict__["_content"])
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "UnionNode":
+        res = object.__new__(type(self))
+        for key, value in self.__dict__.items():
+            if key not in ("_content", "_parent"):
+                res.__dict__[key] = copy.deepcopy(value, memo=memo)
+
+        src_content = self.__dict__["_content"]
+        if isinstance(src_content, Node):
+            old_parent = src_content.__dict__["_parent"]
+            try:
+                src_content.__dict__["_parent"] = None
+                content_copy = copy.deepcopy(src_content, memo=memo)
+                content_copy.__dict__["_parent"] = res
+            finally:
+                src_content.__dict__["_parent"] = old_parent
+        else:
+            # None and strings can be assigned as is
+            content_copy = src_content
+
+        res.__dict__["_content"] = content_copy
+        res.__dict__["_parent"] = self.__dict__["_parent"]
+        return res

@@ -1,0 +1,285 @@
+# -*- encoding: utf-8 -*-
+# @Author: SWHL
+# @Contact: liekkaskono@163.com
+from ctypes import string_at
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Optional, Union
+
+import cv2
+import numpy as np
+import requests
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from .utils import is_url
+
+root_dir = Path(__file__).resolve().parent
+
+
+class MemoryImage:
+    def __init__(self, address: int, length: int):
+        self.address = address
+        self.length = length
+
+
+class RawMemoryImage:
+    """Metadata needed to read an uncompressed pixel buffer by address."""
+
+    def __init__(
+        self,
+        address: int,
+        length: int,
+        width: int,
+        height: int,
+        pixel_format: str = "BGRA",
+        stride: Optional[int] = None,
+        bottom_up: bool = False,
+    ):
+        self.address = address
+        self.length = length
+        self.width = width
+        self.height = height
+        self.pixel_format = pixel_format
+        self.stride = stride
+        self.bottom_up = bottom_up
+
+
+InputType = Union[
+    str, np.ndarray, bytes, Path, Image.Image, MemoryImage, RawMemoryImage
+]
+
+
+class LoadImage:
+    def __init__(self):
+        pass
+
+    def __call__(self, img: InputType) -> np.ndarray:
+        if not isinstance(img, InputType.__args__):
+            raise LoadImageError(
+                f"The img type {type(img)} does not in {InputType.__args__}"
+            )
+
+        origin_img_type = type(img)
+        img = self.load_img(img)
+        img = self.convert_img(img, origin_img_type)
+        return img
+
+    def load_img(self, img: InputType) -> np.ndarray:
+        if isinstance(img, (str, Path)):
+            if is_url(str(img)):
+                img = Image.open(requests.get(img, stream=True, timeout=60).raw)
+            else:
+                self.verify_exist(img)
+                img = Image.open(img)
+
+            img = self.exif_transpose(img)
+
+            try:
+                img = self.img_to_ndarray(img)
+            except UnidentifiedImageError as e:
+                raise LoadImageError(f"cannot identify image file {img}") from e
+            return img
+
+        if isinstance(img, bytes):
+            img = self.img_to_ndarray(Image.open(BytesIO(img)))
+            return img
+
+        if isinstance(img, np.ndarray):
+            return img
+
+        if isinstance(img, Image.Image):
+            return self.img_to_ndarray(img)
+
+        if isinstance(img, MemoryImage):
+            try:
+                return self.load_memory_image(img)
+            except Exception as e:
+                raise LoadImageError("MemoryImage loading failed.") from e
+
+        if isinstance(img, RawMemoryImage):
+            try:
+                return self.load_raw_memory_image(img)
+            except Exception as e:
+                raise LoadImageError(f"RawMemoryImage loading failed: {e}") from e
+
+        raise LoadImageError(f"{type(img)} is not supported!")
+
+    @staticmethod
+    def verify_exist(file_path: Union[str, Path]):
+        if not Path(file_path).exists():
+            raise LoadImageError(f"{file_path} does not exist.")
+
+    @staticmethod
+    def exif_transpose(img: Image.Image) -> Image.Image:
+        try:
+            img_corrected = ImageOps.exif_transpose(img)
+            if img_corrected is None:
+                return img
+            return img_corrected
+        except Exception as e:
+            return img
+
+    def img_to_ndarray(self, img: Image.Image) -> np.ndarray:
+        if img.mode == "1":
+            img = img.convert("L")
+            return np.array(img)
+        return np.array(img)
+
+    def convert_img(self, img: np.ndarray, origin_img_type: Any) -> np.ndarray:
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        if img.ndim == 3:
+            channel = img.shape[2]
+            if channel == 1:
+                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+            if channel == 2:
+                return self.cvt_two_to_three(img)
+
+            if channel == 3:
+                if issubclass(origin_img_type, (str, Path, bytes, Image.Image)):
+                    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                return img
+
+            if channel == 4:
+                return self.cvt_four_to_three(img)
+
+            raise LoadImageError(
+                f"The channel({channel}) of the img is not in [1, 2, 3, 4]"
+            )
+
+        raise LoadImageError(f"The ndim({img.ndim}) of the img is not in [2, 3]")
+
+    @staticmethod
+    def cvt_two_to_three(img: np.ndarray) -> np.ndarray:
+        """gray + alpha → BGR"""
+        img_gray = img[..., 0]
+        img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+
+        img_alpha = img[..., 1]
+        not_a = cv2.bitwise_not(img_alpha)
+        not_a = cv2.cvtColor(not_a, cv2.COLOR_GRAY2BGR)
+
+        new_img = cv2.bitwise_and(img_bgr, img_bgr, mask=img_alpha)
+        new_img = cv2.add(new_img, not_a)
+        return new_img
+
+    @staticmethod
+    def cvt_four_to_three(img: np.ndarray) -> np.ndarray:
+        """自动调整背景颜色，以增强文字对比度"""
+
+        rgb = img[:, :, :3]  # shape (H, W, 3)
+        alpha = img[:, :, 3]  # shape (H, W)
+
+        # 获取非透明区域的 RGB 像素
+        mask = alpha > 0
+        non_transparent_rgb = rgb[mask]  # shape (N, 3)
+        if non_transparent_rgb.size == 0:
+            # 全透明图像：默认用白色背景
+            bg_color = (255, 255, 255)
+        else:
+            # 使用加权灰度公式计算亮度均值
+            # luminance = 0.299*R + 0.587*G + 0.114*B
+            r, g, b = (
+                non_transparent_rgb[:, 0],
+                non_transparent_rgb[:, 1],
+                non_transparent_rgb[:, 2],
+            )
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            avg_luminance = np.mean(luminance)
+
+            # 根据平均亮度选择高对比度背景
+            bg_color = (255, 255, 255) if avg_luminance < 128 else (0, 0, 0)
+
+        # 构建背景图像
+        background = np.full_like(rgb, bg_color, dtype=np.uint8)
+
+        # 合成：前景 = rgb * (alpha/255), 背景 = bg * (1 - alpha/255)
+        alpha_norm = alpha.astype(np.float32) / 255.0
+        foreground_blend = rgb.astype(np.float32) * alpha_norm[..., None]
+        background_blend = background.astype(np.float32) * (1.0 - alpha_norm)[..., None]
+
+        blended = (foreground_blend + background_blend).astype(np.uint8)
+
+        return cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
+
+    def load_memory_image(self, img: MemoryImage) -> np.ndarray:
+        if img.address <= 0 or img.length <= 0:
+            raise LoadImageError("invalid memory address or length")
+
+        encoded = string_at(img.address, img.length)
+        arr = np.frombuffer(encoded, dtype=np.uint8)
+        result = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+        if result is None:
+            raise LoadImageError("cannot decode image from memory")
+
+        return result
+
+    @staticmethod
+    def load_raw_memory_image(img: RawMemoryImage) -> np.ndarray:
+        if img.address <= 0 or img.length <= 0:
+            raise LoadImageError("invalid memory address or length")
+        if img.width <= 0 or img.height <= 0:
+            raise LoadImageError("width and height must be positive")
+
+        pixel_format = str(img.pixel_format).upper()
+        channels_by_format = {
+            "GRAY": 1,
+            "GRAY8": 1,
+            "BGR": 3,
+            "BGR24": 3,
+            "RGB": 3,
+            "RGB24": 3,
+            "BGRA": 4,
+            "BGRA32": 4,
+            "BGRX": 4,
+            "RGBA": 4,
+            "RGBA32": 4,
+            "RGBX": 4,
+        }
+        channels = channels_by_format.get(pixel_format)
+        if channels is None:
+            supported = ", ".join(channels_by_format)
+            raise LoadImageError(
+                f"unsupported pixel format {img.pixel_format!r}; supported: {supported}"
+            )
+
+        row_bytes = img.width * channels
+        stride = row_bytes if img.stride is None else img.stride
+        if stride < row_bytes:
+            raise LoadImageError(
+                f"stride ({stride}) is smaller than row size ({row_bytes})"
+            )
+
+        required_length = stride * img.height
+        if img.length < required_length:
+            raise LoadImageError(
+                f"buffer is too small: need {required_length} bytes, got {img.length}"
+            )
+
+        raw = string_at(img.address, required_length)
+        rows = np.frombuffer(raw, dtype=np.uint8).reshape(img.height, stride)
+        pixels = rows[:, :row_bytes]
+        if channels == 1:
+            pixels = pixels.reshape(img.height, img.width)
+        else:
+            pixels = pixels.reshape(img.height, img.width, channels)
+
+        if img.bottom_up:
+            pixels = pixels[::-1]
+
+        if pixel_format in {"GRAY", "GRAY8"}:
+            return cv2.cvtColor(pixels, cv2.COLOR_GRAY2BGR)
+        if pixel_format in {"RGB", "RGB24"}:
+            return cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+        if pixel_format in {"BGRA", "BGRA32", "BGRX"}:
+            return cv2.cvtColor(pixels, cv2.COLOR_BGRA2BGR)
+        if pixel_format in {"RGBA", "RGBA32", "RGBX"}:
+            return cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGR)
+        return np.ascontiguousarray(pixels)
+
+
+class LoadImageError(Exception):
+    pass
