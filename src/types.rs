@@ -295,13 +295,20 @@ pub fn resolve_full_word_token<'a>(word_text: &'a str, line_text: &'a str) -> &'
 
     // 2. If short fragment (1-2 chars), expand to the longer surrounding token in line
     if clean_word.chars().count() <= 2 {
+        let mut candidate: Option<&str> = None;
         for tok in &tokens {
             let clean_tok = extract_word_token(tok);
             if clean_tok.chars().count() > clean_word.chars().count()
                 && clean_tok.to_ascii_uppercase().contains(&clean_word.to_ascii_uppercase())
             {
-                return clean_tok;
+                if candidate.is_some_and(|previous| !previous.eq_ignore_ascii_case(clean_tok)) {
+                    return clean_word;
+                }
+                candidate = Some(clean_tok);
             }
+        }
+        if let Some(candidate) = candidate {
+            return candidate;
         }
     }
 
@@ -314,7 +321,10 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         return None;
     }
 
-    let all_lines: Vec<RecognizedLine> = blocks.iter().flat_map(|b| b.lines.clone()).collect();
+    let all_lines: Vec<(&OcrBlock, usize)> = blocks
+        .iter()
+        .flat_map(|block| (0..block.lines.len()).map(move |idx| (block, idx)))
+        .collect();
     if all_lines.is_empty() {
         return None;
     }
@@ -350,7 +360,8 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
 
     let mut best_line_match: Option<(usize, (i64, i64, i64))> = None;
 
-    for (idx, line) in all_lines.iter().enumerate() {
+    for (idx, (block, line_idx)) in all_lines.iter().enumerate() {
+        let line = &block.lines[*line_idx];
         let l_dist = dist_to_rect(&line.rect, px, py);
         if l_dist <= LINE_MAX_DISTANCE {
             let l_score = candidate_score(&line.rect);
@@ -365,7 +376,8 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
     }
 
     let (best_idx, _) = best_line_match?;
-    let line = &all_lines[best_idx];
+    let (block, line_idx) = all_lines[best_idx];
+    let line = &block.lines[line_idx];
 
     let mut best_word_match: Option<(&RecognizedWord, (i64, i64, i64))> = None;
     for word in &line.words {
@@ -400,10 +412,10 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         }
     }
 
-    let context_indices = collect_context_lines(&all_lines, best_idx);
+    let context_indices = collect_context_lines(&block.lines, line_idx);
     let s_text = context_indices
         .iter()
-        .map(|&i| all_lines[i].text.trim())
+        .map(|&i| block.lines[i].text.trim())
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
@@ -414,7 +426,7 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
 
     let s_rect = context_indices
         .iter()
-        .fold(line.rect, |acc, &i| acc.union(&all_lines[i].rect));
+        .fold(line.rect, |acc, &i| acc.union(&block.lines[i].rect));
 
     let (w_text_opt, w_rect_opt) = if let Some((word, _)) = best_word_match {
         let raw_word = word.text.trim();
@@ -1498,4 +1510,31 @@ mod tests {
         assert_eq!(found.word_text.as_deref(), Some("INSTRUCTIONS"));
         assert_eq!(found.sentence_text, "PLEASE FOLLOW INSTRUCTIONS!");
     }
+
+    #[test]
+    fn test_ambiguous_word_fragment_stays_a_fragment() {
+        assert_eq!(resolve_full_word_token("IN", "JOIN INSTRUCTIONS"), "IN");
+        assert_eq!(resolve_full_word_token("IN", "FOLLOW INSTRUCTIONS"), "INSTRUCTIONS");
+    }
+
+    #[test]
+    fn test_cursor_context_stays_in_selected_block() {
+        let make_block = |text: &str, y| {
+            let rect = ScreenRect::new(100, y, 180, 20);
+            OcrBlock {
+                text: text.to_string(), rect,
+                lines: vec![RecognizedLine {
+                    text: text.to_string(), rect,
+                    words: vec![RecognizedWord { text: text.to_string(), rect }],
+                }],
+            }
+        };
+        let blocks = vec![make_block("FIRST PANEL", 100), make_block("SECOND PANEL", 132)];
+        let selected = find_text_under_cursor(&blocks, 110, 110).unwrap();
+        assert_eq!(selected.sentence_text, "FIRST PANEL");
+        assert_eq!(selected.sentence_rect, blocks[0].rect);
+        let selected = find_text_under_cursor(&blocks, 110, 142).unwrap();
+        assert_eq!(selected.sentence_text, "SECOND PANEL");
+    }
+
 }

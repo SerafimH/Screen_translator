@@ -131,7 +131,19 @@ impl FrameSignature {
 
     /// Determines if dialogue line has meaningfully changed beyond the noise threshold.
     pub fn has_changed(&self, previous: &FrameSignature) -> bool {
-        self.mad(previous) >= DELTA_THRESHOLD
+        if self.mad(previous) >= DELTA_THRESHOLD {
+            return true;
+        }
+        self.luma
+            .chunks(SIGNATURE_COLS)
+            .zip(previous.luma.chunks(SIGNATURE_COLS))
+            .any(|(row, old_row)| {
+                row.windows(3).zip(old_row.windows(3)).any(|(run, old_run)| {
+                    run.iter().zip(old_run).all(|(&a, &b)| {
+                        (a as f32 - b as f32).abs() >= DELTA_THRESHOLD
+                    })
+                })
+            })
     }
 }
 
@@ -222,8 +234,9 @@ impl GraphicsCaptureApiHandler for WinrtSingleFrameCapture {
         let width = frame.width();
         let height = frame.height();
 
-        if let Ok(mut frame_buf) = frame.buffer() {
-            let raw_bytes = frame_buf.as_raw_buffer();
+        if let Ok(frame_buf) = frame.buffer() {
+            let mut packed = Vec::new();
+            let raw_bytes = frame_buf.as_nopadding_buffer(&mut packed);
             let (final_bytes, final_w, final_h, off_x, off_y) = match self.roi {
                 Some(r) => {
                     let rx = (r.x - self.monitor_origin.0).clamp(0, width as i32) as u32;
@@ -692,4 +705,24 @@ mod tests {
         assert_eq!(winrt_consecutive_timeouts(), 0);
         assert!(is_winrt_available());
     }
+
+    #[test]
+    fn test_signature_detects_local_subtitle_changes() {
+        let (width, height) = (1920, 1080);
+        let original = vec![220u8; width * height * 4];
+        let mut changed = original.clone();
+        for y in 900..960 {
+            for x in 800..1100 {
+                if x % 10 < 2 {
+                    let i = (y * width + x) * 4;
+                    changed[i..i + 3].fill(0);
+                }
+            }
+        }
+        let first = FrameSignature::from_bgra(&original, width as u32, height as u32);
+        let second = FrameSignature::from_bgra(&changed, width as u32, height as u32);
+        assert!(first.mad(&second) < DELTA_THRESHOLD);
+        assert!(second.has_changed(&first));
+    }
+
 }

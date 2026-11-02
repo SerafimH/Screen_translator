@@ -492,9 +492,11 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str,
     res_b = call_engine(ocr_exec, crop_neg)
     lines_b = extract_lines_from_result(res_b)
     for lb in lines_b:
+        _shift_box_coords(lb, x1, y1)
+        if _compute_box_iou(box, lb["box"]) <= 0.5:
+            continue
         eval_b = score_ocr_candidate(lb.get("text", ""), float(lb.get("score", 0.0) or 0.0))
         if eval_b > best_eval + 0.05:
-            _shift_box_coords(lb, x1, y1)
             best_eval = eval_b
             best_cand = lb
 
@@ -504,9 +506,11 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str,
     res_c = call_engine(ocr_exec, crop_mask)
     lines_c = extract_lines_from_result(res_c)
     for lc in lines_c:
+        _shift_box_coords(lc, x1, y1)
+        if _compute_box_iou(box, lc["box"]) <= 0.5:
+            continue
         eval_c = score_ocr_candidate(lc.get("text", ""), float(lc.get("score", 0.0) or 0.0))
         if eval_c > best_eval + 0.05:
-            _shift_box_coords(lc, x1, y1)
             best_eval = eval_c
             best_cand = lc
 
@@ -669,6 +673,12 @@ def process_request(
             cv2 is not None and np is not None and isinstance(img_bgr, np.ndarray),
         )
 
+        use_variants = (
+            not use_upscale
+            and os.environ.get(SCREEN_TRANSLATOR_OCR_VARIANTS_ENV) == "1"
+            and np is not None
+            and isinstance(img_bgr, np.ndarray)
+        )
         if use_upscale:
             up_w = width * UPSCALE_SMALL_FRAMES
             up_h = height * UPSCALE_SMALL_FRAMES
@@ -678,11 +688,7 @@ def process_request(
             result = call_engine(ocr_exec, img_up)
             raw_lines = extract_lines_from_result(result)
             raw_lines = rescale_boxes_down(raw_lines, UPSCALE_SMALL_FRAMES)
-        elif (
-            os.environ.get(SCREEN_TRANSLATOR_OCR_VARIANTS_ENV) == "1"
-            and np is not None
-            and isinstance(img_bgr, np.ndarray)
-        ):
+        elif use_variants:
             lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
                 img_bgr, ocr_exec
             )
@@ -701,6 +707,8 @@ def process_request(
             raw_lines = refined
 
         kept_lines, rejected_lines = filter_ocr_lines(raw_lines)
+        if use_variants:
+            kept_lines = merge_ocr_lines([kept_lines])
 
         if os.environ.get(SCREEN_TRANSLATOR_OCR_DEBUG_ENV) == "1":
             rejection_map = {id(item): reason for item, reason in rejected_lines}

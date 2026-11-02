@@ -454,53 +454,9 @@ pub fn clean_ocr_noise(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// Checks whether a text string or sentence is translatable, filtering out OCR garbage
-/// (e.g. strings with < 50% alphanumeric characters, or symbol noise like "I@II#O*$").
+/// Uses the same text acceptance rules as OCR, including short dialogue with punctuation.
 pub fn is_translatable_text(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    let alpha_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
-    let digit_count = trimmed.chars().filter(|c| c.is_numeric()).count();
-    let total_non_space = trimmed.chars().filter(|c| !c.is_whitespace()).count();
-
-    if total_non_space == 0 {
-        return false;
-    }
-
-    // Pure numbers like "100" or "+50" are legitimate HUD metrics
-    if alpha_count == 0 && digit_count > 0 {
-        return trimmed
-            .trim_matches(|c: char| c == '+' || c == '-' || c == '$' || c == '%' || c == '#')
-            .parse::<f64>()
-            .is_ok();
-    }
-
-    if alpha_count == 0 {
-        return false;
-    }
-
-    let meaningful = alpha_count + digit_count;
-    let ratio = meaningful as f32 / total_non_space as f32;
-    if ratio < 0.50 {
-        return false;
-    }
-
-    // Typical title page / artifact symbols like @, #, $, *, ~, |, \, • (e.g. "I@II#O*$", "•PA")
-    let harsh_symbols = trimmed
-        .chars()
-        .filter(|c| matches!(c, '@' | '#' | '$' | '*' | '~' | '|' | '\\' | '^' | '•' | '·' | '●' | '○'))
-        .count();
-    if harsh_symbols >= 1
-        && (trimmed.chars().any(|c| matches!(c, '•' | '·' | '●' | '○')) || harsh_symbols >= 2)
-        && (harsh_symbols as f32 / total_non_space as f32) >= 0.25
-    {
-        return false;
-    }
-
-    true
+    !crate::ocr::is_ocr_garbage(text)
 }
 
 /// Checks whether a single token is a valid word for dictionary lookup (only letters, apostrophes, and hyphens).
@@ -1593,7 +1549,7 @@ impl TranslatorService {
 
         if details.primary.is_empty() {
             match self
-                .translate_text(normalized, source_lang, target_lang, config)
+                .translate_normalized_text(&normalize_all_caps(normalized), source_lang, target_lang, config, true)
                 .await
             {
                 Ok(fallback_trans) => {
@@ -1737,9 +1693,9 @@ impl TranslatorService {
         &self,
         blocks: &[OcrBlock],
         config: &AppConfig,
-    ) -> Vec<TranslationBlock> {
+    ) -> (Vec<TranslationBlock>, bool) {
         if blocks.is_empty() {
-            return Vec::new();
+            return (Vec::new(), true);
         }
 
         let cleaned_texts: Vec<String> = blocks
@@ -1776,7 +1732,7 @@ impl TranslatorService {
         }
 
         if all_cached {
-            return blocks
+            return (blocks
                 .iter()
                 .zip(cached_results)
                 .map(|(b, trans)| TranslationBlock {
@@ -1784,108 +1740,79 @@ impl TranslatorService {
                     translated_text: trans.unwrap_or_else(|| b.text.clone()),
                     rect: b.rect,
                 })
-                .collect();
+                .collect(), true);
         }
 
-        // 2. Context-aware batch translation when multiple dialogue bubbles are present
-        if blocks.len() > 1 && config.provider == TranslationProvider::Google {
-            let delimiter = "\n[---]\n";
-            let combined = cleaned_texts.join(delimiter);
+        // Only unresolved blocks go to providers; filtered text stays in its original slot.
+        let uncached_indices: Vec<usize> = cached_results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| if c.is_none() { Some(i) } else { None })
+            .collect();
+        let text_refs: Vec<&str> = uncached_indices
+            .iter()
+            .map(|&i| cleaned_texts[i].as_str())
+            .collect();
 
-            if let Ok(batch_translated) = self
+        // 2. Context-aware batch translation
+        let batch_result = if text_refs.len() > 1 && config.provider == TranslationProvider::Google {
+            let combined = text_refs.join("\n[---]\n");
+            Some(self
                 .translate_provider_raw(&combined, &config.source_lang, &config.target_lang, config)
                 .await
-            {
-                let parts: Vec<&str> = batch_translated.split("[---]").collect();
-                if parts.len() == blocks.len() {
-                    let mut results = Vec::with_capacity(blocks.len());
-                    for (i, part) in parts.iter().enumerate() {
-                        let clean_part = clean_russian_punctuation(part.trim());
-                        let final_text = self.context.postprocess(&clean_part);
-                        let key = format!(
-                            "{}:{}:{}:{}",
-                            config.provider.as_str(),
-                            config.source_lang,
-                            config.target_lang,
-                            cleaned_texts[i]
-                        );
-                        self.cache.insert(key, final_text.clone());
-                        self.context
-                            .record_translation(cleaned_texts[i].clone(), final_text.clone());
-
-                        results.push(TranslationBlock {
-                            original_text: blocks[i].text.clone(),
-                            translated_text: final_text,
-                            rect: blocks[i].rect,
-                        });
-                    }
-                    return results;
-                }
-            }
-        }
-
-        if blocks.len() > 1
+                .map(|translated| translated.split("[---]").map(str::to_string).collect::<Vec<_>>()))
+        } else if blocks.len() > 1
             && config.provider == TranslationProvider::DeepL
             && let Some(key) = &config.deepl_api_key
         {
-            let uncached_indices: Vec<usize> = cached_results
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| if c.is_none() { Some(i) } else { None })
-                .collect();
+            let ctx = self.context.format_history_context();
+            Some(self
+                .translate_deepl_batch(
+                    &text_refs,
+                    &config.source_lang,
+                    &config.target_lang,
+                    key,
+                    &ctx,
+                )
+                .await)
+        } else {
+            None
+        };
 
-            if !uncached_indices.is_empty() {
-                let text_refs: Vec<&str> = uncached_indices
+        if let Some(Ok(batch_translated)) = batch_result
+            && batch_translated.len() == uncached_indices.len()
+        {
+            let mut processed_translations = Vec::with_capacity(batch_translated.len());
+            for (&idx, trans) in uncached_indices.iter().zip(batch_translated) {
+                let clean_part = clean_russian_punctuation(trans.trim());
+                let final_text = self.context.postprocess(&clean_part);
+                let key = format!(
+                    "{}:{}:{}:{}",
+                    config.provider.as_str(),
+                    config.source_lang,
+                    config.target_lang,
+                    cleaned_texts[idx]
+                );
+                self.cache.insert(key, final_text.clone());
+                self.context
+                    .record_translation(cleaned_texts[idx].clone(), final_text.clone());
+                processed_translations.push(final_text);
+            }
+
+            if let Ok(merged_texts) = assemble_batch_translations(
+                &cached_results,
+                &uncached_indices,
+                &processed_translations,
+            ) {
+                return (blocks
                     .iter()
-                    .map(|&i| cleaned_texts[i].as_str())
-                    .collect();
-                let ctx = self.context.format_history_context();
-                if let Ok(batch_translated) = self
-                    .translate_deepl_batch(
-                        &text_refs,
-                        &config.source_lang,
-                        &config.target_lang,
-                        key,
-                        &ctx,
-                    )
-                    .await
-                {
-                    if batch_translated.len() == uncached_indices.len() {
-                        let mut processed_translations = Vec::with_capacity(batch_translated.len());
-                        for (k, trans) in batch_translated.into_iter().enumerate() {
-                            let orig_idx = uncached_indices[k];
-                            let clean_part = clean_russian_punctuation(trans.trim());
-                            let final_text = self.context.postprocess(&clean_part);
-                            let key = format!(
-                                "{}:{}:{}:{}",
-                                config.provider.as_str(),
-                                config.source_lang,
-                                config.target_lang,
-                                cleaned_texts[orig_idx]
-                            );
-                            self.cache.insert(key, final_text.clone());
-                            self.context
-                                .record_translation(cleaned_texts[orig_idx].clone(), final_text.clone());
-                            processed_translations.push(final_text);
-                        }
-
-                        if let Ok(merged_texts) = assemble_batch_translations(
-                            &cached_results,
-                            &uncached_indices,
-                            &processed_translations,
-                        ) {
-                            return blocks
-                                .iter()
-                                .zip(merged_texts)
-                                .map(|(b, trans)| TranslationBlock {
-                                    original_text: b.text.clone(),
-                                    translated_text: trans,
-                                    rect: b.rect,
-                                })
-                                .collect();
-                        }
-                    }
-                }
+                    .zip(merged_texts)
+                    .map(|(b, trans)| TranslationBlock {
+                        original_text: b.text.clone(),
+                        translated_text: trans,
+                        rect: b.rect,
+                    })
+                    .collect(), true);
             }
         }
 
@@ -1893,7 +1820,20 @@ impl TranslatorService {
         let mut join_set = tokio::task::JoinSet::new();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
 
+        let mut collected: Vec<(usize, TranslationBlock, bool)> = Vec::with_capacity(blocks.len());
         for (idx, block) in blocks.iter().enumerate() {
+            if let Some(translated_text) = &cached_results[idx] {
+                collected.push((
+                    idx,
+                    TranslationBlock {
+                        original_text: block.text.clone(),
+                        translated_text: translated_text.clone(),
+                        rect: block.rect,
+                    },
+                    is_translatable_text(&cleaned_texts[idx]),
+                ));
+                continue;
+            }
             let this = self.clone();
             let orig_text = block.text.clone();
             let clean_text = cleaned_texts[idx].clone();
@@ -1910,14 +1850,14 @@ impl TranslatorService {
             });
         }
 
-        let mut collected: Vec<(usize, TranslationBlock, bool)> = Vec::with_capacity(blocks.len());
-
+        let mut all_succeeded = true;
         while let Some(res) = join_set.join_next().await {
             match res {
                 Ok((idx, orig_text, rect, trans_res)) => {
                     let (translated_text, is_ok) = match trans_res {
                         Ok(t) => (t, true),
                         Err(e) => {
+                            all_succeeded = false;
                             error!("Failed to translate block '{}': {}", orig_text, e);
                             (format!("[Err: {}]", orig_text), false)
                         }
@@ -1933,6 +1873,7 @@ impl TranslatorService {
                     ));
                 }
                 Err(e) => {
+                    all_succeeded = false;
                     error!("Join error during block translation: {:?}", e);
                 }
             }
@@ -1945,7 +1886,7 @@ impl TranslatorService {
                     .record_translation(cleaned_texts[*idx].clone(), block.translated_text.clone());
             }
         }
-        collected.into_iter().map(|(_, block, _)| block).collect()
+        (collected.into_iter().map(|(_, block, _)| block).collect(), all_succeeded)
     }
 }
 
@@ -2406,10 +2347,19 @@ mod tests {
                 rect: ScreenRect::new(0, 60, 100, 20),
                 lines: vec![],
             },
+            OcrBlock {
+                text: "I@II#O*$".to_string(),
+                rect: ScreenRect::new(0, 90, 100, 20),
+                lines: vec![],
+            },
         ];
 
-        let results = service.translate_blocks(&blocks, &config).await;
-        assert_eq!(results.len(), 3);
+        let (results, all_succeeded) = service.translate_blocks(&blocks, &config).await;
+        assert!(!all_succeeded);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[3].translated_text, "I@II#O*$");
+        assert_eq!(results[3].rect, blocks[3].rect);
+        assert_eq!(service.cache.get("openai_compatible:en:ru:I@II#O*$"), None);
         assert_eq!(results[0].translated_text, "Первый блок");
         assert!(results[1].translated_text.starts_with("[Err:"));
         assert_eq!(results[2].translated_text, "Третий блок");
@@ -2425,7 +2375,8 @@ mod tests {
             "openai_compatible:en:ru:Second block".to_string(),
             "Второй блок".to_string(),
         );
-        let cached_results = service.translate_blocks(&blocks, &config).await;
+        let (cached_results, all_succeeded) = service.translate_blocks(&blocks, &config).await;
+        assert!(all_succeeded);
         assert_eq!(cached_results[1].translated_text, "Второй блок");
         assert_eq!(service.context.get_recent_history().len(), 2);
     }
@@ -2525,6 +2476,9 @@ mod tests {
         assert!(is_translatable_text("HAS ENTERED A NEW ERA."));
         assert!(is_translatable_text("+50"));
         assert!(is_translatable_text("100"));
+        for text in ["No...", "Ah...", "(No!?)"] {
+            assert!(is_translatable_text(text), "Valid dialogue rejected: {text}");
+        }
 
         // Garbage / title artifacts / symbols
         assert!(!is_translatable_text("I@II#O*$"));
@@ -2552,4 +2506,14 @@ mod tests {
         assert!(!is_valid_dictionary_word("1ONG"));
         assert!(!is_valid_dictionary_word("@@"));
     }
+
+    #[tokio::test]
+    async fn test_dictionary_single_letter_bypasses_ocr_artifact_filter() {
+        let service = TranslatorService::new();
+        let config = AppConfig { provider: TranslationProvider::OpenAICompatible, ..Default::default() };
+        service.cache.insert("openai_compatible:en:ru:I".to_string(), "pronoun".to_string());
+        let details = service.lookup_word_details("I", "en", "ru", &config).await;
+        assert_eq!(details.primary, "pronoun");
+    }
+
 }

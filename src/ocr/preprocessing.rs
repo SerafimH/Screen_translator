@@ -11,6 +11,15 @@ pub const MAX_OCR_DIMENSION: u32 = 2600;
 /// Minimum image dimension supported by Windows WinRT OcrEngine (40x40).
 pub const MIN_OCR_DIMENSION: u32 = 40;
 
+/// Fits the whole image, including any padding, within the engine limit.
+pub fn ocr_dimensions(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
+    let scale = (max_dimension.max(1) as f64 / width.max(height).max(1) as f64).min(1.0);
+    (
+        ((width as f64 * scale).floor() as u32).max(1),
+        ((height as f64 * scale).floor() as u32).max(1),
+    )
+}
+
 /// Extracts a black-and-white mask for light text with dark outlines (typical meme/Impact font).
 ///
 /// A pixel is classified as text if:
@@ -199,146 +208,6 @@ pub fn upscale_and_enhance_contrast(
     (dst, new_w, new_h, scale)
 }
 
-/// Converts a BGRA8 buffer to a 3-channel RGB buffer with forced alpha=255.
-/// If pixel alpha < 255, it composites the color over a pure white background.
-pub fn flatten_bgra_to_rgb(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    if width == 0 || height == 0 || bgra.len() < pixel_count * 4 {
-        return Vec::new();
-    }
-    let mut rgb = Vec::with_capacity(pixel_count * 3);
-    for chunk in bgra.as_chunks::<4>().0.iter().take(pixel_count) {
-        let b = chunk[0] as u32;
-        let g = chunk[1] as u32;
-        let r = chunk[2] as u32;
-        let a = chunk[3] as u32;
-        if a == 255 {
-            rgb.push(r as u8);
-            rgb.push(g as u8);
-            rgb.push(b as u8);
-        } else {
-            let cr = ((r * a + 255 * (255 - a)) / 255) as u8;
-            let cg = ((g * a + 255 * (255 - a)) / 255) as u8;
-            let cb = ((b * a + 255 * (255 - a)) / 255) as u8;
-            rgb.push(cr);
-            rgb.push(cg);
-            rgb.push(cb);
-        }
-    }
-    rgb
-}
-
-/// Adds `pad` pixels of padding around an RGB image using the detected background color
-/// averaged from the outermost perimeter pixels.
-pub fn add_rgb_padding_with_edge_color(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    pad: u32,
-) -> (Vec<u8>, u32, u32) {
-    if width == 0 || height == 0 || rgb.len() < (width * height * 3) as usize {
-        return (Vec::new(), 0, 0);
-    }
-    if pad == 0 {
-        return (rgb.to_vec(), width, height);
-    }
-
-    let w = width as usize;
-    let h = height as usize;
-
-    // Sample border pixels to determine edge background color
-    let mut sum_r = 0u64;
-    let mut sum_g = 0u64;
-    let mut sum_b = 0u64;
-    let mut count = 0u64;
-
-    for x in 0..w {
-        let top_idx = x * 3;
-        sum_r += rgb[top_idx] as u64;
-        sum_g += rgb[top_idx + 1] as u64;
-        sum_b += rgb[top_idx + 2] as u64;
-
-        let bot_idx = ((h - 1) * w + x) * 3;
-        sum_r += rgb[bot_idx] as u64;
-        sum_g += rgb[bot_idx + 1] as u64;
-        sum_b += rgb[bot_idx + 2] as u64;
-        count += 2;
-    }
-    for y in 1..h.saturating_sub(1) {
-        let left_idx = (y * w) * 3;
-        sum_r += rgb[left_idx] as u64;
-        sum_g += rgb[left_idx + 1] as u64;
-        sum_b += rgb[left_idx + 2] as u64;
-
-        let right_idx = (y * w + w - 1) * 3;
-        sum_r += rgb[right_idx] as u64;
-        sum_g += rgb[right_idx + 1] as u64;
-        sum_b += rgb[right_idx + 2] as u64;
-        count += 2;
-    }
-
-    let pad_r = if count > 0 { (sum_r / count) as u8 } else { 255 };
-    let pad_g = if count > 0 { (sum_g / count) as u8 } else { 255 };
-    let pad_b = if count > 0 { (sum_b / count) as u8 } else { 255 };
-
-    let out_w = width + pad * 2;
-    let out_h = height + pad * 2;
-    let out_w_usize = out_w as usize;
-    let pad_usize = pad as usize;
-
-    let mut out = vec![0u8; (out_w * out_h * 3) as usize];
-    for chunk in out.as_chunks_mut::<3>().0 {
-        chunk[0] = pad_r;
-        chunk[1] = pad_g;
-        chunk[2] = pad_b;
-    }
-
-    for y in 0..h {
-        let src_row = y * w * 3;
-        let dst_row = ((y + pad_usize) * out_w_usize + pad_usize) * 3;
-        out[dst_row..dst_row + w * 3].copy_from_slice(&rgb[src_row..src_row + w * 3]);
-    }
-
-    (out, out_w, out_h)
-}
-
-/// Computes the negative of the min(R, G, B) channel: `255 - min(R, G, B)`.
-/// This transforms white text (R,G,B all high) on colored background (at least one channel low)
-/// into dark text on a light background.
-pub fn min_rgb_channel_negative(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    if width == 0 || height == 0 || rgb.len() < pixel_count * 3 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(pixel_count * 3);
-    for chunk in rgb.as_chunks::<3>().0.iter().take(pixel_count) {
-        let min_c = chunk[0].min(chunk[1]).min(chunk[2]);
-        let val = 255 - min_c;
-        out.push(val);
-        out.push(val);
-        out.push(val);
-    }
-    out
-}
-
-/// Extracts bright pixels where `min(R, G, B) >= threshold`, turning them pure black (0,0,0)
-/// and all other pixels pure white (255,255,255).
-pub fn bright_pixel_mask(rgb: &[u8], width: u32, height: u32, threshold: u8) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    if width == 0 || height == 0 || rgb.len() < pixel_count * 3 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(pixel_count * 3);
-    for chunk in rgb.as_chunks::<3>().0.iter().take(pixel_count) {
-        let min_c = chunk[0].min(chunk[1]).min(chunk[2]);
-        let val = if min_c >= threshold { 0u8 } else { 255u8 };
-        out.push(val);
-        out.push(val);
-        out.push(val);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,51 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn test_flatten_bgra_to_rgb() {
-        // BGRA: B=10, G=20, R=30, A=255 -> RGB: R=30, G=20, B=10
-        let bgra = vec![10, 20, 30, 255];
-        let rgb = flatten_bgra_to_rgb(&bgra, 1, 1);
-        assert_eq!(rgb, vec![30, 20, 10]);
-
-        // Semi-transparent: B=0, G=0, R=0, A=128 composited on white (255)
-        // (0*128 + 255*127)/255 = 127
-        let bgra_trans = vec![0, 0, 0, 128];
-        let rgb_trans = flatten_bgra_to_rgb(&bgra_trans, 1, 1);
-        assert_eq!(rgb_trans, vec![127, 127, 127]);
-    }
-
-    #[test]
-    fn test_add_rgb_padding_with_edge_color() {
-        // 2x2 image, edge color is blue: [0, 0, 200]
-        let rgb = vec![
-            0, 0, 200,   0, 0, 200,
-            0, 0, 200,   0, 0, 200,
-        ];
-        let (padded, out_w, out_h) = add_rgb_padding_with_edge_color(&rgb, 2, 2, 1);
-        assert_eq!(out_w, 4);
-        assert_eq!(out_h, 4);
-        assert_eq!(padded.len(), 4 * 4 * 3);
-        // All pixels in padded image should match the edge color [0, 0, 200]
-        for chunk in padded.as_chunks::<3>().0 {
-            assert_eq!(chunk, &[0, 0, 200]);
+    fn test_ocr_dimensions_include_padding_and_preserve_aspect_ratio() {
+        for (width, height) in [(2608, 1488), (3888, 2208), (2208, 3888)] {
+            let (w, h) = ocr_dimensions(width, height, MAX_OCR_DIMENSION);
+            assert!(w <= MAX_OCR_DIMENSION && h <= MAX_OCR_DIMENSION);
+            assert!((width as f64 / height as f64 - w as f64 / h as f64).abs() < 0.002);
         }
+        assert_eq!(ocr_dimensions(1000, 360, MAX_OCR_DIMENSION), (1000, 360));
     }
 
-    #[test]
-    fn test_min_rgb_channel_negative() {
-        // White text: [255, 255, 255] -> min=255 -> val=0 (black)
-        // Orange background: [255, 128, 0] -> min=0 -> val=255 (white)
-        let rgb = vec![255, 255, 255, 255, 128, 0];
-        let out = min_rgb_channel_negative(&rgb, 2, 1);
-        assert_eq!(out, vec![0, 0, 0, 255, 255, 255]);
-    }
-
-    #[test]
-    fn test_bright_pixel_mask() {
-        // Very bright pixel: [240, 230, 225] -> min=225 >= 225 -> black [0, 0, 0]
-        // Darker pixel: [200, 200, 200] -> min=200 < 225 -> white [255, 255, 255]
-        let rgb = vec![240, 230, 225, 200, 200, 200];
-        let out = bright_pixel_mask(&rgb, 2, 1, 225);
-        assert_eq!(out, vec![0, 0, 0, 255, 255, 255]);
-    }
 }

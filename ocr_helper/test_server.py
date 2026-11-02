@@ -22,6 +22,7 @@ from ocr_helper.server import (
     merge_ocr_lines,
     process_request,
     read_exact,
+    refine_problematic_box,
     rescale_boxes_down,
     resolve_models_dir,
     run_server,
@@ -390,14 +391,45 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(merge_ocr_lines([[], []]), [])
 
     def test_process_request_with_variants(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for image variants")
         box_a = [[0, 0], [50, 0], [50, 20], [0, 20]]
         engine = MockEngine([{"box": box_a, "text": "Variant recognized", "score": 0.92}])
-        raw_bgr = b"\x00" * 12
+        width, height = 1600, 1000
+        raw_bgr = bytes(width * height * 3)
         with patch.dict(os.environ, {SCREEN_TRANSLATOR_OCR_VARIANTS_ENV: "1"}):
-            resp = process_request({"id": 1, "width": 2, "height": 2, "lang": "en"}, raw_bgr, engine)
+            resp = process_request({"id": 1, "width": width, "height": height, "lang": "en"}, raw_bgr, engine)
             self.assertTrue(resp["ok"])
             self.assertEqual(len(resp["lines"]), 1)
             self.assertEqual(resp["lines"][0]["text"], "Variant recognized")
+
+    def test_refinement_only_replaces_the_original_line(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((120, 180, 3), dtype=server.np.uint8)
+        original = {"text": "HE1P", "score": 0.8,
+                    "box": [[40, 50], [100, 50], [100, 65], [40, 65]]}
+        neighbor = {"text": "GOODBYE", "score": 0.99,
+                    "box": [[20, 0], [80, 0], [80, 15], [20, 15]]}
+        corrected = {"text": "HELP", "score": 0.95,
+                     "box": [[20, 20], [80, 20], [80, 35], [20, 35]],
+                     "words": [{"text": "HELP", "score": 0.95,
+                                "box": [[20, 20], [80, 20], [80, 35], [20, 35]]}]}
+        import copy
+        for variant in (0, 1):
+            for include_target in (False, True):
+                with self.subTest(variant=variant, include_target=include_target):
+                    candidates = [neighbor, corrected] if include_target else [neighbor]
+                    responses = [[], []]
+                    responses[variant] = copy.deepcopy(candidates)
+                    with patch("ocr_helper.server.call_engine", side_effect=responses):
+                        result = refine_problematic_box(img, original, None)
+                    self.assertEqual(result["text"], "HELP" if include_target else "HE1P")
+                    self.assertEqual(result["box"], original["box"])
+                    if include_target:
+                        self.assertEqual(result["words"][0]["box"], original["box"])
 
 
     def test_should_upscale_frame(self):

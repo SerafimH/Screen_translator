@@ -592,19 +592,21 @@ impl OcrHelperClient {
         let raw_bgr = bgra_to_bgr(&frame.bgra_bytes, frame.width, frame.height);
 
         let mut session_guard = self.session.lock().await;
-        let session = match session_guard.as_mut() {
+        let mut writing_session = match session_guard.take() {
             Some(s) => s,
             None => {
                 self.is_available.store(false, Ordering::SeqCst);
                 return Err("OCR helper session is None".to_string());
             }
         };
+        // Cancellation drops the owned session, so a partial frame cannot poison the next request.
+        self.is_available.store(false, Ordering::SeqCst);
 
         // Write request header + raw BGR bytes
         let write_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            session.stdin.write_all(&header_bytes).await?;
-            session.stdin.write_all(&raw_bgr).await?;
-            session.stdin.flush().await?;
+            writing_session.stdin.write_all(&header_bytes).await?;
+            writing_session.stdin.write_all(&raw_bgr).await?;
+            writing_session.stdin.flush().await?;
             tokio::io::Result::Ok(())
         })
         .await;
@@ -625,6 +627,10 @@ impl OcrHelperClient {
                 ));
             }
         }
+
+        *session_guard = Some(writing_session);
+        self.is_available.store(true, Ordering::SeqCst);
+        let session = session_guard.as_mut().expect("completed write restores the session");
 
         // Read JSON response in a loop, skipping any stale responses from cancelled previous requests
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
@@ -1087,7 +1093,22 @@ mod tests {
     #[tokio::test]
     async fn test_manga_fixtures_rapidocr_integration() {
         let mut config = AppConfig::default();
-        config.python_path = "python".to_string();
+        if resolve_helper_path(&config.python_path).is_none() {
+            let output = Command::new("python")
+                .args(["-X", "utf8", "-c", "import sys; print(sys.executable)"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .await
+                .expect("Install the OCR helper environment or put Python on PATH");
+            assert!(
+                output.status.success(),
+                "Could not resolve the Python interpreter"
+            );
+            config.python_path = String::from_utf8(output.stdout)
+                .expect("Python interpreter path must be UTF-8")
+                .trim()
+                .to_string();
+        }
         config.helper_timeout_ms = 15000;
         config.helper_min_score = 0.5;
         let config_arc = Arc::new(Mutex::new(config));
@@ -1095,13 +1116,14 @@ mod tests {
 
         // Ensure helper session is initialized
         client.init_session().await;
-        if !client.is_ready() {
-            println!("SKIPPED: RapidOCR python helper is not available in this environment.");
-            return;
-        }
+        assert!(
+            client.is_ready(),
+            "RapidOCR helper must initialize for the integration test"
+        );
 
-        let load_frame = |rel_path: &str| -> Option<CapturedFrame> {
-            let img = image::open(rel_path).ok()?.to_rgba8();
+        let load_frame = |rel_path: &str| -> CapturedFrame {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
+            let img = image::open(&path).expect("OCR fixture must load").to_rgba8();
             let (width, height) = (img.width(), img.height());
             let mut bgra = Vec::with_capacity((width * height * 4) as usize);
             for pixel in img.pixels() {
@@ -1110,17 +1132,18 @@ mod tests {
                 bgra.push(pixel[0]);
                 bgra.push(pixel[3]);
             }
-            Some(CapturedFrame {
+            CapturedFrame {
                 bgra_bytes: bgra,
                 width,
                 height,
                 offset_x: 0,
                 offset_y: 0,
-            })
+            }
         };
 
         // 1. Fixture: please_follow.png
-        if let Some(frame) = load_frame("tests/fixtures/ocr/please_follow.png") {
+        {
+            let frame = load_frame("tests/fixtures/ocr/please_follow.png");
             let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
             let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
             assert!(full_text.contains("PLEASE"), "Must contain PLEASE: {}", full_text);
@@ -1130,7 +1153,8 @@ mod tests {
         }
 
         // 2. Fixture: utube_shorts.png
-        if let Some(frame) = load_frame("tests/fixtures/ocr/utube_shorts.png") {
+        {
+            let frame = load_frame("tests/fixtures/ocr/utube_shorts.png");
             let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
             let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
             assert!(full_text.contains("LET'S") || full_text.contains("POST"), "Must contain LET'S/POST: {}", full_text);
@@ -1141,7 +1165,8 @@ mod tests {
         }
 
         // 3. Fixture: new_era_white_glow.png
-        if let Some(frame) = load_frame("tests/fixtures/ocr/new_era_white_glow.png") {
+        {
+            let frame = load_frame("tests/fixtures/ocr/new_era_white_glow.png");
             let (blocks, _) = client.recognize_with_raw(&frame, "en").await.expect("OCR must succeed");
             let full_text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
             assert!(full_text.contains("HAS"), "Must contain HAS: {}", full_text);
@@ -1150,4 +1175,43 @@ mod tests {
             assert!(!full_text.contains("•PA"), "Must NOT contain •PA artifact: {}", full_text);
         }
     }
+
+    #[tokio::test]
+    async fn test_cancelled_partial_write_discards_session() {
+        let client = OcrHelperClient::new(Arc::new(Mutex::new(AppConfig::default())));
+        client.is_initializing.store(true, Ordering::SeqCst);
+        let mut child = Command::new("python")
+            .args(["-u", "-c", "import sys,time; sys.stdin.buffer.readline(); print('header',file=sys.stderr,flush=True); time.sleep(30)"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let job = create_kill_on_close_job().unwrap();
+        assign_process_to_job(&job, HANDLE(child.raw_handle().unwrap() as *mut _)).unwrap();
+        let mut ack = BufReader::new(child.stderr.take().unwrap()).lines();
+        let session = ProcessSession {
+            stdin: child.stdin.take().unwrap(),
+            stdout_lines: BufReader::new(child.stdout.take().unwrap()).lines(),
+            _child: child, _job: job,
+        };
+        *client.session.lock().await = Some(session);
+        client.is_ready.store(true, Ordering::SeqCst);
+        client.is_available.store(true, Ordering::SeqCst);
+        let requester = client.clone();
+        let task = tokio::spawn(async move {
+            let frame = CapturedFrame {
+                bgra_bytes: vec![0; 1000 * 1000 * 4], width: 1000, height: 1000,
+                offset_x: 0, offset_y: 0,
+            };
+            requester.recognize_raw_lines_with_raw(&frame, "en").await
+        });
+        let line = tokio::time::timeout(Duration::from_secs(5), ack.next_line()).await.unwrap().unwrap();
+        assert_eq!(line.as_deref(), Some("header"));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(client.session.lock().await.is_none());
+        assert!(!client.is_ready());
+    }
+
 }

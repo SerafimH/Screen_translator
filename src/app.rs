@@ -363,10 +363,12 @@ where
         let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
         slot_lock.take()
     };
+    if let Some(prev) = &prev {
+        prev.abort();
+    }
 
     let handle = tokio::spawn(async move {
         if let Some(prev) = prev {
-            prev.abort();
             let _ = prev.await;
         }
         fut.await;
@@ -717,7 +719,6 @@ impl AppState {
             );
             crate::ocr::dump_ocr_artifacts(
                 &frame,
-                Some((&frame.bgra_bytes, frame.width, frame.height)),
                 &raw_json,
                 &res_text,
             );
@@ -802,7 +803,7 @@ impl AppState {
             Ok(res) => res,
             Err(e) => {
                 error!("OCR error: {}", e);
-                *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+                *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 self.overlay
                     .update_blocks(Vec::new(), Some(format!("Ошибка OCR: {}", e)));
                 return;
@@ -812,6 +813,7 @@ impl AppState {
         let has_text = !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text));
 
         let has_vision_support = cfg.gemini_api_key.is_some() || cfg.openai_api_key.is_some();
+        let mut vision_failed = false;
 
         // Step 4: Vision fallback if all local passes found nothing and vision_fallback is enabled with API key
         if !has_text && cfg.vision_fallback && has_vision_support {
@@ -841,6 +843,7 @@ impl AppState {
                     }
                 }
                 Err(err) => {
+                    vision_failed = true;
                     warn!("Vision OCR fallback failed: {}", err);
                 }
             }
@@ -856,7 +859,7 @@ impl AppState {
             } else {
                 format!("Текст не найден ({} мс)", elapsed)
             };
-            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if vision_failed { None } else { Some(sig) };
             self.overlay.update_blocks(Vec::new(), Some(status));
             return;
         }
@@ -871,7 +874,7 @@ impl AppState {
             Some(format!("Перевод {} блоков текста...", valid_blocks.len())),
         );
 
-        let translations = self.translator.translate_blocks(&valid_blocks, &cfg).await;
+        let (translations, all_succeeded) = self.translator.translate_blocks(&valid_blocks, &cfg).await;
 
         if cfg.dump_ocr {
             let res_text = translations
@@ -881,7 +884,6 @@ impl AppState {
                 .join("\n---\n");
             crate::ocr::dump_ocr_artifacts(
                 &frame,
-                Some((&frame.bgra_bytes, frame.width, frame.height)),
                 &raw_json,
                 &res_text,
             );
@@ -891,7 +893,7 @@ impl AppState {
         let status = format!("Переведено {} блоков за {} мс", translations.len(), elapsed);
         info!("{}", status);
 
-        *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+        *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if all_succeeded { Some(sig) } else { None };
 
         self.overlay.update_blocks(translations, Some(status));
     }
@@ -1383,4 +1385,22 @@ mod tests {
         assert!(!is_suspicious_word("naïve"));
         assert!(!is_suspicious_word("Привет"));
     }
+
+    #[tokio::test]
+    async fn test_cancelling_unpolled_replacement_also_cancels_original() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let marker = completed.clone();
+        let slot = Arc::new(Mutex::new(Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            marker.store(true, Ordering::SeqCst);
+        }))));
+        tokio::task::yield_now().await;
+        spawn_cancellable_task(&slot, async {});
+        let replacement = slot.lock().unwrap().take().unwrap();
+        replacement.abort();
+        let _ = replacement.await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
 }

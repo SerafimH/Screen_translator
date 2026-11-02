@@ -380,11 +380,25 @@ impl WinrtOcrEngine {
     }
 
     async fn run_ocr_pass(&self, params: OcrPassParams<'_>) -> Result<Vec<RecognizedLine>, String> {
+        let (width, height) = preprocessing::ocr_dimensions(
+            params.width, params.height,
+            OcrEngine::MaxImageDimension().unwrap_or(preprocessing::MAX_OCR_DIMENSION),
+        );
+        let resized = if (width, height) != (params.width, params.height) {
+            let img = ImageBuffer::<Rgba<u8>, _>::from_raw(params.width, params.height, params.bgra_bytes)
+                .ok_or_else(|| "Invalid OCR image buffer".to_string())?;
+            Some(image::imageops::resize(&img, width, height, image::imageops::FilterType::CatmullRom))
+        } else {
+            None
+        };
+        let bytes = resized.as_ref().map(|img| img.as_raw().as_slice()).unwrap_or(params.bgra_bytes);
+        let scale_x = params.width as f32 / width as f32;
+        let scale_y = params.height as f32 / height as f32;
         let ocr_op = {
             let writer =
                 DataWriter::new().map_err(|e| format!("Failed to create DataWriter: {:?}", e))?;
             writer
-                .WriteBytes(params.bgra_bytes)
+                .WriteBytes(bytes)
                 .map_err(|e| format!("Failed to write bytes to DataWriter: {:?}", e))?;
             let ibuffer = writer
                 .DetachBuffer()
@@ -393,8 +407,8 @@ impl WinrtOcrEngine {
             let software_bitmap = SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
                 &ibuffer,
                 BitmapPixelFormat::Bgra8,
-                params.width as i32,
-                params.height as i32,
+                width as i32,
+                height as i32,
                 BitmapAlphaMode::Premultiplied,
             )
             .map_err(|e| format!("Failed to create SoftwareBitmap: {:?}", e))?;
@@ -448,7 +462,8 @@ impl WinrtOcrEngine {
                     .BoundingRect()
                     .map_err(|e| format!("Failed to get word rect: {:?}", e))?;
 
-                let word_rect = remap_rect(rect.X, rect.Y, rect.Width, rect.Height, params.remap);
+                let word_rect = remap_rect(rect.X * scale_x, rect.Y * scale_y,
+                    rect.Width * scale_x, rect.Height * scale_y, params.remap);
 
                 line_rect = line_rect.union(&word_rect);
                 words.push(RecognizedWord {
@@ -639,7 +654,7 @@ pub fn prepare_ocr_image(frame: &CapturedFrame) -> (PreprocessedImage, Option<Ve
 
     let (padded_buf, padded_w, padded_h) =
         add_pure_white_padding(&scaled_buf, scaled_w, scaled_h, pad);
-    let fallback_inv = Some(create_inverted_buffer(&padded_buf));
+    let fallback_inv = Some(preprocessing::invert_bgra(&padded_buf));
 
     (
         PreprocessedImage {
@@ -914,60 +929,57 @@ pub fn add_pure_white_padding(src: &[u8], w: u32, h: u32, pad: u32) -> (Vec<u8>,
     (dst, out_w, out_h)
 }
 
-/// Inverts color buffer for second OCR pass.
-pub fn create_inverted_buffer(buf: &[u8]) -> Vec<u8> {
-    let mut inv = buf.to_vec();
-    for chunk in inv.as_chunks_mut::<4>().0 {
-        chunk[0] = 255 - chunk[0];
-        chunk[1] = 255 - chunk[1];
-        chunk[2] = 255 - chunk[2];
-        chunk[3] = 255;
+/// Saves the captured frame, translation result, and helper response or engine description.
+pub fn dump_ocr_artifacts(frame: &CapturedFrame, raw_json: &str, result_text: &str) {
+    match write_ocr_artifacts(std::path::Path::new("debug/ocr"), frame, raw_json, result_text) {
+        Ok(dir) => info!("Saved OCR debug dump to {}", dir.display()),
+        Err(e) => warn!("Failed to save OCR debug dump: {}", e),
     }
-    inv
 }
 
-/// Saves OCR debug artifacts (frame, input, raw JSON, final text) into `debug/ocr/<timestamp>/`.
-pub fn dump_ocr_artifacts(
+fn write_ocr_artifacts(
+    root: &std::path::Path,
     frame: &CapturedFrame,
-    input_bgra: Option<(&[u8], u32, u32)>,
     raw_json: &str,
     result_text: &str,
-) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let dir = format!("debug/ocr/{}", ts);
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("Failed to create debug dump dir {}: {}", dir, e);
-        return;
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    fs::create_dir_all(root)?;
+    let root = root.canonicalize()?;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let dir = root.join(ts.to_string());
+    fs::create_dir(&dir)?;
+
+    // Only numeric, real directories created by this dumper are eligible for retention cleanup.
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && let Some(stamp) = entry.file_name().to_str().and_then(|name| name.parse::<u128>().ok())
+        {
+            runs.push((stamp, entry.path()));
+        }
+    }
+    runs.sort_unstable_by_key(|(stamp, _)| *stamp);
+    for (_, old) in runs.iter().take(runs.len().saturating_sub(20)) {
+        if old.parent() == Some(root.as_path()) {
+            fs::remove_dir_all(old)?;
+        }
     }
 
-    // 1. frame.png
-    let mut frame_rgba = frame.bgra_bytes.clone();
-    for chunk in frame_rgba.as_chunks_mut::<4>().0 {
-        chunk.swap(0, 2);
+    let mut rgba = frame.bgra_bytes.clone();
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
     }
-    if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, frame_rgba) {
-        let _ = img.save(format!("{}/frame.png", dir));
+    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, rgba)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid captured frame"))?;
+    img.save(dir.join("frame.png"))?;
+    if let Ok(response) = serde_json::from_str::<serde_json::Value>(raw_json) {
+        fs::write(dir.join("recognition.json"), serde_json::to_string_pretty(&response)?)?;
+    } else {
+        fs::write(dir.join("engine.txt"), raw_json)?;
     }
-
-    // 2. input.png
-    let (in_bytes, in_w, in_h) = input_bgra.unwrap_or((&frame.bgra_bytes, frame.width, frame.height));
-    let mut in_rgba = in_bytes.to_vec();
-    for chunk in in_rgba.as_chunks_mut::<4>().0 {
-        chunk.swap(0, 2);
-    }
-    if let Some(img) = ImageBuffer::<Rgba<u8>, _>::from_raw(in_w, in_h, in_rgba) {
-        let _ = img.save(format!("{}/input.png", dir));
-    }
-
-    // 3. raw.json
-    let _ = fs::write(format!("{}/raw.json", dir), raw_json);
-
-    // 4. result.txt
-    let _ = fs::write(format!("{}/result.txt", dir), result_text);
-    info!("Saved OCR debug dump to {}", dir);
+    fs::write(dir.join("result.txt"), result_text)?;
+    Ok(dir)
 }
 
 /// Sorts lines into natural 2D reading order:
@@ -1569,4 +1581,42 @@ mod tests {
             "Catmull-Rom must differ from bilinear interpolation on sharp edges"
         );
     }
+
+    #[tokio::test]
+    async fn test_winrt_pass_accepts_large_padded_frame() {
+        if !WinrtOcrEngine::is_language_available("en") { return; }
+        let engine = WinrtOcrEngine::new("en").unwrap();
+        let frame = CapturedFrame {
+            bgra_bytes: vec![255; 3840 * 100 * 4], width: 3840, height: 100,
+            offset_x: 300, offset_y: 400,
+        };
+        engine.recognize_pass_1(&frame).await.expect("Oversized frame must be resized before OCR");
+    }
+
+    #[test]
+    fn test_debug_artifacts_are_labelled_and_bounded() {
+        let temp_dir = std::env::temp_dir();
+        let root = temp_dir.join(format!("screen_translator_dump_test_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        assert_eq!(root.parent(), Some(temp_dir.as_path()));
+        fs::create_dir(&root).unwrap();
+        for stamp in 0..20 { fs::create_dir(root.join(stamp.to_string())).unwrap(); }
+        fs::create_dir(root.join("keep_me")).unwrap();
+        let frame = CapturedFrame {
+            bgra_bytes: vec![0, 0, 255, 255], width: 1, height: 1, offset_x: 0, offset_y: 0,
+        };
+        let first = write_ocr_artifacts(&root, &frame, "WinRT OCR", "result").unwrap();
+        assert!(first.join("frame.png").exists());
+        assert_eq!(fs::read_to_string(first.join("engine.txt")).unwrap(), "WinRT OCR");
+        assert!(!first.join("raw.json").exists() && !first.join("input.png").exists());
+        let second = write_ocr_artifacts(&root, &frame, r#"{"lines":[]}"#, "result").unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&fs::read(second.join("recognition.json")).unwrap()).unwrap();
+        assert!(response["lines"].is_array());
+        assert!(!second.join("engine.txt").exists());
+        assert!(root.join("keep_me").is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 21);
+        assert!(!root.join("0").exists() && !root.join("1").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
 }
