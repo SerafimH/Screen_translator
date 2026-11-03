@@ -19,10 +19,12 @@
 provider = "google"
 
 # Режим OCR распознавания текста:
-# "winrt"  - Встроенный системный Windows.Media.Ocr (по умолчанию, без внешних зависимостей)
+# "winrt"  - Встроенный системный Windows.Media.Ocr (без внешних зависимостей)
 # "helper" - Python-помощник на базе RapidOCR (модели PP-OCR, высокая точность на сложных фонах)
 # "auto"   - Сравнение WinRT и RapidOCR по областям -> разрешённый Vision fallback
-ocr_engine = "winrt"
+ocr_engine = "auto"
+# Для английских шрифтов манги/манхвы в helper и auto автоматически включается
+# нормализация контраста, толщины штрихов и узких букв. Название шрифта не требуется.
 
 # Настройки OCR-помощника (RapidOCR Python):
 python_path = "ocr_helper/.venv/Scripts/python.exe"

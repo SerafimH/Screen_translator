@@ -12,6 +12,20 @@ Four additional English fixtures cover native Segoe UI 10px text, 14px dark text
 Reproduce them with `generate_english.py` using the OCR helper virtualenv on
 Windows; it reads installed Segoe UI fonts without bundling font binaries.
 
+Seven synthetic English comic lettering samples cover Comic Sans, bold italics,
+compressed bold lettering, Impact, outlined white text, handwriting, and very
+faint dark text. All require zero word errors. Reproduce with `generate_manga.py`
+on Windows using installed fonts. These are typography checks, not manga scans
+and not proof of accuracy for arbitrary artistic lettering. The condensed and
+faint cases reproduce missing spacing and an entirely missed line respectively.
+
+`manga_handwritten_black.png` is the user-provided screenshot containing
+`D-Did he / find out?!`. Besides the OCR text check, Rust integration tests
+exercise Auto mode, complete sentence grouping, and cursor confirmation of all
+four words. The rotated line boxes overlap vertically; WinRT can return `finA`
+for `find`, so this case also verifies conflict resolution using two strong,
+distinct RapidOCR crop readings.
+
 Run from the repository root:
 
 ```powershell

@@ -370,10 +370,11 @@ def should_upscale_frame(width: int, height: int, cv2_available: bool) -> bool:
 
 
 def rescale_boxes_down(
-    lines: List[Dict[str, Any]], scale_factor: float
+    lines: List[Dict[str, Any]], scale_factor: float, scale_y: Optional[float] = None
 ) -> List[Dict[str, Any]]:
     """Пересчитывает координаты 4-точечных рамок найденных строк обратно в систему исходного кадра."""
-    if scale_factor <= 1.0 or not lines:
+    scale_y = scale_factor if scale_y is None else scale_y
+    if (scale_factor == 1.0 and scale_y == 1.0) or not lines:
         return lines
     rescaled = []
     for line in lines:
@@ -381,7 +382,7 @@ def rescale_boxes_down(
         box = line.get("box")
         if box:
             new_line["box"] = [
-                [float(p[0]) / scale_factor, float(p[1]) / scale_factor] for p in box
+                [float(p[0]) / scale_factor, float(p[1]) / scale_y] for p in box
             ]
         words = line.get("words")
         if words:
@@ -391,7 +392,7 @@ def rescale_boxes_down(
                 w_box = w.get("box")
                 if w_box:
                     nw["box"] = [
-                        [float(p[0]) / scale_factor, float(p[1]) / scale_factor] for p in w_box
+                        [float(p[0]) / scale_factor, float(p[1]) / scale_y] for p in w_box
                     ]
                 new_words.append(nw)
             new_line["words"] = new_words
@@ -464,8 +465,75 @@ def score_ocr_candidate(text: str, score: float) -> float:
     return min(1.0, max(0.0, score)) - garbage_count / len(non_spaces) * 0.6
 
 
+def is_condensed_lettering(line: Dict[str, Any]) -> bool:
+    """Detect unusually narrow Latin lettering, without guessing a font family."""
+    text = str(line.get("text", ""))
+    letters = sum(c.isascii() and c.isalpha() for c in text)
+    box = line.get("box")
+    if letters < 6 or not box or len(box) < 4:
+        return False
+    width = max(p[0] for p in box) - min(p[0] for p in box)
+    height = max(p[1] for p in box) - min(p[1] for p in box)
+    return height > 0 and width / letters / height < 0.32
+
+
+def lettering_variants(img, condensed=False):
+    """At most two contrast/stroke-normalized views for English comic lettering.
+
+    Return actual x/y scale factors so both line and word boxes can be mapped
+    back exactly. Polarity and stroke weight come from pixels, not OCR text.
+    Original pixels are always tried separately by the caller.
+    """
+    if cv2 is None or np is None or not isinstance(img, np.ndarray):
+        return
+    height, width = img.shape[:2]
+    if min(height, width) < 8 or width * height > SMALL_FRAME_PIXELS:
+        return
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if int(gray.max()) == int(gray.min()):
+        return
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # Speech bubbles are usually light, but narration may use a dark panel.
+    border = np.concatenate((binary[0], binary[-1], binary[:, 0], binary[:, -1]))
+    if np.median(border) < 128:
+        binary = 255 - binary
+    ink = (binary == 0).astype(np.uint8)
+    fraction = float(ink.mean())
+    if not 0.001 <= fraction <= 0.45:
+        return
+
+    # Measure glyph height and stroke radius, ignoring tiny antialiasing specks
+    # and panel-sized objects such as speech bubble outlines.
+    count, _, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+    glyphs = [stat for stat in stats[1:count]
+              if stat[cv2.CC_STAT_HEIGHT] >= 4 and stat[cv2.CC_STAT_AREA] >= 4
+              and stat[cv2.CC_STAT_HEIGHT] <= height * 0.85]
+    if not glyphs:
+        return
+    glyph_height = float(np.median([s[cv2.CC_STAT_HEIGHT] for s in glyphs]))
+    radius = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
+    stroke_ratio = float(np.percentile(radius[ink != 0], 90)) / glyph_height
+
+    stretch = 1.8 if condensed else 1.0
+    previous_size = None
+    for scale in (1.0, 2.0):
+        fit = min(scale, 2000 / max(width * stretch, height))
+        out_w, out_h = max(1, round(width * stretch * fit)), max(1, round(height * fit))
+        if (out_w, out_h) == previous_size:
+            break  # the size ceiling must not turn one view into two votes
+        previous_size = (out_w, out_h)
+        prepared = cv2.resize(binary, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+        if scale == 2.0 and fit >= 1.5:
+            kernel = np.ones((2, 2), dtype=np.uint8)
+            if stroke_ratio < 0.09:
+                prepared = cv2.erode(prepared, kernel)  # strengthen thin ink
+            elif stroke_ratio > 0.18:
+                prepared = cv2.dilate(prepared, kernel)  # open heavy glyph counters
+        yield cv2.cvtColor(prepared, cv2.COLOR_GRAY2BGR), out_w / width, out_h / height
+
+
 def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,
-                           min_score=MIN_SCORE) -> Dict[str, Any]:
+                           min_score=MIN_SCORE, english_lettering=False) -> Dict[str, Any]:
     box = line.get("box")
     if not box or len(box) < 4 or cv2 is None or np is None or not isinstance(img_bgr, np.ndarray):
         return line
@@ -517,6 +585,22 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,
             best_eval = eval_c
             best_cand = lc
 
+    if english_lettering:
+        for prepared, sx, sy in lettering_variants(crop, is_condensed_lettering(line)):
+            candidates = rescale_boxes_down(
+                extract_lines_from_result(call_engine(ocr_exec, prepared, min_score)), sx, sy)
+            candidates, _ = filter_ocr_lines(candidates, min_score)
+            for candidate in candidates:
+                _shift_box_coords(candidate, x1, y1)
+                if _compute_box_iou(box, candidate["box"]) <= 0.5:
+                    continue
+                value = score_ocr_candidate(candidate["text"], candidate["score"])
+                # A spacing-only improvement cannot change the actual letters.
+                same_letters = ("".join(str(line.get("text", "")).split())
+                                == "".join(candidate["text"].split()))
+                margin = 0.005 if same_letters else 0.05
+                if value > best_eval + margin:
+                    best_eval, best_cand = value, candidate
     return best_cand
 
 
@@ -707,14 +791,34 @@ def process_request(
             result = call_engine(ocr_exec, img_bgr, min_score)
             raw_lines = extract_lines_from_result(result)
 
-        # Step 3: Targeted retry pass on problematic boxes
+        # Step 3: Targeted retry pass on problematic boxes. English lettering
+        # passes are bounded and keep every word box in original coordinates.
         if np is not None and isinstance(img_bgr, np.ndarray):
             refined = []
+            lettering_budget = 4
             for item in raw_lines:
-                if is_problematic_line(item):
-                    item = refine_problematic_box(img_bgr, item, ocr_exec, min_score)
+                font_retry = (base_lang == "en" and lettering_budget > 0
+                              and (is_problematic_line(item) or is_condensed_lettering(item)))
+                if is_problematic_line(item) or font_retry:
+                    item = refine_problematic_box(img_bgr, item, ocr_exec, min_score,
+                                                  english_lettering=font_retry)
+                    lettering_budget -= int(font_retry)
                 refined.append(item)
             raw_lines = refined
+
+            # If faint lettering was missed entirely, recover it only when the
+            # two normalized views agree. Never run this on full-size pages.
+            if base_lang == "en" and not filter_ocr_lines(raw_lines, min_score)[0]:
+                recovered = []
+                for prepared, sx, sy in lettering_variants(img_bgr):
+                    candidates = rescale_boxes_down(extract_lines_from_result(
+                        call_engine(ocr_exec, prepared, min_score)), sx, sy)
+                    recovered.append(filter_ocr_lines(candidates, max(0.85, min_score))[0])
+                if len(recovered) == 2:
+                    raw_lines.extend(a for a in recovered[0] if any(
+                        " ".join(a["text"].split()) == " ".join(b["text"].split())
+                        and _compute_box_iou(a["box"], b["box"]) > 0.5
+                        for b in recovered[1]))
 
         kept_lines, rejected_lines = filter_ocr_lines(raw_lines, min_score)
         if use_variants or use_upscale:

@@ -681,6 +681,7 @@ impl AppState {
         let crop_rect = cursor_line_crop(frame, initial.line_rect)?;
         let crop = crop_frame(frame, crop_rect).ok()?;
         let mut readings = Vec::new();
+        let mut helper_readings = Vec::new();
         if let Some(native) = &self.ocr {
             if let Ok(lines) = native.recognize_raw(&crop).await {
                 readings.push(find_text_under_cursor(&cluster_lines_into_blocks(lines, None), pt.x, pt.y));
@@ -691,26 +692,32 @@ impl AppState {
         }
         if self.helper_ocr.is_ready() {
             if let Ok(blocks) = self.helper_ocr.recognize(&crop, &cfg.ocr_lang).await {
-                readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
+                helper_readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
             }
         }
-        if let Some(target) = choose_verified_cursor_target(&initial, &readings, cfg.helper_min_score) {
+        if let Some(target) = choose_cursor_target_from_readings(
+            &initial, &readings, &helper_readings, cfg.helper_min_score,
+        ) {
             return Some(target);
         }
         // A missing coarse reading needs two crop readings. This also works when
-        // WinRT is unavailable; do not retry away a conflict between valid words.
-        let valid_count = readings.iter().flatten()
+        // WinRT is unavailable. Two strong helper crops can also resolve an
+        // unscored WinRT error on handwriting; helper conflicts remain rejected.
+        let valid_count = readings.iter().chain(&helper_readings).flatten()
             .filter(|reading| reliable_cursor_token(reading, cfg.helper_min_score).is_some()).count();
-        if valid_count == 1 && self.helper_ocr.is_ready() {
+        let strong_helper = helper_readings.iter().flatten().any(|reading|
+            reliable_cursor_token(reading, cfg.helper_min_score.max(0.95)).is_some()
+                && reading.word_confidence.is_some());
+        if (valid_count == 1 || strong_helper) && self.helper_ocr.is_ready() {
             let second_rect = cursor_line_crop_with_padding(frame, initial.line_rect, 20)?;
             if second_rect != crop_rect {
                 let second_crop = crop_frame(frame, second_rect).ok()?;
                 if let Ok(blocks) = self.helper_ocr.recognize(&second_crop, &cfg.ocr_lang).await {
-                    readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
+                    helper_readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
                 }
             }
         }
-        choose_verified_cursor_target(&initial, &readings, cfg.helper_min_score)
+        choose_cursor_target_from_readings(&initial, &readings, &helper_readings, cfg.helper_min_score)
     }
 
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
@@ -1033,6 +1040,24 @@ fn choose_verified_cursor_target(
     Some(accepted)
 }
 
+fn choose_cursor_target_from_readings(
+    initial: &TextUnderCursor, native: &[Option<TextUnderCursor>],
+    helper: &[Option<TextUnderCursor>], min_score: f32,
+) -> Option<TextUnderCursor> {
+    let all = native.iter().chain(helper).cloned().collect::<Vec<_>>();
+    choose_verified_cursor_target(initial, &all, min_score).or_else(|| {
+        // Native OCR has no confidence and can read handwritten "find" as
+        // "finA". Override that reading only after two distinct helper crops
+        // agree with real geometry and >=95% word confidence in both crops.
+        if native.iter().flatten().all(|target| target.word_confidence.is_none())
+            && helper.len() == 2 && helper.iter().all(|reading| reading.as_ref().is_some_and(|target|
+            !target.word_is_estimated && target.word_confidence.is_some()
+                && reliable_cursor_token(target, min_score.max(0.95)).is_some())) {
+            choose_verified_cursor_target(initial, helper, min_score.max(0.95))
+        } else { None }
+    })
+}
+
 fn cursor_context_is_clean(text: &str) -> bool {
     // A sentence is not a dictionary token: numbers and separated punctuation
     // are ordinary context, while OCR corruption such as @#* stays forbidden.
@@ -1096,6 +1121,24 @@ mod tests {
         assert!(choose_verified_cursor_target(&estimated, &[Some(initial.clone())], 0.5).is_some());
         assert!(cursor_point_on_word(accepted.word_rect.unwrap(), POINT { x: 120, y: 110 }));
         assert!(!cursor_point_on_word(accepted.word_rect.unwrap(), POINT { x: 250, y: 110 }));
+    }
+
+    #[test]
+    fn cursor_native_conflict_needs_two_strong_agreeing_helper_crops() {
+        let initial = cursor_reading("find", Some(0.99), false);
+        let native = [Some(cursor_reading("finA", None, false))];
+        let helper = Some(cursor_reading("find", Some(0.99), false));
+        assert!(choose_cursor_target_from_readings(&initial, &native, &[helper.clone()], 0.5).is_none());
+        let accepted = choose_cursor_target_from_readings(
+            &initial, &native, &[helper.clone(), helper.clone()], 0.5,
+        ).unwrap();
+        assert_eq!(accepted.word_text.as_deref(), Some("find"));
+        for other in [Some(cursor_reading("from", Some(0.99), false)),
+                      Some(cursor_reading("find", Some(0.90), false)),
+                      Some(cursor_reading("find", Some(0.99), true)), None] {
+            assert!(choose_cursor_target_from_readings(&initial, &native, &[helper.clone(), other], 0.5).is_none());
+        }
+        assert!(choose_cursor_target_from_readings(&initial, &native, &[helper.clone(), helper], 1.0).is_none());
     }
 
     #[test]
@@ -1252,6 +1295,44 @@ mod tests {
         assert!(!status.contains("sk-audit-secret"));
         assert!(!status.contains("Переведено"));
         assert_eq!(translation_status(3, 42, &[], None), "Переведено 3 блоков за 42 мс");
+    }
+
+    #[tokio::test]
+    async fn handwritten_black_panel_preserves_sentence_and_confirms_each_cursor_word() {
+        use crate::overlay::OverlaySharedState;
+        use windows::Win32::Foundation::HWND;
+        let rgba = image::open("tests/fixtures/ocr/manga_handwritten_black.png").unwrap().to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut bgra = rgba.into_raw();
+        for pixel in bgra.chunks_exact_mut(4) { pixel.swap(0, 2); }
+        let frame = CapturedFrame { width, height, bgra_bytes: bgra, offset_x: 0, offset_y: 0 };
+        let cfg = AppConfig { ocr_engine: OcrMode::Auto, helper_timeout_ms: 15_000,
+                              ..AppConfig::default() };
+        let config = Arc::new(Mutex::new(cfg.clone()));
+        let helper = OcrHelperClient::new(config.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !helper.is_ready() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+        }).await.expect("fixture helper must initialize");
+        let state = AppState {
+            config, overlay: OverlayHandle { hwnd: HWND(std::ptr::null_mut()),
+                shared_state: Arc::new(Mutex::new(OverlaySharedState::default())) },
+            ocr: WinrtOcrEngine::new("en").ok().map(Arc::new), helper_ocr: helper,
+            translator: Arc::new(TranslatorService::new()),
+            active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
+            is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            current_task: Arc::new(Mutex::new(None)),
+        };
+        let (blocks, _) = state.perform_ocr(&frame, &cfg).await.unwrap();
+        for (word, x, y) in [("D-Did", 145, 108), ("he", 259, 112),
+                             ("find", 121, 156), ("out", 225, 162)] {
+            let initial = find_text_under_cursor(&blocks, x, y);
+            let confirmed = state.verify_cursor_target(&frame, &cfg, initial, POINT { x, y }).await;
+            assert_eq!(confirmed.as_ref().and_then(|t| t.word_text.as_deref()), Some(word),
+                       "cursor reading failed for {word}: {confirmed:?}");
+            assert_eq!(confirmed.unwrap().sentence_text, "D-Did he find out?!");
+        }
+        assert_eq!(blocks.len(), 1, "one utterance must be translated together: {blocks:?}");
+        assert_eq!(blocks[0].text, "D-Did he find out?!");
     }
 
     #[tokio::test]

@@ -535,6 +535,48 @@ pub fn clean_russian_punctuation(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Google treats a leading comic stutter as an untranslated Latin initial.
+/// Translate the complete question, then restore hesitation in the target
+/// alphabet. Restrict this to common English dialogue openings to preserve
+/// real hyphenated terms such as D-Day and B-cell.
+fn google_dialogue_input<'a>(text: &'a str, source: &str, target: &str) -> (&'a str, usize) {
+    let language = |tag: &str, expected| tag.split(['-', '_']).next()
+        .is_some_and(|base| base.eq_ignore_ascii_case(expected));
+    if !language(source, "en") || !language(target, "ru") { return (text, 0); }
+    let Some((first, _)) = text.split_once(char::is_whitespace) else { return (text, 0); };
+    let parts = first.split('-').collect::<Vec<_>>();
+    let Some(word) = parts.last().copied() else { return (text, 0); };
+    let lower = word.to_ascii_lowercase();
+    if parts.len() < 2 || !matches!(lower.as_str(),
+        "did" | "do" | "does" | "is" | "are" | "was" | "were" | "can" | "could"
+        | "will" | "would" | "should" | "have" | "has" | "had" | "what" | "who"
+        | "when" | "where" | "why" | "how" | "i" | "you" | "he" | "she" | "we" | "they")
+        || !parts[..parts.len() - 1].iter().all(|part|
+            part.len() == 1 && part.as_bytes()[0].is_ascii_alphabetic()
+                && part.as_bytes()[0].eq_ignore_ascii_case(&word.as_bytes()[0])) {
+        return (text, 0);
+    }
+    (&text[first.len() - word.len()..], parts.len() - 1)
+}
+
+fn restore_russian_stutter(translated: &str, repeats: usize) -> String {
+    if repeats == 0 { return translated.to_string(); }
+    let Some((start, first)) = translated.char_indices().find(|(_, ch)| ch.is_alphabetic())
+        else { return translated.to_string(); };
+    let mut result = translated[..start].to_string();
+    for _ in 0..repeats { result.push(first); result.push('-'); }
+    let word = translated[start..].split_whitespace().next().unwrap_or("")
+        .trim_matches(|ch: char| !ch.is_alphabetic()).to_lowercase();
+    // Lowercase ordinary sentence openings; preserve capitalized proper names.
+    if matches!(word.as_str(), "он" | "она" | "оно" | "они" | "я" | "ты" | "вы"
+        | "мы" | "что" | "кто" | "как" | "где" | "когда" | "почему" | "зачем"
+        | "это" | "неужели" | "разве" | "может") {
+        result.extend(first.to_lowercase());
+    } else { result.push(first); }
+    result.push_str(&translated[start + first.len_utf8()..]);
+    result
+}
+
 /// Strips HTML tags (e.g. <b>, </b>) and unescapes basic HTML entities.
 pub fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1091,6 +1133,7 @@ impl TranslatorService {
         source_lang: &str,
         target_lang: &str,
     ) -> Result<String, String> {
+        let (text, stutter_repeats) = google_dialogue_input(text, source_lang, target_lang);
         let url = format!(
             "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&dj=1",
             urlencode(source_lang),
@@ -1122,7 +1165,7 @@ impl TranslatorService {
             return Err("No translated text received from Google".to_string());
         }
 
-        Ok(translated_pieces.join(""))
+        Ok(restore_russian_stutter(&translated_pieces.join(""), stutter_repeats))
     }
 
     pub async fn translate_deepl(
@@ -2141,6 +2184,25 @@ mod tests {
             clean_russian_punctuation(messy),
             "Привет, как дела? Это отлично!"
         );
+    }
+
+    #[test]
+    fn google_translates_complete_stuttered_questions_and_restores_target_letters() {
+        let (input, repeats) = google_dialogue_input("D-Did he find out?!", "en", "ru");
+        assert_eq!(input, "Did he find out?!");
+        assert_eq!(repeats, 1);
+        assert_eq!(restore_russian_stutter("Он узнал?!", repeats), "О-он узнал?!");
+        assert_eq!(google_dialogue_input("W-W-What is that?!", "en-US", "ru-RU"),
+                   ("What is that?!", 2));
+        assert_eq!(restore_russian_stutter("«Что это?!»", 2), "«Ч-Ч-что это?!»");
+        assert_eq!(restore_russian_stutter("Алиса здесь?", 1), "А-Алиса здесь?");
+        for text in ["D-Day is here.", "B-cell count", "state-of-the-art", "D-Did",
+                     "X-Did he find out?!", "Did he find out?!", "D--Did he find out?!"] {
+            assert_eq!(google_dialogue_input(text, "en", "ru"), (text, 0));
+        }
+        assert_eq!(google_dialogue_input("D-Did he find out?!", "en", "ja"),
+                   ("D-Did he find out?!", 0));
+        assert_eq!(restore_russian_stutter("?!", 1), "?!");
     }
 
     #[test]

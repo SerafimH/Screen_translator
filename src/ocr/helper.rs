@@ -118,6 +118,11 @@ pub fn strip_ansi_codes(s: &str) -> String {
     out
 }
 
+fn is_empty_detection_notice(line: &str) -> bool {
+    line.contains("[WARNING]")
+        && line.trim_end().ends_with("The text detection result is empty")
+}
+
 /// Resolves a relative or absolute path, checking current working directory,
 /// executable directory, and parent project directories.
 pub fn resolve_helper_path(path_str: &str) -> Option<std::path::PathBuf> {
@@ -471,6 +476,10 @@ impl OcrHelperClient {
                     let clean = strip_ansi_codes(&line);
                     if clean.contains("[ERROR]") {
                         tracing::error!("[ocr_helper] {}", clean);
+                    } else if is_empty_detection_notice(&clean) {
+                        // Empty masks/crops are normal during cursor validation.
+                        // Keep them available for diagnostics without warning spam.
+                        tracing::debug!("[ocr_helper] {}", clean);
                     } else if clean.contains("[WARNING]") || clean.contains("[WARN]") {
                         tracing::warn!("[ocr_helper] {}", clean);
                     } else {
@@ -908,6 +917,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_detection_is_a_diagnostic_notice_and_other_warnings_stay_visible() {
+        assert!(is_empty_detection_notice(
+            "[WARNING] main.py:164: The text detection result is empty"));
+        assert!(!is_empty_detection_notice("[WARNING] Failed to load OCR model"));
+        assert!(!is_empty_detection_notice("[ERROR] The text detection result is empty"));
+        assert!(!is_empty_detection_notice(
+            "[WARNING] The text detection result is empty because a model failed"));
+    }
+
+    #[test]
     fn helper_word_confidence_and_detected_geometry_survive_conversion() {
         for score in [Some(0.01), Some(0.99), None] {
             let word = recognized_helper_word(HelperWordJson {
@@ -1278,6 +1297,28 @@ mod tests {
             assert!(full_text.contains("ENTERED"), "Must contain ENTERED: {}", full_text);
             assert!(full_text.contains("NEW ERA"), "Must contain NEW ERA: {}", full_text);
             assert!(!full_text.contains("•PA"), "Must NOT contain •PA artifact: {}", full_text);
+        }
+
+        // Font normalization must preserve real word boxes at fixed screenshot
+        // coordinates, including desktop offsets on a secondary monitor.
+        for (fixture, px, py) in [
+            ("manga_condensed.png", 94, 65),
+            ("manga_low_contrast.png", 170, 57),
+        ] {
+            let mut frame = load_frame(&format!("tests/fixtures/ocr/{fixture}"));
+            frame.offset_x = -900;
+            frame.offset_y = 200;
+            let blocks = client.recognize(&frame, "en").await.expect("lettering OCR must succeed");
+            let text = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+            assert_eq!(text, "WAIT! WE HAVE TO GET OUT OF HERE!", "{fixture}");
+            let target = crate::types::find_text_under_cursor(
+                &blocks, px + frame.offset_x, py + frame.offset_y,
+            ).expect("normalized lettering must remain under the original cursor position");
+            assert_eq!(target.word_text.as_deref(), Some("HAVE"), "{fixture}");
+            assert!(!target.word_is_estimated, "font normalization must keep detected geometry");
+            assert!(crate::types::find_text_under_cursor(
+                &blocks, frame.offset_x + 10, frame.offset_y + 10,
+            ).is_none(), "background must not become a word: {fixture}");
         }
     }
 

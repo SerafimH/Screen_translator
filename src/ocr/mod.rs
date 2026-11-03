@@ -18,6 +18,14 @@ use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect, luma_fr
 pub fn merge_recognized_lines(lines: &mut Vec<RecognizedLine>, candidates: Vec<RecognizedLine>) {
     for candidate in candidates {
         if is_ocr_garbage(&candidate.text) { continue; }
+        // A rotated helper box is often taller than WinRT's tight word union.
+        // Suppress every enclosed native reading of that same baseline, rather
+        // than keeping multiple corrupt duplicates beside one confident line.
+        if lines.iter().any(|line| strong_line_covers_unscored(line, &candidate)) {
+            continue;
+        }
+        let replacement_index = lines.iter().position(|line| strong_line_covers_unscored(&candidate, line));
+        lines.retain(|line| !strong_line_covers_unscored(&candidate, line));
         let candidate_text = candidate.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
         let duplicate = lines.iter_mut().find(|line| {
             let a = line.rect;
@@ -49,8 +57,25 @@ pub fn merge_recognized_lines(lines: &mut Vec<RecognizedLine>, candidates: Vec<R
                 && candidate.confidence.unwrap_or(0.85) > existing.confidence.unwrap_or(0.85)) {
                 *existing = candidate;
             }
+        } else if let Some(index) = replacement_index {
+            lines.insert(index.min(lines.len()), candidate);
         } else { lines.push(candidate); }
     }
+}
+
+fn strong_line_covers_unscored(strong: &RecognizedLine, unscored: &RecognizedLine) -> bool {
+    if !strong.confidence.is_some_and(|score| score >= 0.95) || unscored.confidence.is_some() {
+        return false;
+    }
+    let a = strong.rect;
+    let b = unscored.rect;
+    if a.is_empty() || b.is_empty() { return false; }
+    let same_baseline = (2 * a.y as i64 + a.height as i64
+        - 2 * b.y as i64 - b.height as i64).abs() <= a.height.max(b.height) as i64 / 2;
+    same_baseline && a.height as f32 <= b.height as f32 * 1.6
+        && b.x as i64 >= a.x as i64 - 2 && b.y as i64 >= a.y as i64 - 2
+        && b.x as i64 + b.width as i64 <= a.x as i64 + a.width as i64 + 2
+        && b.y as i64 + b.height as i64 <= a.y as i64 + a.height as i64 + 2
 }
 
 pub fn ocr_tiles(width: u32, height: u32) -> Vec<ScreenRect> {
@@ -1123,8 +1148,17 @@ pub fn cluster_lines_into_blocks(
 
             let avg_line_h = (block.rect.height as f32 / block.lines.len() as f32).max(12.0);
             let v_gap = line.rect.y - (block.rect.y + block.rect.height);
+            // Slanted/handwritten line boxes can overlap vertically even when
+            // the baselines are distinct. Keep one utterance together without
+            // joining two fragments on the same row.
+            let previous = block.lines.last().expect("blocks contain at least one line");
+            let min_h = previous.rect.height.min(line.rect.height).max(1);
+            let center_distance = (line.rect.y + line.rect.height / 2)
+                - (previous.rect.y + previous.rect.height / 2);
+            let overlapping_baselines = v_gap >= -(min_h as f32 * 0.4) as i32
+                && center_distance >= min_h / 2;
 
-            if v_gap >= -6 && v_gap <= (avg_line_h * 1.45) as i32 {
+            if (v_gap >= -6 || overlapping_baselines) && v_gap <= (avg_line_h * 1.45) as i32 {
                 let x_overlap = line.rect.x.max(block.rect.x)
                     <= (line.rect.x + line.rect.width).min(block.rect.x + block.rect.width);
                 let left_aligned = (line.rect.x - block.rect.x).abs() <= 50;
@@ -1186,6 +1220,28 @@ mod tests {
         assert_eq!(lines[0].text, "Corrected");
         assert_eq!(lines[1].text, "Missing dialogue");
         assert_eq!(lines[0].confidence, Some(0.99));
+    }
+
+    #[test]
+    fn test_merge_handwritten_line_removes_all_enclosed_native_duplicates_in_either_order() {
+        let line = |text: &str, rect, confidence| RecognizedLine {
+            text: text.into(), rect, confidence, words: vec![],
+        };
+        let native = vec![
+            line("finA 044?!", ScreenRect::new(82, 133, 196, 54), None),
+            line("firlA our !", ScreenRect::new(87, 125, 195, 56), None),
+        ];
+        let helper = line("find out?!", ScreenRect::new(74, 126, 214, 65), Some(0.98));
+        for (mut lines, candidates) in [(native.clone(), vec![helper.clone()]),
+                                       (vec![helper.clone()], native)] {
+            merge_recognized_lines(&mut lines, candidates);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, "find out?!");
+            let neighbor = line("Other panel", ScreenRect::new(300, 126, 200, 65), None);
+            let lower = line("Next line", ScreenRect::new(82, 192, 196, 54), None);
+            merge_recognized_lines(&mut lines, vec![neighbor, lower]);
+            assert_eq!(lines.len(), 3, "uncovered text must remain");
+        }
     }
 
     #[test]
@@ -1340,6 +1396,30 @@ mod tests {
 
         let blocks = cluster_lines_into_blocks(vec![line1, line2], None);
         assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_handwritten_overlapping_boxes_keeps_complete_utterance() {
+        let line = |text: &str, rect| RecognizedLine {
+            text: text.into(), rect, confidence: Some(0.99), words: vec![],
+        };
+        let blocks = cluster_lines_into_blocks(vec![
+            line("D-Did he", ScreenRect::new(70, 72, 225, 75)),
+            line("find out?!", ScreenRect::new(74, 126, 214, 65)),
+        ], None);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "D-Did he find out?!");
+
+        let same_row = cluster_lines_into_blocks(vec![
+            line("Left label", ScreenRect::new(10, 20, 100, 60)),
+            line("Right label", ScreenRect::new(120, 25, 110, 60)),
+        ], None);
+        assert_eq!(same_row.len(), 2, "same-row labels must remain separate");
+        let other_panel = cluster_lines_into_blocks(vec![
+            line("D-Did he", ScreenRect::new(70, 72, 225, 75)),
+            line("Other bubble", ScreenRect::new(500, 126, 214, 65)),
+        ], None);
+        assert_eq!(other_panel.len(), 2, "nearby panels must remain separate");
     }
 
     #[test]

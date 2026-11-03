@@ -87,5 +87,61 @@
     ],
     "max_cer": 0.05,
     "max_wer": 0.0
+  },
+  {
+    "file": "manga_comic.png",
+    "kind": "synthetic English comic speech lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_italic.png",
+    "kind": "synthetic bold italic comic lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_condensed.png",
+    "kind": "synthetic horizontally compressed bold comic lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_heavy.png",
+    "kind": "synthetic heavy Impact lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_outline.png",
+    "kind": "synthetic white comic lettering with a black outline",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_low_contrast.png",
+    "kind": "synthetic faint dark comic lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_handwritten.png",
+    "kind": "synthetic English handwritten lettering",
+    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
+  },
+  {
+    "file": "manga_handwritten_black.png",
+    "kind": "user-provided handwritten English text on a black manga panel",
+    "lines": ["D-Did he", "find out?!"],
+    "max_cer": 0.0,
+    "max_wer": 0.0
   }
 ]

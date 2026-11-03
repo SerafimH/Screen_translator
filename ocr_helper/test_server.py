@@ -19,6 +19,8 @@ from ocr_helper.server import (
     create_ocr_engine,
     extract_lines_from_result,
     filter_ocr_lines,
+    is_condensed_lettering,
+    lettering_variants,
     merge_ocr_lines,
     process_request,
     read_exact,
@@ -41,6 +43,133 @@ class MockEngine:
 
 
 class TestOcrHelperProtocol(unittest.TestCase):
+    def test_condensed_lettering_detection_is_limited_to_long_latin_text(self):
+        box = [[10, 10], [80, 10], [80, 30], [10, 30]]
+        self.assertTrue(is_condensed_lettering({"text": "WAIT FOR ME NOW", "box": box}))
+        for text in ("III", "はい、待ってください", "Hello"):
+            self.assertFalse(is_condensed_lettering({"text": text, "box": box}))
+        self.assertFalse(is_condensed_lettering({"text": "WAIT FOR ME NOW",
+                                               "box": [[0, 0], [300, 0], [300, 20], [0, 20]]}))
+
+    def test_lettering_normalization_handles_polarity_and_measured_stroke_weight(self):
+        from ocr_helper import server
+        if server.cv2 is None or server.np is None:
+            self.skipTest("OpenCV and numpy are required")
+        cv, np = server.cv2, server.np
+        for thickness in (1, 10):
+            img = np.full((60, 160, 3), 205, dtype=np.uint8)
+            for x in range(20, 140, 20):
+                img[20:40, x:x + thickness] = 202
+            before = img.copy()
+            normal = list(lettering_variants(img))
+            inverse = list(lettering_variants(255 - img))
+            self.assertEqual(len(normal), 2)
+            self.assertTrue(np.array_equal(img, before))
+            for (a, sx, sy), (b, _, _) in zip(normal, inverse):
+                self.assertTrue(np.array_equal(a, b))
+                self.assertEqual(a.shape[:2], (round(60 * sy), round(160 * sx)))
+                self.assertEqual(a.dtype, np.uint8)
+            unadjusted = cv.resize(normal[0][0], (320, 120), interpolation=cv.INTER_CUBIC)
+            adjusted_ink = int((normal[1][0][:, :, 0] < 128).sum())
+            previous_ink = int((unadjusted[:, :, 0] < 128).sum())
+            if thickness == 1:
+                self.assertGreater(adjusted_ink, previous_ink)
+            else:
+                self.assertLess(adjusted_ink, previous_ink)
+
+    def test_lettering_normalization_skips_blank_and_large_images(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("OpenCV and numpy are required")
+        for shape in ((40, 120, 3), (1080, 1920, 3), (4, 100, 3)):
+            self.assertEqual(list(lettering_variants(server.np.zeros(shape, dtype=server.np.uint8))), [])
+
+    def test_lettering_size_limit_does_not_duplicate_confirmation_views(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("OpenCV and numpy are required")
+        img = server.np.full((60, 2200, 3), 255, dtype=server.np.uint8)
+        server.cv2.putText(img, "WAIT HERE", (20, 35), server.cv2.FONT_HERSHEY_SIMPLEX,
+                           0.8, (0, 0, 0), 1)
+        variants = list(lettering_variants(img))
+        self.assertEqual(len(variants), 1)
+        self.assertLessEqual(max(variants[0][0].shape[:2]), 2000)
+
+    def test_anisotropic_lettering_maps_line_and_word_boxes_without_mutating_input(self):
+        box = [[36, 20], [180, 20], [180, 60], [36, 60]]
+        line = {"text": "WAIT", "score": 0.97, "box": box,
+                "words": [{"text": "WAIT", "score": 0.96, "box": box}]}
+        mapped = rescale_boxes_down([line], 3.6, 2.0)[0]
+        expected = [[10.0, 10.0], [50.0, 10.0], [50.0, 30.0], [10.0, 30.0]]
+        self.assertEqual(mapped["box"], expected)
+        self.assertEqual(mapped["words"][0]["box"], expected)
+        self.assertEqual(mapped["words"][0]["score"], 0.96)
+        self.assertEqual(line["box"], box)
+        self.assertEqual(line["words"][0]["box"], box)
+
+    def test_lettering_refinement_keeps_original_screen_geometry_and_rejects_neighbors(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("OpenCV and numpy are required")
+        img = server.np.full((120, 180, 3), 255, dtype=server.np.uint8)
+        line = {"text": "HE1P", "score": 0.7,
+                "box": [[40, 50], [100, 50], [100, 65], [40, 65]]}
+        local = [[72, 40], [288, 40], [288, 70], [72, 70]]
+        corrected = {"text": "HELP", "score": 0.96, "box": local,
+                     "words": [{"text": "HELP", "score": 0.95, "box": local}]}
+        import copy
+        for neighbor in (False, True):
+            candidate = copy.deepcopy(corrected)
+            if neighbor:
+                candidate["box"] = [[72, 0], [288, 0], [288, 20], [72, 20]]
+            with patch("ocr_helper.server.lettering_variants", return_value=[(img, 3.6, 2.0)]), \
+                 patch("ocr_helper.server.call_engine", side_effect=[[], [], [candidate]]):
+                result = refine_problematic_box(img, line, None, english_lettering=True)
+            self.assertEqual(result["text"], "HE1P" if neighbor else "HELP")
+            self.assertEqual(result["box"], line["box"])
+            if not neighbor:
+                self.assertEqual(result["words"][0]["box"], line["box"])
+
+    def test_faint_lettering_recovery_requires_two_agreeing_high_confidence_views(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("OpenCV and numpy are required")
+        img = server.np.full((60, 160, 3), 205, dtype=server.np.uint8)
+        a = {"text": "WAIT HERE", "score": 0.96,
+             "box": [[10, 10], [120, 10], [120, 30], [10, 30]]}
+        import copy
+        for other_text, score, shift, expected in (("WAIT HERE", 0.97, 0, True),
+                                                  ("WHAT HERE", 0.99, 0, False),
+                                                  ("WAIT HERE", 0.7, 0, False),
+                                                  ("WAIT HERE", 0.99, 60, False)):
+            b = copy.deepcopy(a)
+            b.update(text=other_text, score=score)
+            b["box"] = [[x * 2, (y + shift) * 2] for x, y in b["box"]]
+            with self.subTest(text=other_text, score=score, shift=shift), \
+                 patch("ocr_helper.server.lettering_variants", return_value=[(img, 1, 1), (img, 2, 2)]), \
+                 patch("ocr_helper.server.call_engine", side_effect=[[], [], [copy.deepcopy(a)], [b]]):
+                response = process_request(dict(id=1, width=160, height=60, lang="en"), img.tobytes(), None)
+            self.assertTrue(response["ok"], response)
+            self.assertEqual(len(response["lines"]), int(expected))
+            if expected:
+                self.assertEqual(response["lines"][0], a)
+
+    def test_english_lettering_passes_are_bounded_and_leave_other_languages_alone(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("OpenCV and numpy are required")
+        lines = [{"text": "UNCERTAIN", "score": 0.7,
+                  "box": [[10, i * 22], [150, i * 22], [150, i * 22 + 20], [10, i * 22 + 20]]}
+                 for i in range(10)]
+        img = server.np.zeros((300, 200, 3), dtype=server.np.uint8)
+        for lang, expected in (("en", 4), ("ja", 0)):
+            with patch("ocr_helper.server.should_upscale_frame", return_value=False), \
+                 patch("ocr_helper.server.call_engine", return_value=lines), \
+                 patch("ocr_helper.server.refine_problematic_box", side_effect=lambda image, line, *a, **kw: line) as refine:
+                response = process_request(dict(id=1, width=200, height=300, lang=lang), img.tobytes(), None)
+            self.assertTrue(response["ok"], response)
+            self.assertEqual(sum(call.kwargs["english_lettering"] for call in refine.call_args_list), expected)
+
     def test_ready_follows_model_warmup_and_keeps_stdout_clean(self):
         for configured, expected in (("ja-JP", "ja"), ("", "en")):
             output = io.BytesIO()
