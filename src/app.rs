@@ -14,7 +14,8 @@ use crate::ocr::{
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
 use crate::types::{
-    AppConfig, OcrBlock, OcrMode, ScreenRect, TranslationBlock, find_text_under_cursor,
+    AppConfig, OcrBlock, OcrMode, ScreenRect, TextUnderCursor, TranslationBlock,
+    cursor_word_key, cursor_word_token, find_text_under_cursor,
 };
 
 /// RAII Guard that ensures `is_processing` is unconditionally reset to false upon completion or error.
@@ -609,134 +610,42 @@ impl AppState {
             return;
         }
 
-        let Some(target) = find_text_under_cursor(&blocks, pt.x, pt.y) else {
-            info!("No text found under cursor at ({}, {})", pt.x, pt.y);
-            self.overlay.set_loading(false, Some("Готов".to_string()));
+        let initial = find_text_under_cursor(&blocks, pt.x, pt.y);
+        let Some(target) = self.verify_cursor_target(&frame, &cfg, initial, pt).await else {
+            self.overlay.clear_cursor_card();
+            self.overlay.set_loading(false, Some("Не удалось уверенно распознать слово под курсором".to_string()));
             return;
         };
-
-        let is_multi_word = target
-            .word_text
-            .as_ref()
-            .map(|w| w.to_lowercase() != target.sentence_text.to_lowercase())
-            .unwrap_or(false)
-            && target.sentence_text.split_whitespace().count() > 1;
-
-        let translation_block = if target.word_text.is_none() {
-            // Line found but no resolvable word (e.g. cursor on "..."): translate the whole sentence.
-            let sentence_trans = self
-                .translator
-                .translate_text(&target.sentence_text, &cfg.source_lang, &cfg.target_lang, &cfg)
-                .await
-                .unwrap_or_else(|_| target.sentence_text.clone());
-            TranslationBlock {
-                original_text: target.sentence_text.clone(),
-                translated_text: format!("«{}»\n→ «{}»", target.sentence_text, sentence_trans),
-                rect: ScreenRect::new(
-                    target.sentence_rect.x,
-                    target.sentence_rect.y,
-                    target.sentence_rect.width.max(420),
-                    target.sentence_rect.height,
-                ),
-            }
-        } else if is_multi_word {
-            let word = target.word_text.as_ref().unwrap();
-            let is_suspicious = is_suspicious_word(word);
-
-            let (card_header, sentence_trans) = if is_suspicious {
-                let sentence_res = self
-                    .translator
-                    .translate_text(
-                        &target.sentence_text,
-                        &cfg.source_lang,
-                        &cfg.target_lang,
-                        &cfg,
-                    )
-                    .await;
-                let header = format!("Слово: {} (не удалось распознать)", word);
-                let trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
-                (header, trans)
-            } else {
-                let word_fut = self
-                    .translator
-                    .lookup_word_details(word, &cfg.source_lang, &cfg.target_lang, &cfg);
-                let sentence_fut = self.translator.translate_text(
-                    &target.sentence_text,
-                    &cfg.source_lang,
-                    &cfg.target_lang,
-                    &cfg,
-                );
-                let (details, sentence_res) = tokio::join!(word_fut, sentence_fut);
-
-                let trans = sentence_res.unwrap_or_else(|_| target.sentence_text.clone());
-                let mut header = format!("Слово: {} → {}", word, details.primary);
-                if !details.synonyms.is_empty() {
-                    header.push_str(&format!(" ({})", details.synonyms.join(", ")));
-                }
-                if !details.examples.is_empty() {
-                    header.push_str("\n\nПримеры:");
-                    for ex in &details.examples {
-                        header.push_str(&format!("\n• {}", ex));
-                    }
-                }
-                (header, trans)
-            };
-
-            let mut card_text = card_header;
-            card_text.push_str("\n\nВ контексте предложения:\n«");
-            card_text.push_str(&target.sentence_text);
-            card_text.push_str("»\n→ «");
-            card_text.push_str(&sentence_trans);
-            card_text.push('»');
-
-            let card_w = target.sentence_rect.width.max(420);
-            TranslationBlock {
-                original_text: format!("{} ({})", word, target.sentence_text),
-                translated_text: card_text,
-                rect: ScreenRect::new(
-                    target.sentence_rect.x,
-                    target.sentence_rect.y,
-                    card_w,
-                    target.sentence_rect.height,
-                ),
-            }
-        } else {
-            let word_or_line = target.word_text.as_ref().unwrap_or(&target.sentence_text);
-            let is_suspicious = is_suspicious_word(word_or_line);
-
-            let card_text = if is_suspicious {
-                format!("Слово: {} (не удалось распознать)", word_or_line)
-            } else {
-                let details = self
-                    .translator
-                    .lookup_word_details(word_or_line, &cfg.source_lang, &cfg.target_lang, &cfg)
-                    .await;
-
-                let mut text = format!("Слово: {} → {}", word_or_line, details.primary);
-                if !details.synonyms.is_empty() {
-                    text.push_str(&format!(" ({})", details.synonyms.join(", ")));
-                }
-                if !details.examples.is_empty() {
-                    text.push_str("\n\nПримеры:");
-                    for ex in &details.examples {
-                        text.push_str(&format!("\n• {}", ex));
-                    }
-                }
-                text
-            };
-
-            let card_w = target
-                .word_rect
-                .map(|r| r.width)
-                .unwrap_or(target.sentence_rect.width)
-                .max(360);
-            let base_rect = target.word_rect.unwrap_or(target.sentence_rect);
-
-            TranslationBlock {
-                original_text: word_or_line.clone(),
-                translated_text: card_text,
-                rect: ScreenRect::new(base_rect.x, base_rect.y, card_w, base_rect.height),
-            }
+        if !cursor_is_still_on_target(&target) {
+            self.overlay.clear_cursor_card();
+            return;
+        }
+        let Some(word) = target.word_text.as_ref() else { return; };
+        let details_fut = self.translator.lookup_word_details(word, &cfg.source_lang, &cfg.target_lang, &cfg);
+        let context = (target.sentence_text != *word && cursor_context_is_clean(&target.sentence_text))
+            .then_some(target.sentence_text.as_str());
+        let sentence_fut = async {
+            if let Some(context) = context {
+                self.translator.translate_text(context, &cfg.source_lang, &cfg.target_lang, &cfg).await.ok()
+            } else { None }
+        };
+        let (details, sentence_translation) = tokio::join!(details_fut, sentence_fut);
+        let mut card_text = format!("Слово: {} → {}", word, details.primary);
+        if !details.synonyms.is_empty() {
+            card_text.push_str(&format!(" ({})", details.synonyms.join(", ")));
+        }
+        if !details.examples.is_empty() {
+            card_text.push_str("\n\nПримеры:");
+            for example in &details.examples { card_text.push_str(&format!("\n• {}", example)); }
+        }
+        if let (Some(context), Some(translation)) = (context, sentence_translation) {
+            card_text.push_str(&format!("\n\nВ контексте предложения:\n«{}»\n→ «{}»", context, translation));
+        }
+        let base_rect = target.word_rect.unwrap_or(target.line_rect);
+        let translation_block = TranslationBlock {
+            original_text: if let Some(context) = context { format!("{} ({})", word, context) } else { word.clone() },
+            translated_text: card_text,
+            rect: ScreenRect::new(base_rect.x, base_rect.y, base_rect.width.max(420), base_rect.height),
         };
 
         if cfg.dump_ocr {
@@ -751,8 +660,8 @@ impl AppState {
             );
         }
 
-        if !crate::overlay::is_shift_held() {
-            info!("Shift was released before translation finished, skipping card display.");
+        if !cursor_is_still_on_target(&target) {
+            info!("Cursor left the verified word or Shift was released, skipping card display.");
             self.overlay.set_loading(false, Some("Готов".to_string()));
             return;
         }
@@ -762,6 +671,46 @@ impl AppState {
         info!("{}", status);
         self.overlay
             .update_cursor_card(Some(translation_block), Some(status));
+    }
+
+    async fn verify_cursor_target(
+        &self, frame: &CapturedFrame, cfg: &AppConfig,
+        initial: Option<TextUnderCursor>, pt: POINT,
+    ) -> Option<TextUnderCursor> {
+        let initial = initial.or_else(|| cursor_search_hint(frame, pt))?;
+        let crop_rect = cursor_line_crop(frame, initial.line_rect)?;
+        let crop = crop_frame(frame, crop_rect).ok()?;
+        let mut readings = Vec::new();
+        if let Some(native) = &self.ocr {
+            if let Ok(lines) = native.recognize_raw(&crop).await {
+                readings.push(find_text_under_cursor(&cluster_lines_into_blocks(lines, None), pt.x, pt.y));
+            }
+            if let Ok(lines) = native.recognize_pass_1(&crop).await {
+                readings.push(find_text_under_cursor(&cluster_lines_into_blocks(lines, None), pt.x, pt.y));
+            }
+        }
+        if self.helper_ocr.is_ready() {
+            if let Ok(blocks) = self.helper_ocr.recognize(&crop, &cfg.ocr_lang).await {
+                readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
+            }
+        }
+        if let Some(target) = choose_verified_cursor_target(&initial, &readings, cfg.helper_min_score) {
+            return Some(target);
+        }
+        // A missing coarse reading needs two crop readings. This also works when
+        // WinRT is unavailable; do not retry away a conflict between valid words.
+        let valid_count = readings.iter().flatten()
+            .filter(|reading| reliable_cursor_token(reading, cfg.helper_min_score).is_some()).count();
+        if valid_count == 1 && self.helper_ocr.is_ready() {
+            let second_rect = cursor_line_crop_with_padding(frame, initial.line_rect, 20)?;
+            if second_rect != crop_rect {
+                let second_crop = crop_frame(frame, second_rect).ok()?;
+                if let Ok(blocks) = self.helper_ocr.recognize(&second_crop, &cfg.ocr_lang).await {
+                    readings.push(find_text_under_cursor(&blocks, pt.x, pt.y));
+                }
+            }
+        }
+        choose_verified_cursor_target(&initial, &readings, cfg.helper_min_score)
     }
 
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
@@ -1021,6 +970,95 @@ impl AppState {
     }
 }
 
+/// A line-sized crop retains complete words while excluding unrelated paragraphs.
+fn cursor_search_hint(frame: &CapturedFrame, pt: POINT) -> Option<TextUnderCursor> {
+    let x = pt.x as i64 - frame.offset_x as i64;
+    let y = pt.y as i64 - frame.offset_y as i64;
+    if x < 0 || y < 0 || x >= frame.width as i64 || y >= frame.height as i64 { return None; }
+    Some(TextUnderCursor {
+        raw_word: None, word_confidence: None, word_is_estimated: true,
+        line_rect: ScreenRect::new(pt.x.saturating_sub(172), pt.y.saturating_sub(40), 344, 80),
+        word_text: None, word_rect: None, sentence_text: String::new(),
+        sentence_rect: ScreenRect::new(pt.x, pt.y, 0, 0),
+    })
+}
+
+fn cursor_line_crop(frame: &CapturedFrame, line: ScreenRect) -> Option<ScreenRect> {
+    cursor_line_crop_with_padding(frame, line, 8)
+}
+
+fn cursor_line_crop_with_padding(frame: &CapturedFrame, line: ScreenRect, padding: i64) -> Option<ScreenRect> {
+    let left = (line.x as i64 - frame.offset_x as i64 - padding).clamp(0, frame.width as i64);
+    let top = (line.y as i64 - frame.offset_y as i64 - padding).clamp(0, frame.height as i64);
+    let right = (line.x as i64 + line.width as i64 - frame.offset_x as i64 + padding).clamp(0, frame.width as i64);
+    let bottom = (line.y as i64 + line.height as i64 - frame.offset_y as i64 + padding).clamp(0, frame.height as i64);
+    if right <= left || bottom <= top { return None; }
+    Some(ScreenRect::new(left as i32, top as i32, (right-left) as i32, (bottom-top) as i32))
+}
+
+fn reliable_cursor_token(target: &TextUnderCursor, min_score: f32) -> Option<&str> {
+    if target.word_confidence.is_some_and(|score| !score.is_finite() || score > 1.0 || score < min_score.max(0.8)) {
+        return None;
+    }
+    cursor_word_token(target.raw_word.as_deref()?)
+}
+
+/// Agreement is required; a score cannot resolve conflicting crop readings.
+fn choose_verified_cursor_target(
+    initial: &TextUnderCursor, crop_readings: &[Option<TextUnderCursor>], min_score: f32,
+) -> Option<TextUnderCursor> {
+    let valid: Vec<(&TextUnderCursor, &str)> = crop_readings.iter().flatten()
+        .filter_map(|reading| reliable_cursor_token(reading, min_score).map(|token| (reading, token))).collect();
+    let (_, token) = *valid.first()?;
+    let normalized = cursor_word_key(token)?;
+    if valid.iter().any(|(_, other)| cursor_word_key(other).as_ref() != Some(&normalized)) { return None; }
+    let initial_agrees = reliable_cursor_token(initial, min_score)
+        .is_some_and(|original| cursor_word_key(original).as_ref() == Some(&normalized));
+    if valid.len() + usize::from(initial_agrees) < 2 { return None; }
+    let real = valid.iter().find(|(reading, _)| !reading.word_is_estimated)
+        .map(|(reading, _)| *reading)
+        .or_else(|| (initial_agrees && !initial.word_is_estimated).then_some(initial))?;
+    let mut accepted = real.clone();
+    // Case-insensitive agreement confirms letters, not a different meaning of
+    // US/us or Polish/polish. Keep the original spelling when it was confirmed.
+    accepted.word_text = Some(if initial_agrees {
+        reliable_cursor_token(initial, min_score)?.to_string()
+    } else { token.to_string() });
+    if initial_agrees && cursor_context_is_clean(&initial.sentence_text) {
+        accepted.sentence_text = initial.sentence_text.clone();
+        accepted.sentence_rect = initial.sentence_rect;
+    } else if !cursor_context_is_clean(&accepted.sentence_text) {
+        accepted.sentence_text = token.to_string();
+    }
+    Some(accepted)
+}
+
+fn cursor_context_is_clean(text: &str) -> bool {
+    // A sentence is not a dictionary token: numbers and separated punctuation
+    // are ordinary context, while OCR corruption such as @#* stays forbidden.
+    text.chars().any(char::is_alphanumeric) && text.chars().all(|ch| {
+        ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch,
+            '.' | ',' | '!' | '?' | ':' | ';' | '…' | '"' | '\'' | 'ʼ'
+            | '‘' | '’' | '“' | '”' | '«' | '»' | '(' | ')' | '[' | ']' | '{' | '}'
+            | '-' | '‐' | '‑' | '—' | '–' | '/' | '%' | '+' | '=' | '&'
+            | '。' | '、' | '！' | '？' | '，' | '：' | '；'
+            | '「' | '」' | '『' | '』' | '（' | '）')
+    })
+}
+
+fn cursor_is_still_on_target(target: &TextUnderCursor) -> bool {
+    if !crate::overlay::is_shift_held() { return false; }
+    let mut pt = POINT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.is_err() { return false; }
+    target.word_rect.is_some_and(|rect| cursor_point_on_word(rect, pt))
+}
+
+fn cursor_point_on_word(rect: ScreenRect, pt: POINT) -> bool {
+    !rect.is_empty() && pt.x as i64 >= rect.x as i64 - 2 && pt.y as i64 >= rect.y as i64 - 2
+        && (pt.x as i64) < rect.x as i64 + rect.width as i64 + 2
+        && (pt.y as i64) < rect.y as i64 + rect.height as i64 + 2
+}
+
 fn translation_status(block_count: usize, elapsed_ms: u128, errors: &[String], retry: Option<&str>) -> String {
     if errors.is_empty() {
         format!("Переведено {block_count} блоков за {elapsed_ms} мс")
@@ -1034,6 +1072,176 @@ fn translation_status(block_count: usize, elapsed_ms: u128, errors: &[String], r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cursor_reading(raw: &str, confidence: Option<f32>, estimated: bool) -> TextUnderCursor {
+        let rect = ScreenRect::new(100, 100, 80, 20);
+        TextUnderCursor {
+            raw_word: Some(raw.to_string()), word_confidence: confidence, word_is_estimated: estimated,
+            line_rect: rect, word_text: cursor_word_token(raw).map(str::to_string), word_rect: Some(rect),
+            sentence_text: raw.to_string(), sentence_rect: rect,
+        }
+    }
+
+    #[test]
+    fn cursor_verification_requires_real_geometry_and_consistent_rereading() {
+        let initial = cursor_reading("Hello", None, false);
+        assert!(choose_verified_cursor_target(&initial, &[], 0.5).is_none());
+        let accepted = choose_verified_cursor_target(&initial, &[Some(cursor_reading("HELLO", Some(0.99), false))], 0.5).unwrap();
+        assert_eq!(accepted.word_text.as_deref(), Some("Hello"));
+        assert!(choose_verified_cursor_target(&initial, &[
+            Some(cursor_reading("Hello", None, false)), Some(cursor_reading("Help", Some(0.99), false)),
+        ], 0.5).is_none());
+        let estimated = cursor_reading("Hello", Some(0.99), true);
+        assert!(choose_verified_cursor_target(&estimated, &[Some(estimated.clone())], 0.5).is_none());
+        assert!(choose_verified_cursor_target(&estimated, &[Some(initial.clone())], 0.5).is_some());
+        assert!(cursor_point_on_word(accepted.word_rect.unwrap(), POINT { x: 120, y: 110 }));
+        assert!(!cursor_point_on_word(accepted.word_rect.unwrap(), POINT { x: 250, y: 110 }));
+    }
+
+    #[test]
+    fn english_punctuation_variants_do_not_create_false_ocr_conflicts() {
+        for (observed, reread) in [("don't", "don’t"), ("state-of-the-art", "state‑of‑the‑art"),
+            ("O'Neill", "OʼNeill")] {
+            let initial = cursor_reading(observed, None, false);
+            let crop = cursor_reading(reread, Some(0.99), false);
+            let accepted = choose_verified_cursor_target(&initial, &[Some(crop)], 0.5)
+                .expect("equivalent typography should confirm the observed English word");
+            assert_eq!(accepted.word_text.as_deref(), Some(observed));
+        }
+        let initial = cursor_reading("form", None, false);
+        assert!(choose_verified_cursor_target(&initial,
+            &[Some(cursor_reading("from", Some(0.99), false))], 0.5).is_none());
+    }
+
+    #[test]
+    fn cursor_confirmation_preserves_case_sensitive_word_and_context() {
+        for (original, reread, context) in [
+            ("US", "us", "I live in the US."),
+            ("us", "US", "Come with us."),
+            ("Polish", "polish", "I speak Polish."),
+            ("iPhone", "IPHONE", "My iPhone works."),
+        ] {
+            let mut initial = cursor_reading(original, Some(0.99), false);
+            initial.sentence_text = context.to_string();
+            let accepted = choose_verified_cursor_target(&initial,
+                &[Some(cursor_reading(reread, Some(0.99), false))], 0.5).unwrap();
+            assert_eq!(accepted.word_text.as_deref(), Some(original));
+            assert_eq!(accepted.sentence_text, context);
+        }
+    }
+
+    #[test]
+    fn cursor_context_accepts_numbers_and_sentence_punctuation_without_accepting_corruption() {
+        for context in ["I have 100 HP.", "Hello , world !", "HP:100 / 200 (50%).",
+            "Level 10: HP + 20% & MP = 50."] {
+            assert!(cursor_context_is_clean(context), "Valid context rejected: {context}");
+            let mut initial = cursor_reading("HP", None, false);
+            initial.sentence_text = context.to_string();
+            let accepted = choose_verified_cursor_target(&initial,
+                &[Some(cursor_reading("HP", Some(0.99), false))], 0.5).unwrap();
+            assert_eq!(accepted.sentence_text, context);
+            assert_ne!(accepted.sentence_text, accepted.word_text.unwrap());
+        }
+        for context in ["", "   ", "... !?", "*#($#", "Read Jdlk;@#k4 now"] {
+            assert!(!cursor_context_is_clean(context), "Corrupt context accepted: {context}");
+        }
+    }
+
+    #[test]
+    fn cursor_verification_rejects_artifacts_and_low_word_confidence() {
+        for raw in ["*#($#", "Jdlk;@#k4", "*#Jdlk;@#"] {
+            let bad = cursor_reading(raw, Some(0.99), false);
+            assert!(choose_verified_cursor_target(&bad, &[Some(bad.clone())], 0.5).is_none());
+        }
+        let good = cursor_reading("Hello", Some(0.99), false);
+        for confidence in [0.01, 1.1, f32::NAN, f32::INFINITY] {
+            let bad = cursor_reading("Hello", Some(confidence), false);
+            assert!(choose_verified_cursor_target(&good, &[Some(bad)], 0.5).is_none());
+        }
+        assert!(choose_verified_cursor_target(&good, &[Some(cursor_reading("Hello", Some(0.85), false))], 0.9).is_none());
+    }
+
+    #[test]
+    fn cursor_verification_can_recover_bad_initial_text_without_exposing_it() {
+        let mut bad = cursor_reading("Jdlk;@#k4", Some(0.99), false);
+        bad.sentence_text = "Please Jdlk;@#k4 now".to_string();
+        for name in ["iPhone", "McDonald", "don't", "state-of-the-art"] {
+            let corrected = cursor_reading(name, Some(0.99), false);
+            assert!(choose_verified_cursor_target(&bad, &[Some(corrected.clone())], 0.5).is_none());
+            let accepted = choose_verified_cursor_target(&bad, &[Some(corrected.clone()), Some(corrected)], 0.5).unwrap();
+            assert_eq!(accepted.word_text.as_deref(), Some(name));
+            assert_eq!(accepted.sentence_text, name);
+            assert!(!accepted.sentence_text.contains('@'));
+        }
+        let mut initial = cursor_reading("qzxvbnm", Some(0.99), false);
+        initial.sentence_text = "PLEASE qzxvbnm NOW".to_string();
+        let corrected = cursor_reading("FOLLOW", Some(0.99), false);
+        let accepted = choose_verified_cursor_target(&initial, &[Some(corrected.clone()), Some(corrected)], 0.5).unwrap();
+        assert_eq!(accepted.sentence_text, "FOLLOW");
+    }
+
+    #[test]
+    fn cursor_crop_clamps_locally_and_preserves_negative_desktop_offsets() {
+        let frame = CapturedFrame { width: 100, height: 50, offset_x: -500, offset_y: -200,
+            bgra_bytes: vec![255; 100 * 50 * 4] };
+        let rect = cursor_line_crop(&frame, ScreenRect::new(-498, -199, 40, 20)).unwrap();
+        assert_eq!(rect, ScreenRect::new(0, 0, 50, 29));
+        let crop = crop_frame(&frame, rect).unwrap();
+        assert_eq!((crop.offset_x, crop.offset_y, crop.width, crop.height), (-500, -200, 50, 29));
+        assert!(cursor_line_crop(&frame, ScreenRect::new(500, 500, 10, 10)).is_none());
+        let center = POINT { x: -450, y: -175 };
+        let hint = cursor_search_hint(&frame, center).unwrap();
+        assert_eq!(cursor_line_crop(&frame, hint.line_rect), Some(ScreenRect::new(0, 0, 100, 50)));
+        assert!(cursor_search_hint(&frame, POINT { x: 0, y: 0 }).is_none());
+        let reading = cursor_reading("Hello", None, false);
+        assert!(choose_verified_cursor_target(&hint, &[Some(reading.clone())], 0.5).is_none());
+        assert!(choose_verified_cursor_target(&hint, &[Some(reading.clone()), Some(reading)], 0.5).is_some());
+    }
+
+    #[tokio::test]
+    async fn cursor_crop_recognition_accepts_real_fixture_word_and_rejects_background() {
+        use crate::overlay::OverlaySharedState;
+        use windows::Win32::Foundation::HWND;
+        let rgba = image::open("tests/fixtures/ocr/small_subtitle.png").unwrap().to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut bgra = rgba.into_raw();
+        for pixel in bgra.chunks_exact_mut(4) { pixel.swap(0, 2); }
+        let frame = CapturedFrame { width, height, bgra_bytes: bgra, offset_x: 0, offset_y: 0 };
+        let config = Arc::new(Mutex::new(AppConfig {
+            ocr_engine: OcrMode::Helper, helper_timeout_ms: 15_000, ..AppConfig::default()
+        }));
+        let helper = OcrHelperClient::new(config.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !helper.is_ready() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+        }).await.expect("fixture helper must initialize within its startup budget");
+        let blocks = helper.recognize(&frame, "en").await.expect("fixture OCR helper must work");
+        let state = AppState {
+            config: config.clone(), overlay: OverlayHandle { hwnd: HWND(std::ptr::null_mut()),
+                shared_state: Arc::new(Mutex::new(OverlaySharedState::default())) },
+            ocr: None, helper_ocr: helper, translator: Arc::new(TranslatorService::new()),
+            active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
+            is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            current_task: Arc::new(Mutex::new(None)),
+        };
+        let cfg = config.lock().unwrap().clone();
+        let pt = POINT { x: 273, y: 89 };
+        let initial = find_text_under_cursor(&blocks, pt.x, pt.y);
+        let accepted = state.verify_cursor_target(&frame, &cfg, initial, pt).await
+            .expect("a real, correctly reread word should be accepted");
+        assert_eq!(accepted.word_text.unwrap().to_lowercase(), "wait");
+        // Without WinRT and without a coarse candidate, two distinct helper
+        // crops must be able to confirm the word while retaining real geometry.
+        let hint = cursor_search_hint(&frame, pt).unwrap();
+        assert_ne!(cursor_line_crop(&frame, hint.line_rect),
+            cursor_line_crop_with_padding(&frame, hint.line_rect, 20));
+        let recovered = state.verify_cursor_target(&frame, &cfg, None, pt).await
+            .expect("helper-only fallback must recover a missed coarse word");
+        assert_eq!(recovered.word_text.unwrap().to_lowercase(), "wait");
+        assert!(!recovered.word_is_estimated);
+        let background = POINT { x: 50, y: 40 };
+        assert!(state.verify_cursor_target(&frame, &cfg,
+            find_text_under_cursor(&blocks, background.x, background.y), background).await.is_none());
+    }
 
     #[test]
     fn failed_translation_status_shows_count_cause_and_hides_keys() {

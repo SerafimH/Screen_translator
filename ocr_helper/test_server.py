@@ -25,6 +25,7 @@ from ocr_helper.server import (
     refine_problematic_box,
     rescale_boxes_down,
     resolve_models_dir,
+    score_ocr_candidate,
     run_server,
     save_ocr_debug_dump,
     should_upscale_frame,
@@ -268,6 +269,12 @@ class TestOcrHelperProtocol(unittest.TestCase):
 
     def test_create_ocr_engine_passes_lang_type(self):
         with patch("rapidocr.RapidOCR") as mock_rapid:
+            create_ocr_engine(None, lang="en")
+            mock_rapid.assert_called_once_with(params={
+                "Rec.lang_type": "en", "Det.limit_type": "max", "Det.limit_side_len": 2000,
+            })
+
+        with patch("rapidocr.RapidOCR") as mock_rapid:
             create_ocr_engine(None, lang="ja")
             mock_rapid.assert_called_once_with(params={"Rec.lang_type": "japan"})
 
@@ -486,6 +493,27 @@ class TestOcrHelperProtocol(unittest.TestCase):
             self.assertTrue(resp["ok"])
             self.assertEqual(len(resp["lines"]), 1)
             self.assertEqual(resp["lines"][0]["text"], "Variant recognized")
+
+    def test_candidate_ranking_does_not_reward_extra_nonsense_words(self):
+        self.assertGreater(score_ocr_candidate("HELP", 0.95),
+                           score_ocr_candidate("qzxv bnm klm", 0.74))
+        for text in ("don't", "state-of-the-art", "iPhone", "McDonald", "Gungnir"):
+            self.assertAlmostEqual(score_ocr_candidate(text, 0.91), 0.91)
+        self.assertLess(score_ocr_candidate("Jdlk;@#k4", 0.91), 0.91)
+        self.assertEqual(score_ocr_candidate("HELLO", float("nan")), 0.0)
+
+    def test_refinement_cannot_replace_clear_text_with_longer_low_confidence_noise(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        original = {"text": "HELP", "score": 0.90,
+                    "box": [[40, 50], [100, 50], [100, 65], [40, 65]]}
+        noisy = {"text": "qzxv bnm klm", "score": 0.74,
+                 "box": [[20, 20], [80, 20], [80, 35], [20, 35]]}
+        with patch("ocr_helper.server.call_engine", side_effect=[[noisy], []]):
+            result = refine_problematic_box(server.np.zeros((120, 180, 3), dtype=server.np.uint8),
+                                            original, None)
+        self.assertEqual(result, original)
 
     def test_refinement_only_replaces_the_original_line(self):
         from ocr_helper import server

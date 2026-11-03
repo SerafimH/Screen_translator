@@ -85,6 +85,10 @@ impl ScreenRect {
 /// A word recognized by the OCR engine with its exact bounding box.
 #[derive(Debug, Clone)]
 pub struct RecognizedWord {
+    /// Confidence reported for this word; WinRT does not supply it.
+    pub confidence: Option<f32>,
+    /// True when the word box was guessed from a line instead of detected.
+    pub is_estimated: bool,
     pub text: String,
     pub rect: ScreenRect,
 }
@@ -116,8 +120,12 @@ pub struct TranslationBlock {
 }
 
 /// The detected text target (word and/or sentence) located directly under or near the mouse cursor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextUnderCursor {
+    pub raw_word: Option<String>,
+    pub word_confidence: Option<f32>,
+    pub word_is_estimated: bool,
+    pub line_rect: ScreenRect,
     pub word_text: Option<String>,
     pub word_rect: Option<ScreenRect>,
     pub sentence_text: String,
@@ -277,183 +285,118 @@ pub fn extract_word_token(token: &str) -> &str {
     token.trim_matches(|c: char| !c.is_alphanumeric())
 }
 
-/// Resolves the full token under the cursor, expanding 1-2 letter fragments to the full word
-/// if the surrounding line contains a longer token (e.g. "IN" -> "INSTRUCTIONS").
-pub fn resolve_full_word_token<'a>(word_text: &'a str, line_text: &'a str) -> &'a str {
-    let clean_word = extract_word_token(word_text.trim());
-    if clean_word.is_empty() {
-        return clean_word;
+/// Validates the unmodified OCR token before removing ordinary surrounding punctuation.
+/// Symbols suggesting a damaged reading must not disappear into a plausible word.
+pub fn cursor_word_token(raw: &str) -> Option<&str> {
+    let boundary = |c: char| matches!(c,
+        '.' | ',' | '!' | '?' | ':' | ';' | '…' | '"' | '\'' | 'ʼ'
+        | '‘' | '’' | '“' | '”' | '«' | '»' | '(' | ')' | '[' | ']' | '{' | '}'
+        | '—' | '–' | '。' | '、' | '！' | '？' | '，' | '：' | '；'
+        | '「' | '」' | '『' | '』' | '（' | '）');
+    let raw = raw.trim();
+    if raw.is_empty() || raw.chars().any(|c| !c.is_alphabetic()
+        && !matches!(c, '-' | '‐' | '‑') && !boundary(c)) {
+        return None;
     }
-
-    let tokens: Vec<&str> = line_text.split_whitespace().collect();
-
-    // 1. Direct match with any clean token in the line
-    for tok in &tokens {
-        let clean_tok = extract_word_token(tok);
-        if clean_tok.eq_ignore_ascii_case(clean_word) {
-            return clean_tok;
+    let token = raw.trim_matches(boundary);
+    let letters: Vec<char> = token.chars().collect();
+    let letter = |c: char| c.is_alphabetic() && c != 'ʼ';
+    if !letters.first().is_some_and(|&c| letter(c))
+        || !letters.last().is_some_and(|&c| letter(c)) {
+        return None;
+    }
+    for (i, &c) in letters.iter().enumerate() {
+        if letter(c) { continue; }
+        if !matches!(c, '-' | '‐' | '‑' | '\'' | '’' | '‘' | 'ʼ') || i == 0 || i + 1 == letters.len()
+            || !letter(letters[i - 1]) || !letter(letters[i + 1]) {
+            return None;
         }
     }
-
-    // 2. If short fragment (1-2 chars), expand to the longer surrounding token in line
-    if clean_word.chars().count() <= 2 {
-        let mut candidate: Option<&str> = None;
-        for tok in &tokens {
-            let clean_tok = extract_word_token(tok);
-            if clean_tok.chars().count() > clean_word.chars().count()
-                && clean_tok.to_ascii_uppercase().contains(&clean_word.to_ascii_uppercase())
-            {
-                if candidate.is_some_and(|previous| !previous.eq_ignore_ascii_case(clean_tok)) {
-                    return clean_word;
-                }
-                candidate = Some(clean_tok);
-            }
-        }
-        if let Some(candidate) = candidate {
-            return candidate;
-        }
-    }
-
-    clean_word
+    Some(token)
 }
 
-/// Identifies the word or sentence under the cursor given recognized OCR blocks.
+/// Compare typographic variants without rewriting the observed/displayed spelling.
+pub fn cursor_word_spelling(raw: &str) -> Option<String> {
+    Some(cursor_word_token(raw)?.chars().map(|ch| match ch {
+        '’' | '‘' | 'ʼ' => '\'',
+        '‐' | '‑' => '-',
+        other => other,
+    }).collect())
+}
+
+pub fn cursor_word_key(raw: &str) -> Option<String> {
+    cursor_word_spelling(raw).map(|word| word.to_lowercase())
+}
+
+/// Keeps only the observed token; nearby line text cannot expand a short reading.
+pub fn resolve_full_word_token<'a>(word_text: &'a str, _line_text: &str) -> &'a str {
+    cursor_word_token(word_text).unwrap_or("")
+}
+
+/// Selects a word globally before collecting its paragraph context.
+/// A two-pixel tolerance accommodates OCR box rounding without searching nearby background.
 pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<TextUnderCursor> {
-    if blocks.is_empty() {
-        return None;
-    }
-
-    let all_lines: Vec<(&OcrBlock, usize)> = blocks
-        .iter()
-        .flat_map(|block| (0..block.lines.len()).map(move |idx| (block, idx)))
-        .collect();
-    if all_lines.is_empty() {
-        return None;
-    }
-
-    let dist_to_rect = |r: &ScreenRect, x: i32, y: i32| -> i64 {
-        let dx = if x < r.x {
-            (r.x - x) as i64
-        } else if x >= r.x + r.width {
-            (x - (r.x + r.width - 1)) as i64
-        } else {
-            0
-        };
-        let dy = if y < r.y {
-            (r.y - y) as i64
-        } else if y >= r.y + r.height {
-            (y - (r.y + r.height - 1)) as i64
-        } else {
-            0
-        };
-        ((dx * dx + dy * dy) as f64).sqrt().round() as i64
-    };
-
-    // Maximum distance in pixels to search for text around the cursor.
-    const MAX_DISTANCE: i64 = 10;
-    const LINE_MAX_DISTANCE: i64 = 24;
-
-    let candidate_score = |r: &ScreenRect| -> (i64, i64, i64) {
-        let d = dist_to_rect(r, px, py);
-        let dy_center = (2 * r.y as i64 + r.height as i64 - 2 * py as i64).abs();
-        let dx_center = (2 * r.x as i64 + r.width as i64 - 2 * px as i64).abs();
-        (d, dy_center, dx_center)
-    };
-
-    let mut best_line_match: Option<(usize, (i64, i64, i64))> = None;
-
-    for (idx, (block, line_idx)) in all_lines.iter().enumerate() {
-        let line = &block.lines[*line_idx];
-        let l_dist = dist_to_rect(&line.rect, px, py);
-        if l_dist <= LINE_MAX_DISTANCE {
-            let l_score = candidate_score(&line.rect);
-            if let Some((_, best_score)) = best_line_match {
-                if l_score < best_score {
-                    best_line_match = Some((idx, l_score));
-                }
-            } else {
-                best_line_match = Some((idx, l_score));
-            }
-        }
-    }
-
-    let (best_idx, _) = best_line_match?;
-    let (block, line_idx) = all_lines[best_idx];
-    let line = &block.lines[line_idx];
-
-    let mut best_word_match: Option<(&RecognizedWord, (i64, i64, i64))> = None;
-    for word in &line.words {
-        let w_dist = dist_to_rect(&word.rect, px, py);
-        if w_dist <= MAX_DISTANCE {
-            let w_score = candidate_score(&word.rect);
-            if let Some((_, best_score)) = best_word_match {
-                if w_score < best_score {
-                    best_word_match = Some((word, w_score));
-                }
-            } else {
-                best_word_match = Some((word, w_score));
-            }
-        }
-    }
-
-    // Если курсор попал в строку, но ни один бокс слова не оказался в пределах MAX_DISTANCE
-    // (например, клик между словами или чуть выше/ниже), ищем ближайшее слово в этой строке
-    if best_word_match.is_none() && !line.words.is_empty() {
-        for word in &line.words {
-            let w_dist = dist_to_rect(&word.rect, px, py);
-            if w_dist <= 24 {
-                let w_score = candidate_score(&word.rect);
-                if let Some((_, best_score)) = best_word_match {
-                    if w_score < best_score {
-                        best_word_match = Some((word, w_score));
+    type CandidateScore = (i64, i64, i64, bool);
+    let mut best: Option<(usize, usize, usize, CandidateScore)> = None;
+    let mut ambiguous = false;
+    for (block_idx, block) in blocks.iter().enumerate() {
+        for (line_idx, line) in block.lines.iter().enumerate() {
+            for (word_idx, word) in line.words.iter().enumerate() {
+                let r = word.rect;
+                if r.is_empty() { continue; }
+                let x = px as i64;
+                let y = py as i64;
+                let right = r.x as i64 + r.width as i64 - 1;
+                let bottom = r.y as i64 + r.height as i64 - 1;
+                let dx = (r.x as i64 - x).max(x - right).max(0);
+                let dy = (r.y as i64 - y).max(y - bottom).max(0);
+                // Reject distant coordinates before squaring to avoid overflow.
+                if dx > 2 || dy > 2 || dx * dx + dy * dy > 4 { continue; }
+                let score = (dx * dx + dy * dy,
+                    (2 * r.y as i64 + r.height as i64 - 2 * y).abs(),
+                    (2 * r.x as i64 + r.width as i64 - 2 * x).abs(),
+                    word.is_estimated);
+                match best {
+                    Some((_, _, _, current)) if score < current => {
+                        best = Some((block_idx, line_idx, word_idx, score));
+                        ambiguous = false;
                     }
-                } else {
-                    best_word_match = Some((word, w_score));
+                    Some((bi, li, wi, current)) if score == current => {
+                        let other = &blocks[bi].lines[li].words[wi];
+                        let same_token = match (cursor_word_key(&other.text), cursor_word_key(&word.text)) {
+                            (Some(left), Some(right)) => left == right,
+                            _ => other.text.trim().eq_ignore_ascii_case(word.text.trim()),
+                        };
+                        if !same_token {
+                            ambiguous = true;
+                        }
+                    }
+                    None => best = Some((block_idx, line_idx, word_idx, score)),
+                    _ => {}
                 }
             }
         }
     }
-
+    if ambiguous { return None; }
+    let (block_idx, line_idx, word_idx, _) = best?;
+    let block = &blocks[block_idx];
+    let line = &block.lines[line_idx];
+    let word = &line.words[word_idx];
     let context_indices = collect_context_lines(&block.lines, line_idx);
-    let s_text = context_indices
-        .iter()
-        .map(|&i| block.lines[i].text.trim())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if s_text.is_empty() {
-        return None;
-    }
-
-    let s_rect = context_indices
-        .iter()
-        .fold(line.rect, |acc, &i| acc.union(&block.lines[i].rect));
-
-    let (w_text_opt, w_rect_opt) = if let Some((word, _)) = best_word_match {
-        let raw_word = word.text.trim();
-        let expanded = resolve_full_word_token(raw_word, &line.text);
-        if !expanded.is_empty() {
-            // Если токен был расширен, проверяем, есть ли слово с совпадающим текстом в line.words для точного rect
-            let mut resolved_rect = word.rect;
-            if expanded != raw_word {
-                if let Some(matching_word) = line.words.iter().find(|w| extract_word_token(w.text.trim()) == expanded) {
-                    resolved_rect = matching_word.rect;
-                }
-            }
-            (Some(expanded.to_string()), Some(resolved_rect))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
+    let sentence_text = context_indices.iter().map(|&i| block.lines[i].text.trim())
+        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" ");
+    if sentence_text.is_empty() { return None; }
+    let sentence_rect = context_indices.iter().fold(line.rect,
+        |rect, &i| rect.union(&block.lines[i].rect));
     Some(TextUnderCursor {
-        word_text: w_text_opt,
-        word_rect: w_rect_opt,
-        sentence_text: s_text,
-        sentence_rect: s_rect,
+        raw_word: Some(word.text.clone()),
+        word_confidence: word.confidence,
+        word_is_estimated: word.is_estimated,
+        line_rect: line.rect,
+        word_text: cursor_word_token(&word.text).map(str::to_owned),
+        word_rect: Some(word.rect),
+        sentence_text,
+        sentence_rect,
     })
 }
 
@@ -1269,11 +1212,11 @@ mod tests {
                 text: "Hello world".to_string(),
                 rect: ScreenRect::new(100, 100, 200, 30),
                 words: vec![
-                    RecognizedWord {
+                    RecognizedWord { confidence: None, is_estimated: false,
                         text: "Hello".to_string(),
                         rect: ScreenRect::new(100, 100, 90, 30),
                     },
-                    RecognizedWord {
+                    RecognizedWord { confidence: None, is_estimated: false,
                         text: "world".to_string(),
                         rect: ScreenRect::new(200, 100, 100, 30),
                     },
@@ -1294,10 +1237,8 @@ mod tests {
         assert_eq!(target2.word_text.as_deref(), Some("world"));
         assert_eq!(target2.sentence_text, "Hello world");
 
-        // Cursor in margin (near line/words within 24px)
-        let target_near =
-            find_text_under_cursor(&blocks, 100, 90).expect("Near target must be found");
-        assert_eq!(target_near.word_text.as_deref(), Some("Hello"));
+        // Background ten pixels above a word is not a word hit.
+        assert!(find_text_under_cursor(&blocks, 100, 90).is_none());
 
         // Cursor far outside
         let target_miss = find_text_under_cursor(&blocks, 500, 500);
@@ -1321,11 +1262,11 @@ mod tests {
                     text: "Top line".to_string(),
                     rect: ScreenRect::new(100, 100, 200, 30), // Y: 100..130, center Y = 115
                     words: vec![
-                        RecognizedWord {
+                        RecognizedWord { confidence: None, is_estimated: false,
                             text: "Top".to_string(),
                             rect: ScreenRect::new(100, 100, 90, 30),
                         },
-                        RecognizedWord {
+                        RecognizedWord { confidence: None, is_estimated: false,
                             text: "line".to_string(),
                             rect: ScreenRect::new(200, 100, 100, 30),
                         },
@@ -1336,11 +1277,11 @@ mod tests {
                     text: "Bottom line".to_string(),
                     rect: ScreenRect::new(100, 120, 200, 30), // Y: 120..150, center Y = 135
                     words: vec![
-                        RecognizedWord {
+                        RecognizedWord { confidence: None, is_estimated: false,
                             text: "Bottom".to_string(),
                             rect: ScreenRect::new(100, 120, 90, 30),
                         },
-                        RecognizedWord {
+                        RecognizedWord { confidence: None, is_estimated: false,
                             text: "line".to_string(),
                             rect: ScreenRect::new(200, 120, 100, 30),
                         },
@@ -1369,17 +1310,15 @@ mod tests {
                 confidence: None,
                 text: "Target".to_string(),
                 rect: ScreenRect::new(100, 100, 100, 30),
-                words: vec![RecognizedWord {
+                words: vec![RecognizedWord { confidence: None, is_estimated: false,
                     text: "Target".to_string(),
                     rect: ScreenRect::new(100, 100, 100, 30),
                 }],
             }],
         };
 
-        // Case 2: курсор в 8 px от слова — выбирается это слово
-        let target_8px = find_text_under_cursor(&[single_word_block.clone()], 100, 92)
-            .expect("Word must be selected within 8px");
-        assert_eq!(target_8px.word_text.as_deref(), Some("Target"));
+        // Empty background eight pixels above a word is not a word hit.
+        assert!(find_text_under_cursor(&[single_word_block.clone()], 100, 92).is_none());
 
         // Case 3: курсор в 30 px от всего — None
         let target_30px = find_text_under_cursor(&[single_word_block.clone()], 100, 70);
@@ -1400,17 +1339,17 @@ mod tests {
                 confidence: None,
                 text: "Target".to_string(),
                 rect: ScreenRect::new(100, 100, 100, 30),
-                words: vec![RecognizedWord {
+                words: vec![RecognizedWord { confidence: None, is_estimated: false,
                     text: "Target".to_string(),
                     rect: ScreenRect::new(100, 100, 100, 30),
                 }],
             }],
         };
 
-        // Cursor at (120, 80) is 20 px above line rect (within LINE_MAX_DISTANCE <= 24)
-        let found = find_text_under_cursor(&[block.clone()], 120, 80)
-            .expect("Line within 20px must be found");
-        assert_eq!(found.word_text.as_deref(), Some("Target"));
+        // A line twenty pixels away cannot supply a word under the cursor.
+        assert!(find_text_under_cursor(&[block.clone()], 120, 80).is_none());
+        assert!(find_text_under_cursor(&[block.clone()], 120, 98).is_some());
+        assert!(find_text_under_cursor(&[block.clone()], 120, 97).is_none());
 
         // Cursor at (120, 74) is 26 px above line rect (exceeds LINE_MAX_DISTANCE <= 24)
         let miss = find_text_under_cursor(&[block], 120, 74);
@@ -1504,10 +1443,10 @@ mod tests {
         assert_eq!(extract_word_token("Привет!"), "Привет");
         assert_eq!(extract_word_token("..."), "");
 
-        // Expands 1-2 char fragments to full token from line
+        // Short fragments remain the observed text, without inferred expansion
         let line = "PLEASE FOLLOW INSTRUCTIONS!";
-        assert_eq!(resolve_full_word_token("IN", line), "INSTRUCTIONS");
-        assert_eq!(resolve_full_word_token("PL", line), "PLEASE");
+        assert_eq!(resolve_full_word_token("IN", line), "IN");
+        assert_eq!(resolve_full_word_token("PL", line), "PL");
         assert_eq!(resolve_full_word_token("FOLLOW", line), "FOLLOW");
 
         // Legitimate short words are preserved
@@ -1517,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_text_under_cursor_expands_fragment() {
+    fn test_find_text_under_cursor_preserves_observed_fragment() {
         let block = OcrBlock {
             text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
             rect: ScreenRect::new(100, 100, 200, 30),
@@ -1526,15 +1465,15 @@ mod tests {
                 text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
                 rect: ScreenRect::new(100, 100, 200, 30),
                 words: vec![
-                    RecognizedWord {
+                    RecognizedWord { confidence: None, is_estimated: false,
                         text: "PLEASE".to_string(),
                         rect: ScreenRect::new(100, 100, 60, 30),
                     },
-                    RecognizedWord {
+                    RecognizedWord { confidence: None, is_estimated: false,
                         text: "FOLLOW".to_string(),
                         rect: ScreenRect::new(165, 100, 60, 30),
                     },
-                    RecognizedWord {
+                    RecognizedWord { confidence: None, is_estimated: false,
                         text: "IN".to_string(), // 1-2 char fragment
                         rect: ScreenRect::new(230, 100, 70, 30),
                     },
@@ -1544,14 +1483,101 @@ mod tests {
 
         // Cursor on the fragment "IN" at (235, 105)
         let found = find_text_under_cursor(&[block], 235, 105).expect("Should find text under cursor");
-        assert_eq!(found.word_text.as_deref(), Some("INSTRUCTIONS"));
+        assert_eq!(found.word_text.as_deref(), Some("IN"));
         assert_eq!(found.sentence_text, "PLEASE FOLLOW INSTRUCTIONS!");
     }
 
     #[test]
     fn test_ambiguous_word_fragment_stays_a_fragment() {
         assert_eq!(resolve_full_word_token("IN", "JOIN INSTRUCTIONS"), "IN");
-        assert_eq!(resolve_full_word_token("IN", "FOLLOW INSTRUCTIONS"), "INSTRUCTIONS");
+        assert_eq!(resolve_full_word_token("IN", "FOLLOW INSTRUCTIONS"), "IN");
+        assert_eq!(resolve_full_word_token("IN", "BEGINNER"), "IN");
+    }
+
+    #[test]
+    fn cursor_token_rejects_corruption_before_removing_punctuation() {
+        for raw in ["*#Jdlk;@#", "Jdlk;@#k4", "*#($#", "hello;world", "1ONG", "3D",
+            "hello_world", "-hello", "hello-", "don't--go", "rock-'roll", "..."] {
+            assert_eq!(cursor_word_token(raw), None, "Corrupt token accepted: {raw}");
+        }
+        for (raw, expected) in [("«HELLO»,", "HELLO"), ("(McDonald)", "McDonald"),
+            ("iPhone!", "iPhone"), ("don't", "don't"), ("let’s", "let’s"),
+            ("state-of-the-art", "state-of-the-art"), ("café", "café"),
+            ("「你好」", "你好"), ("Привет!", "Привет"), ("—Hello—", "Hello")] {
+            assert_eq!(cursor_word_token(raw), Some(expected));
+        }
+    }
+
+    #[test]
+    fn english_typographic_variants_compare_without_spelling_guesses() {
+        for (left, right) in [("don't", "don’t"), ("CAN'T", "can‘t"),
+            ("state-of-the-art", "state‑of‑the‑art"), ("co-operate", "co‐operate"),
+            ("O'Neill", "OʼNeill")] {
+            assert_eq!(cursor_word_key(left), cursor_word_key(right));
+            assert!(cursor_word_key(left).is_some());
+        }
+        assert_eq!(cursor_word_token("iPhone"), Some("iPhone"));
+        assert_eq!(cursor_word_token("state‑of‑the‑art"), Some("state‑of‑the‑art"));
+        assert_ne!(cursor_word_key("form"), cursor_word_key("from"));
+        assert_ne!(cursor_word_key("Hello"), cursor_word_key("Help"));
+        assert_eq!(cursor_word_key("d0n't"), None);
+        assert_eq!(cursor_word_key("*#don't"), None);
+        for raw in ["ʼ", "ʼʼ", "OʼʼNeill", "--", "‘’"] {
+            assert_eq!(cursor_word_key(raw), None);
+        }
+        assert_eq!(cursor_word_spelling("OʼNeill"), Some("O'Neill".to_string()));
+    }
+
+    fn cursor_test_block(text: &str, line_rect: ScreenRect, words: Vec<RecognizedWord>) -> OcrBlock {
+        OcrBlock { text: text.to_string(), rect: line_rect,
+            lines: vec![RecognizedLine { confidence: None, text: text.to_string(),
+                rect: line_rect, words }] }
+    }
+
+    #[test]
+    fn cursor_selects_near_word_before_a_closer_empty_part_of_another_line() {
+        let make_word = |text: &str, rect| RecognizedWord {
+            confidence: None, is_estimated: false, text: text.to_string(), rect,
+        };
+        let wide = cursor_test_block("LEFT RIGHT", ScreenRect::new(100, 100, 400, 20), vec![
+            make_word("LEFT", ScreenRect::new(100, 100, 50, 20)),
+            make_word("RIGHT", ScreenRect::new(450, 100, 50, 20)),
+        ]);
+        let target = cursor_test_block("TARGET", ScreenRect::new(200, 123, 50, 20),
+            vec![make_word("TARGET", ScreenRect::new(200, 123, 50, 20))]);
+        let result = find_text_under_cursor(&[wide, target], 220, 121).unwrap();
+        assert_eq!(result.word_text.as_deref(), Some("TARGET"));
+        assert_eq!(result.sentence_text, "TARGET");
+    }
+
+    #[test]
+    fn cursor_rejects_equal_geometry_conflicts_and_prefers_detected_to_estimated_boxes() {
+        let rect = ScreenRect::new(100, 100, 80, 20);
+        let make_word = |text: &str, is_estimated| RecognizedWord {
+            confidence: Some(0.99), is_estimated, text: text.to_string(), rect,
+        };
+        let first = cursor_test_block("HELLO", rect, vec![make_word("HELLO", false)]);
+        let conflict = cursor_test_block("WORLD", rect, vec![make_word("WORLD", false)]);
+        assert!(find_text_under_cursor(&[first.clone(), conflict], 120, 110).is_none());
+        let estimated = cursor_test_block("WORLD", rect, vec![make_word("WORLD", true)]);
+        let result = find_text_under_cursor(&[estimated, first], 120, 110).unwrap();
+        assert_eq!(result.word_text.as_deref(), Some("HELLO"));
+        assert!(!result.word_is_estimated);
+    }
+
+    #[test]
+    fn cursor_retains_raw_token_confidence_and_geometry_for_targeted_retry() {
+        let rect = ScreenRect::new(100, 100, 80, 20);
+        let block = cursor_test_block("*#Jdlk;@#", rect, vec![RecognizedWord {
+            confidence: Some(0.01), is_estimated: true, text: "*#Jdlk;@#".to_string(), rect,
+        }]);
+        let result = find_text_under_cursor(&[block], 120, 110).unwrap();
+        assert_eq!(result.word_text, None);
+        assert_eq!(result.raw_word.as_deref(), Some("*#Jdlk;@#"));
+        assert_eq!(result.word_confidence, Some(0.01));
+        assert!(result.word_is_estimated);
+        assert_eq!(result.word_rect, Some(rect));
+        assert_eq!(result.line_rect, rect);
     }
 
     #[test]
@@ -1563,7 +1589,7 @@ mod tests {
                 lines: vec![RecognizedLine {
                     confidence: None,
                     text: text.to_string(), rect,
-                    words: vec![RecognizedWord { text: text.to_string(), rect }],
+                    words: vec![RecognizedWord { confidence: None, is_estimated: false, text: text.to_string(), rect }],
                 }],
             }
         };

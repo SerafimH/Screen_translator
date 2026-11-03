@@ -84,6 +84,11 @@ def create_ocr_engine(models_dir: Optional[str] = None, lang: str = "en"):
         from rapidocr import RapidOCR
 
         params = {"Rec.lang_type": rec_lang}
+        if rec_lang == "en":
+            # Thin subtitle/cursor crops must not be stretched until their short
+            # side reaches 736px. Small frames already get a separate 2x pass;
+            # keep the detector within the same 2000px ceiling as RapidOCR input.
+            params.update({"Det.limit_type": "max", "Det.limit_side_len": 2000})
         if models_dir and os.path.exists(models_dir):
             params["Global.model_root_dir"] = models_dir
         logger.info(
@@ -445,26 +450,18 @@ def score_ocr_candidate(text: str, score: float) -> float:
     non_spaces = [c for c in trimmed if not c.isspace()]
     if not non_spaces:
         return 0.0
-    alnum_count = sum(1 for c in non_spaces if c.isalnum())
-    alnum_ratio = alnum_count / len(non_spaces)
-    symbol_penalty = (1.0 - alnum_ratio) * 0.6
-
-    words = [w.strip(".,!?:;'\"-()").upper() for w in trimmed.split()]
-    common_words = {
-        "A", "AN", "THE", "IN", "ON", "AT", "OF", "TO", "FOR", "WITH",
-        "IS", "ARE", "WAS", "WERE", "BE", "BEEN", "HAS", "HAVE", "HAD",
-        "AND", "OR", "BUT", "NOT", "NEW", "ERA", "ENTERED", "POST", "IT",
-        "FOLLOW", "PLEASE", "INSTRUCTIONS", "SHORTS", "UTUBE", "YOU", "ME",
-        "MY", "HE", "SHE", "THEY", "THIS", "THAT", "WHAT", "WHY", "HOW"
-    }
-    dict_bonus = 0.0
-    for w in words:
-        if len(w) >= 2 and (w in common_words or w.isalpha()):
-            dict_bonus += 0.15
-        elif len(w) == 1 and w in {"A", "I"}:
-            dict_bonus += 0.15
-
-    return score - symbol_penalty + dict_bonus
+    if not math.isfinite(score):
+        return 0.0
+    garbage_count = sum(
+        not c.isalnum() and c not in STANDARD_PUNCTUATION
+        and not (not c.isascii() and unicodedata.category(c).startswith("P"))
+        for c in non_spaces
+    )
+    # Character count is not evidence that a token is an English word. The old
+    # per-word bonus let several low-confidence nonsense tokens outrank a clear
+    # reading. Preserve confidence and penalize actual corruption, not normal
+    # apostrophes/hyphens, names, or the number of words in a crop.
+    return min(1.0, max(0.0, score)) - garbage_count / len(non_spaces) * 0.6
 
 
 def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,

@@ -11,6 +11,44 @@ pub const MAX_OCR_DIMENSION: u32 = 2600;
 /// Minimum image dimension supported by Windows WinRT OcrEngine (40x40).
 pub const MIN_OCR_DIMENSION: u32 = 40;
 
+/// Gives tightly cropped lines enough background for the recognizer without
+/// stretching their glyphs. Large images are borrowed by the caller unchanged.
+pub fn pad_small_ocr_image(bgra: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, u32, u32, u32)> {
+    if width == 0 || height == 0 || width.min(height) >= MIN_OCR_DIMENSION
+        || bgra.len() != width as usize * height as usize * 4 {
+        return None;
+    }
+    let pad = (MIN_OCR_DIMENSION - width.min(height)).div_ceil(2).max(12);
+    let padded_w = width.checked_add(pad * 2)?;
+    let padded_h = height.checked_add(pad * 2)?;
+    let mut histograms = [[0usize; 256]; 3];
+    let mut samples = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            if x != 0 && y != 0 && x + 1 != width && y + 1 != height { continue; }
+            let pixel = ((y * width + x) * 4) as usize;
+            for c in 0..3 { histograms[c][bgra[pixel + c] as usize] += 1; }
+            samples += 1;
+        }
+    }
+    let mut background = [0u8, 0, 0, 255];
+    for c in 0..3 {
+        let mut count = 0;
+        for (value, &frequency) in histograms[c].iter().enumerate() {
+            count += frequency;
+            if count > samples / 2 { background[c] = value as u8; break; }
+        }
+    }
+    let mut padded = vec![0u8; padded_w as usize * padded_h as usize * 4];
+    for pixel in padded.chunks_exact_mut(4) { pixel.copy_from_slice(&background); }
+    for y in 0..height as usize {
+        let source = y * width as usize * 4;
+        let target = ((y + pad as usize) * padded_w as usize + pad as usize) * 4;
+        padded[target..target + width as usize * 4].copy_from_slice(&bgra[source..source + width as usize * 4]);
+    }
+    Some((padded, padded_w, padded_h, pad))
+}
+
 /// Fits the whole image, including any padding, within the engine limit.
 pub fn ocr_dimensions(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
     let scale = (max_dimension.max(1) as f64 / width.max(height).max(1) as f64).min(1.0);
@@ -156,9 +194,9 @@ pub fn upscale_and_enhance_contrast(
     let max_allowable_scale = MAX_OCR_DIMENSION as f32 / max_side;
     let scale = requested_scale.min(max_allowable_scale).max(1.0);
 
-    let new_w = ((width as f32 * scale).round() as u32).clamp(MIN_OCR_DIMENSION, MAX_OCR_DIMENSION);
+    let new_w = ((width as f32 * scale).round() as u32).clamp(1, MAX_OCR_DIMENSION);
     let new_h =
-        ((height as f32 * scale).round() as u32).clamp(MIN_OCR_DIMENSION, MAX_OCR_DIMENSION);
+        ((height as f32 * scale).round() as u32).clamp(1, MAX_OCR_DIMENSION);
 
     let mut dst = vec![0u8; (new_w * new_h * 4) as usize];
     let x_ratio = (width as f32 - 1.0) / (new_w as f32 - 1.0).max(1.0);
@@ -211,6 +249,28 @@ pub fn upscale_and_enhance_contrast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_line_padding_preserves_pixels_and_uses_background_not_text_color() {
+        let mut pixels = [32u8, 48, 64, 255].repeat(20 * 6);
+        // A glyph touching the upper edge must not turn the whole margin black.
+        pixels[..4].copy_from_slice(&[0, 0, 0, 255]);
+        let (padded, width, height, pad) = pad_small_ocr_image(&pixels, 20, 6).unwrap();
+        assert_eq!((width, height, pad), (54, 40, 17));
+        assert_eq!(&padded[..4], &[32, 48, 64, 255]);
+        for y in 0..6usize {
+            let start = ((y + pad as usize) * width as usize + pad as usize) * 4;
+            assert_eq!(&padded[start..start + 80], &pixels[y * 80..(y + 1) * 80]);
+        }
+        assert!(pad_small_ocr_image(&[255; 40 * 40 * 4], 40, 40).is_none());
+        assert!(pad_small_ocr_image(&[], 20, 6).is_none());
+    }
+
+    #[test]
+    fn tiny_line_upscale_does_not_stretch_height_independently() {
+        let (_, width, height, scale) = upscale_and_enhance_contrast(&[128; 100 * 8 * 4], 100, 8, 2.0);
+        assert_eq!((width, height, scale), (200, 16, 2.0));
+    }
 
     #[test]
     fn test_extract_outlined_text_mask_synthetic_gradient() {

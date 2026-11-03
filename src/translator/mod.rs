@@ -454,18 +454,7 @@ pub fn is_translatable_text(text: &str) -> bool {
 /// Checks whether a single token is a valid word for dictionary lookup (only letters, apostrophes, and hyphens).
 /// Tokens containing foreign characters, symbols, or numbers (e.g. "•PA", "4EASE", "I@II#O*$") are rejected.
 pub fn is_valid_dictionary_word(word: &str) -> bool {
-    if word
-        .chars()
-        .any(|c| matches!(c, '@' | '#' | '$' | '*' | '~' | '|' | '\\' | '^' | '•' | '·' | '●' | '○'))
-    {
-        return false;
-    }
-    let w = crate::types::extract_word_token(word);
-    if w.is_empty() {
-        return false;
-    }
-    w.chars()
-        .all(|c| c.is_alphabetic() || c == '\'' || c == '’' || c == '-')
+    crate::types::cursor_word_token(word).is_some()
 }
 
 /// Converts comic/game ALL CAPS text into readable, natural sentence casing.
@@ -1617,8 +1606,8 @@ impl TranslatorService {
             };
         }
 
-        let w = crate::types::extract_word_token(word);
-        let clean = clean_ocr_noise(w);
+        let w = crate::types::cursor_word_spelling(word).expect("dictionary word was validated");
+        let clean = clean_ocr_noise(&w);
         let trimmed_punct = clean.trim().trim_matches(|c: char| !c.is_alphanumeric());
         let normalized = if !trimmed_punct.is_empty() {
             trimmed_punct
@@ -1629,7 +1618,8 @@ impl TranslatorService {
             return WordDetails::default();
         }
 
-        let cache_key = self.cache_key("dictionary", &normalized.to_lowercase(), source_lang, target_lang, config);
+        // English acronyms can differ in meaning from their lowercase spelling: US / us.
+        let cache_key = self.cache_key("dictionary", normalized, source_lang, target_lang, config);
 
         if let Some(cached_json) = self.cache.get(&cache_key)
             && let Ok(details) = serde_json::from_str::<WordDetails>(&cached_json) {
@@ -1913,6 +1903,38 @@ mod tests {
 
     fn completion_response(text: &str) -> String {
         serde_json::json!({"choices":[{"message":{"content":text}}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn dictionary_preserves_case_sensitive_english_meanings() {
+        let (base_url, server) = mock_responses(vec![
+            (200, String::new(), completion_response("США")),
+            (200, String::new(), completion_response("нас")),
+        ]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        assert_eq!(service.lookup_word_details("US", "en", "ru", &config).await.primary, "США");
+        assert_eq!(service.lookup_word_details("us", "en", "ru", &config).await.primary, "нас");
+        assert_eq!(service.lookup_word_details("US", "en", "ru", &config).await.primary, "США");
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dictionary_uses_canonical_english_punctuation_without_changing_name_case() {
+        for (observed, expected) in [("state‑of‑the‑art", "state-of-the-art"),
+            ("OʼNeill", "O'Neill"), ("don‘t", "don't")] {
+            let (base_url, server) = mock_responses(vec![
+                (200, String::new(), completion_response("meaning")),
+            ]).await;
+            let config = openai_config(base_url);
+            let service = TranslatorService::new();
+            assert_eq!(service.lookup_word_details(observed, "en", "ru", &config).await.primary, "meaning");
+            assert_eq!(service.lookup_word_details(expected, "en", "ru", &config).await.primary, "meaning");
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let body: serde_json::Value = serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["messages"][1]["content"], expected);
+        }
     }
 
     #[tokio::test]

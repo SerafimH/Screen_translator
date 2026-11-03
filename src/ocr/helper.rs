@@ -778,36 +778,7 @@ impl OcrHelperClient {
             {
                 h_words
                     .into_iter()
-                    .filter_map(|w| {
-                        let w_text = w.text.trim();
-                        if w_text.is_empty() {
-                            return None;
-                        }
-                        let mut min_x = f32::MAX;
-                        let mut max_x = f32::MIN;
-                        let mut min_y = f32::MAX;
-                        let mut max_y = f32::MIN;
-                        for pt in &w.bbox {
-                            min_x = min_x.min(pt[0]);
-                            max_x = max_x.max(pt[0]);
-                            min_y = min_y.min(pt[1]);
-                            max_y = max_y.max(pt[1]);
-                        }
-                        let local_x = min_x.round() as i32;
-                        let local_y = min_y.round() as i32;
-                        let w_w = (max_x - min_x).round().max(1.0) as i32;
-                        let w_h = (max_y - min_y).round().max(1.0) as i32;
-                        let rect = ScreenRect::new(
-                            local_x + frame.offset_x,
-                            local_y + frame.offset_y,
-                            w_w,
-                            w_h,
-                        );
-                        Some(RecognizedWord {
-                            text: w_text.to_string(),
-                            rect,
-                        })
-                    })
+                    .filter_map(|w| recognized_helper_word(w, frame.offset_x, frame.offset_y))
                     .collect()
             } else {
                 split_line_words_proportionate(trimmed, rect)
@@ -839,6 +810,42 @@ impl OcrHelperClient {
         self.is_ready.store(false, Ordering::SeqCst);
         *session_guard = None;
     }
+}
+
+fn recognized_helper_word(w: HelperWordJson, offset_x: i32, offset_y: i32) -> Option<RecognizedWord> {
+    let w_text = w.text.trim();
+    if w_text.is_empty() || w.bbox.iter().flatten().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+    for pt in &w.bbox {
+        min_x = min_x.min(pt[0]);
+        max_x = max_x.max(pt[0]);
+        min_y = min_y.min(pt[1]);
+        max_y = max_y.max(pt[1]);
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    let local_x = min_x.round() as i32;
+    let local_y = min_y.round() as i32;
+    let w_w = (max_x - min_x).round().max(1.0) as i32;
+    let w_h = (max_y - min_y).round().max(1.0) as i32;
+    let rect = ScreenRect::new(
+        local_x.checked_add(offset_x)?,
+        local_y.checked_add(offset_y)?,
+        w_w,
+        w_h,
+    );
+    Some(RecognizedWord {
+        confidence: w.score,
+        is_estimated: false,
+        text: w_text.to_string(),
+        rect,
+    })
 }
 
 /// Helper: returns proportional character weight for horizontal box partitioning.
@@ -883,6 +890,8 @@ pub fn split_line_words_proportionate(text: &str, line_rect: ScreenRect) -> Vec<
             .max(1.0) as i32;
 
         words.push(RecognizedWord {
+            confidence: None,
+            is_estimated: true,
             text: w_str.to_string(),
             rect: ScreenRect::new(word_x, line_rect.y, word_w, line_rect.height),
         });
@@ -897,6 +906,35 @@ pub fn split_line_words_proportionate(text: &str, line_rect: ScreenRect) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_word_confidence_and_detected_geometry_survive_conversion() {
+        for score in [Some(0.01), Some(0.99), None] {
+            let word = recognized_helper_word(HelperWordJson {
+                text: " target ".to_string(), score,
+                bbox: [[10.0, 20.0], [60.0, 20.0], [60.0, 40.0], [10.0, 40.0]],
+            }, -300, 500).unwrap();
+            assert_eq!(word.confidence, score);
+            assert!(!word.is_estimated);
+            assert_eq!(word.text, "target");
+            assert_eq!(word.rect, ScreenRect::new(-290, 520, 50, 20));
+        }
+        let guessed = split_line_words_proportionate("Hello world", ScreenRect::new(0, 0, 100, 20));
+        assert!(guessed.iter().all(|word| word.is_estimated && word.confidence.is_none()));
+    }
+
+    #[test]
+    fn helper_does_not_turn_invalid_boxes_into_detected_one_pixel_words() {
+        for bbox in [
+            [[10.0, 20.0]; 4],
+            [[f32::NAN, 20.0], [60.0, 20.0], [60.0, 40.0], [10.0, 40.0]],
+            [[10.0, f32::INFINITY], [60.0, 20.0], [60.0, 40.0], [10.0, 40.0]],
+        ] {
+            assert!(recognized_helper_word(HelperWordJson {
+                text: "word".to_string(), score: Some(0.99), bbox,
+            }, 0, 0).is_none());
+        }
+    }
 
     #[test]
     fn test_split_line_words_proportionate() {

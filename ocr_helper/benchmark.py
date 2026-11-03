@@ -9,6 +9,8 @@ from ocr_helper.server import EngineManager, cv2, process_request, resolve_model
 
 
 def normalize(text):
+    # Different quote/hyphen glyphs do not change the English word being read.
+    text = text.translate(str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "‐": "-", "‑": "-"}))
     return " ".join(text.upper().split())
 
 
@@ -32,7 +34,9 @@ def quality(expected_lines, actual_lines):
                 / max(1, len(normalize(line))) <= 0.2 for candidate in actual_lines)
         for line in expected_lines
     )
+    expected_words, actual_words = expected.split(), actual.split()
     return {"cer": edit_distance(expected, actual) / max(1, len(expected)),
+            "wer": edit_distance(expected_words, actual_words) / max(1, len(expected_words)),
             "missing_lines": missing, "text": actual}
 
 
@@ -61,7 +65,9 @@ def main():
         lines = sorted(response["lines"], key=lambda line: min(p[1] for p in line["box"]))
         metrics = quality(case["lines"], [line["text"] for line in lines])
         results.append({"file": case["file"], **metrics, "ms": response["ms"],
-                        "pass": metrics["cer"] <= case["max_cer"] and metrics["missing_lines"] == 0})
+                        "pass": metrics["cer"] <= case["max_cer"]
+                        and metrics["wer"] <= case.get("max_wer", float("inf"))
+                        and metrics["missing_lines"] == 0})
     report = {"engine": "RapidOCR", "load_ms": round(load_ms, 2), "results": results}
     output = json.dumps(report, ensure_ascii=False, indent=2)
     print(output)

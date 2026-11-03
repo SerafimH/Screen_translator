@@ -2,37 +2,90 @@
   {
     "file": "please_follow.png",
     "kind": "speech bubble",
-    "lines": ["PLEASE FOLLOW", "INSTRUCTIONS!"],
+    "lines": [
+      "PLEASE FOLLOW",
+      "INSTRUCTIONS!"
+    ],
     "max_cer": 0.15
   },
   {
     "file": "utube_shorts.png",
     "kind": "speech bubble on patterned background",
-    "lines": ["LET'S POST", "IT ON UTUBE", "SHORTS!"],
+    "lines": [
+      "LET'S POST",
+      "IT ON UTUBE",
+      "SHORTS!"
+    ],
     "max_cer": 0.15
   },
   {
     "file": "new_era_white_glow.png",
     "kind": "white glowing text",
-    "lines": ["HAS ENTERED", "A NEW ERA."],
+    "lines": [
+      "HAS ENTERED",
+      "A NEW ERA."
+    ],
     "max_cer": 0.15
   },
   {
     "file": "meme_no_pickles.png",
     "kind": "outlined text on a photo",
-    "lines": ["EXCUSE ME SIR", "SHE ASKED FOR NO PICKLES"],
+    "lines": [
+      "EXCUSE ME SIR",
+      "SHE ASKED FOR NO PICKLES"
+    ],
     "max_cer": 0.15
   },
   {
     "file": "small_subtitle.png",
     "kind": "synthetic small outlined subtitle",
-    "lines": ["Please wait for the next mission."],
+    "lines": [
+      "Please wait for the next mission."
+    ],
     "max_cer": 0.15
   },
   {
     "file": "small_subtitle_noisy.png",
     "kind": "synthetic small subtitle on a patterned background",
-    "lines": ["Please wait for the next mission."],
+    "lines": [
+      "Please wait for the next mission."
+    ],
     "max_cer": 0.15
+  },
+  {
+    "file": "english_thin_10.png",
+    "kind": "Segoe UI 10px thin white English subtitle",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "max_cer": 0.05,
+    "max_wer": 0.0
+  },
+  {
+    "file": "english_dark_14.png",
+    "kind": "Segoe UI 14px dark English text on light background",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "max_cer": 0.05,
+    "max_wer": 0.0
+  },
+  {
+    "file": "english_italic_14.png",
+    "kind": "Segoe UI Italic 14px English subtitle",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "max_cer": 0.05,
+    "max_wer": 0.0
+  },
+  {
+    "file": "english_edge_14.png",
+    "kind": "English text near image boundary",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "max_cer": 0.05,
+    "max_wer": 0.0
   }
 ]

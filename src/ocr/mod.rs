@@ -262,6 +262,14 @@ impl WinrtOcrEngine {
         self.run_ocr_pass(pass_params).await
     }
 
+    /// Reads untouched pixels separately, preserving an independent crop candidate.
+    pub async fn recognize_raw(&self, frame: &CapturedFrame) -> Result<Vec<RecognizedLine>, String> {
+        self.run_ocr_pass(OcrPassParams {
+            bgra_bytes: &frame.bgra_bytes, width: frame.width, height: frame.height,
+            remap: RemapParams { pad: 0, scale: 1.0, offset_x: frame.offset_x, offset_y: frame.offset_y },
+        }).await
+    }
+
     /// Recognizes text in the captured frame using an adaptive multi-pass OCR strategy:
     ///
     /// 1. Standard manga preprocessing (bubble cleaner, contrast, 2x upscale, white padding)
@@ -431,20 +439,28 @@ impl WinrtOcrEngine {
     }
 
     async fn run_ocr_pass(&self, params: OcrPassParams<'_>) -> Result<Vec<RecognizedLine>, String> {
+        if params.width == 0 || params.height == 0 { return Ok(Vec::new()); }
+        if params.bgra_bytes.len() != params.width as usize * params.height as usize * 4 {
+            return Err("Invalid OCR image buffer".to_string());
+        }
+        let padded = preprocessing::pad_small_ocr_image(params.bgra_bytes, params.width, params.height);
+        let (input, input_w, input_h, extra_pad) = padded.as_ref()
+            .map(|(bytes, width, height, pad)| (bytes.as_slice(), *width, *height, *pad))
+            .unwrap_or((params.bgra_bytes, params.width, params.height, 0));
         let (width, height) = preprocessing::ocr_dimensions(
-            params.width, params.height,
+            input_w, input_h,
             OcrEngine::MaxImageDimension().unwrap_or(preprocessing::MAX_OCR_DIMENSION),
         );
-        let resized = if (width, height) != (params.width, params.height) {
-            let img = ImageBuffer::<Rgba<u8>, _>::from_raw(params.width, params.height, params.bgra_bytes)
+        let resized = if (width, height) != (input_w, input_h) {
+            let img = ImageBuffer::<Rgba<u8>, _>::from_raw(input_w, input_h, input)
                 .ok_or_else(|| "Invalid OCR image buffer".to_string())?;
             Some(image::imageops::resize(&img, width, height, image::imageops::FilterType::CatmullRom))
         } else {
             None
         };
-        let bytes = resized.as_ref().map(|img| img.as_raw().as_slice()).unwrap_or(params.bgra_bytes);
-        let scale_x = params.width as f32 / width as f32;
-        let scale_y = params.height as f32 / height as f32;
+        let bytes = resized.as_ref().map(|img| img.as_raw().as_slice()).unwrap_or(input);
+        let scale_x = input_w as f32 / width as f32;
+        let scale_y = input_h as f32 / height as f32;
         let ocr_op = {
             let writer =
                 DataWriter::new().map_err(|e| format!("Failed to create DataWriter: {:?}", e))?;
@@ -515,11 +531,14 @@ impl WinrtOcrEngine {
                     .BoundingRect()
                     .map_err(|e| format!("Failed to get word rect: {:?}", e))?;
 
-                let word_rect = remap_rect(rect.X * scale_x, rect.Y * scale_y,
+                let word_rect = remap_rect(rect.X * scale_x - extra_pad as f32,
+                    rect.Y * scale_y - extra_pad as f32,
                     rect.Width * scale_x, rect.Height * scale_y, params.remap);
 
                 line_rect = line_rect.union(&word_rect);
                 words.push(RecognizedWord {
+                    confidence: None,
+                    is_estimated: false,
                     text: word_text,
                     rect: word_rect,
                 });
@@ -1768,6 +1787,26 @@ mod tests {
             offset_x: 300, offset_y: 400,
         };
         engine.recognize_pass_1(&frame).await.expect("Oversized frame must be resized before OCR");
+    }
+
+    #[tokio::test]
+    async fn tightly_cropped_english_line_is_read_without_distorting_screen_coordinates() {
+        if !WinrtOcrEngine::is_language_available("en") { return; }
+        let rgba = image::open("tests/fixtures/ocr/small_subtitle.png").unwrap().to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut bytes = rgba.into_raw();
+        for pixel in bytes.chunks_exact_mut(4) { pixel.swap(0, 2); }
+        let frame = CapturedFrame { bgra_bytes: bytes, width, height, offset_x: -300, offset_y: 500 };
+        // 17px-high crop returned no raw WinRT lines before background padding.
+        let crop = crop_frame(&frame, ScreenRect::new(208, 82, 226, 17)).unwrap();
+        let engine = WinrtOcrEngine::new("en").unwrap();
+        let lines = engine.recognize_raw(&crop).await.unwrap();
+        let text = lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("Please wait for the next mission"), "Unexpected crop reading: {text}");
+        let words: Vec<_> = lines.iter().flat_map(|line| &line.words).collect();
+        let word = words.iter().find(|word| word.text.eq_ignore_ascii_case("wait")).unwrap();
+        assert!(word.rect.contains(273 - 300, 89 + 500), "Padding shifted the cursor word: {:?}", word.rect);
+        assert!(words.iter().all(|word| word.rect.x >= crop.offset_x && word.rect.y >= crop.offset_y));
     }
 
     #[test]
