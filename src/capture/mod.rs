@@ -107,12 +107,20 @@ pub fn is_winrt_available() -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameSignature {
     pub luma: [u8; SIGNATURE_COLS * SIGNATURE_ROWS],
+    /// High-contrast edge positions retain small glyph changes whose brightness
+    /// averages cancel out inside the coarse cells.
+    edges: Vec<u64>,
+    text_mask: Vec<u64>,
+    dimensions: (u32, u32),
 }
 
 impl Default for FrameSignature {
     fn default() -> Self {
         Self {
             luma: [0u8; SIGNATURE_COLS * SIGNATURE_ROWS],
+            edges: Vec::new(),
+            text_mask: Vec::new(),
+            dimensions: (0, 0),
         }
     }
 }
@@ -121,8 +129,9 @@ impl FrameSignature {
     pub fn from_bgra(bgra: &[u8], width: u32, height: u32) -> Self {
         let mut luma = [0u8; SIGNATURE_COLS * SIGNATURE_ROWS];
         if width == 0 || height == 0 || bgra.len() < (width * height * 4) as usize {
-            return Self { luma };
+            return Self::default();
         }
+        let mut edges = vec![0u64; (width as usize * height as usize).div_ceil(64)];
 
         for row in 0..SIGNATURE_ROWS {
             let start_y = (row * height as usize) / SIGNATURE_ROWS;
@@ -153,6 +162,15 @@ impl FrameSignature {
                                 luma_from_bgr(bgra[idx], bgra[idx + 1], bgra[idx + 2]) as u64;
                             sum += y_val;
                             count += 1;
+                            let edge_at = |neighbor: usize| {
+                                let other = luma_from_bgr(bgra[neighbor], bgra[neighbor + 1], bgra[neighbor + 2]);
+                                (y_val as u8).abs_diff(other) >= 16
+                            };
+                            if (x + 1 < width as usize && edge_at(idx + 4))
+                                || (y + 1 < height as usize && edge_at(idx + width as usize * 4)) {
+                                let bit = row_offset + x;
+                                edges[bit / 64] |= 1u64 << (bit % 64);
+                            }
                         }
                     }
                 }
@@ -162,7 +180,37 @@ impl FrameSignature {
             }
         }
 
-        Self { luma }
+        Self { luma, edges, text_mask: Vec::new(), dimensions: (width, height) }
+    }
+
+    /// Scope fine changes to known text. Outside animation still uses the
+    /// coarse scene detector, including during the 250ms stability check.
+    pub fn set_text_regions(
+        &mut self, regions: impl IntoIterator<Item = ScreenRect>, offset_x: i32, offset_y: i32,
+    ) {
+        let (width, height) = self.dimensions;
+        self.text_mask = vec![0u64; self.edges.len()];
+        for rect in regions {
+            if rect.is_empty() { continue; }
+            let left = (rect.x as i64 - offset_x as i64 - 3).clamp(0, width as i64) as usize;
+            let top = (rect.y as i64 - offset_y as i64 - 3).clamp(0, height as i64) as usize;
+            let right = (rect.x as i64 + rect.width as i64 - offset_x as i64 + 3)
+                .clamp(0, width as i64) as usize;
+            let bottom = (rect.y as i64 + rect.height as i64 - offset_y as i64 + 3)
+                .clamp(0, height as i64) as usize;
+            for y in top..bottom {
+                for x in left..right {
+                    let bit = y * width as usize + x;
+                    self.text_mask[bit / 64] |= 1u64 << (bit % 64);
+                }
+            }
+        }
+    }
+
+    pub fn inherit_text_regions(&mut self, previous: &FrameSignature) {
+        if self.dimensions == previous.dimensions {
+            self.text_mask.clone_from(&previous.text_mask);
+        }
     }
 
     /// Computes the Mean Absolute Difference (MAD) between this and another signature.
@@ -178,8 +226,16 @@ impl FrameSignature {
 
     /// Determines if dialogue line has meaningfully changed beyond the noise threshold.
     pub fn has_changed(&self, previous: &FrameSignature) -> bool {
+        if self.dimensions != previous.dimensions { return true; }
         if self.mad(previous) >= DELTA_THRESHOLD {
             return true;
+        }
+        // A blinking 2x10 caret changes fewer than 48 edge pixels. A changed
+        // word can exceed that locally while leaving the full-frame MAD tiny.
+        let mut changed_edges = 0u32;
+        for ((&current, &old), &mask) in self.edges.iter().zip(&previous.edges).zip(&previous.text_mask) {
+            changed_edges += ((current ^ old) & mask).count_ones();
+            if changed_edges >= 48 { return true; }
         }
         self.luma
             .chunks(SIGNATURE_COLS)
@@ -763,6 +819,54 @@ mod tests {
         let mad = sig1.mad(&sig2);
         assert_eq!(mad, 0.0);
         assert!(!sig1.has_changed(&sig2));
+    }
+
+    #[test]
+    fn signature_detects_a_short_word_change_on_a_1080p_page() {
+        let signature = |name| {
+            let image = image::open(format!("tests/fixtures/capture/dialogue_{name}.png"))
+                .expect("capture fixture must load").to_rgba8();
+            let (width, height) = image.dimensions();
+            let mut bgra = image.into_raw();
+            for pixel in bgra.chunks_exact_mut(4) { pixel.swap(0, 2); }
+            let mut signature = FrameSignature::from_bgra(&bgra, width, height);
+            signature.set_text_regions([ScreenRect::new(790, 645, 100, 65)], 0, 0);
+            signature
+        };
+        let yes = signature("yes");
+        let no = signature("no");
+        assert!(yes.mad(&no) < DELTA_THRESHOLD);
+        assert!(yes.has_changed(&no), "YES -> NO must refresh the translation");
+        assert!(no.has_changed(&yes));
+        assert!(!yes.has_changed(&yes.clone()));
+    }
+
+    #[test]
+    fn signature_ignores_outside_animation_but_checks_text_during_stabilization() {
+        let moving_square = |x: usize, y: usize| {
+            let mut pixels = vec![255u8; 1920 * 1080 * 4];
+            for row in y..y + 10 {
+                for col in x..x + 10 {
+                    let start = (row * 1920 + col) * 4;
+                    pixels[start..start + 3].fill(0);
+                }
+            }
+            FrameSignature::from_bgra(&pixels, 1920, 1080)
+        };
+        let mut last = moving_square(100, 100);
+        // Real desktop coordinates on a monitor left of the primary display.
+        last.set_text_regions([ScreenRect::new(-110, 845, 100, 65)], -900, 200);
+        let mut sample = moving_square(130, 100);
+        sample.inherit_text_regions(&last);
+        assert!(sample.mad(&last) < DELTA_THRESHOLD);
+        assert!(!sample.has_changed(&last), "outside particles must not retrigger OCR");
+        let stable_sample = moving_square(160, 100);
+        assert!(!stable_sample.has_changed(&sample), "outside animation must not block stabilization");
+
+        let mut inside = moving_square(800, 660);
+        inside.inherit_text_regions(&last);
+        let typing = moving_square(830, 660);
+        assert!(typing.has_changed(&inside), "changing text must still delay translation");
     }
 
     #[test]

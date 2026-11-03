@@ -766,12 +766,20 @@ pub fn prepare_ocr_image(frame: &CapturedFrame) -> (PreprocessedImage, Option<Ve
     )
 }
 
+fn is_english_first_person_word(text: &str) -> bool {
+    let Some(word) = crate::types::cursor_word_spelling(text) else { return false; };
+    word == "I" || matches!(word.to_ascii_lowercase().as_str(), "i'll" | "i'm" | "i'd" | "i've")
+}
+
 /// Checks if a single token consists exclusively of spike/line OCR noise (| / \ 1 I l _ ~).
 pub fn is_spike_word(word: &str) -> bool {
     let trimmed = word.trim();
     if trimmed.is_empty() {
         return true;
     }
+    // A vertical stroke may also be the English pronoun. Preserve validated
+    // first-person words, without admitting arbitrary runs such as IIII/llll.
+    if is_english_first_person_word(trimmed) { return false; }
     let spike_chars = [
         '|', '/', '\\', '1', 'I', 'l', '_', '~', '!', '-', '`', '\'', ';', ':',
     ];
@@ -799,6 +807,7 @@ pub fn is_ocr_garbage(text: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
+    if is_english_first_person_word(trimmed) { return false; }
 
     let alpha_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
     let digit_count = trimmed.chars().filter(|c| c.is_numeric()).count();
@@ -1170,13 +1179,17 @@ pub fn cluster_lines_into_blocks(
                 if x_overlap || left_aligned || center_aligned {
                     block.rect = block.rect.union(&line.rect);
 
-                    // Check hyphenated word wrap: "adven-" + "ture" -> "adventure"
+                    // A visible hyphen may belong to a compound or stutter.
+                    // Only an explicit soft hyphen confirms a discretionary
+                    // break; preserve hard hyphens when joining wrapped text.
                     let trimmed_block = block.text.trim_end();
-                    if let Some(base) = trimmed_block.strip_suffix('-')
+                    let soft_base = trimmed_block.strip_suffix('\u{00ad}');
+                    if let Some(base) = soft_base.or_else(|| trimmed_block.strip_suffix('-'))
                         && base.chars().next_back().is_some_and(char::is_alphabetic)
                         && line.text.trim_start().chars().next().is_some_and(char::is_alphabetic)
                     {
-                        block.text = format!("{}{}", base, line.text.trim_start());
+                        let prefix = if soft_base.is_some() { base } else { trimmed_block };
+                        block.text = format!("{}{}", prefix, line.text.trim_start());
                     } else if !block.text.is_empty() {
                         block.text.push(' ');
                         block.text.push_str(line.text.trim());
@@ -1352,7 +1365,7 @@ mod tests {
 
         let blocks = cluster_lines_into_blocks(vec![line1, line2], None);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].text, "This was an adventure of a lifetime.");
+        assert_eq!(blocks[0].text, "This was an adven-ture of a lifetime.");
         assert_eq!(blocks[0].rect, ScreenRect::new(100, 100, 210, 44));
     }
 
@@ -1363,7 +1376,11 @@ mod tests {
             ("Damage: 10-", "20 points", "Damage: 10- 20 points"),
             ("Option-", "2 is ready", "Option- 2 is ready"),
             ("Wait--", "come here", "Wait-- come here"),
-            ("Это приклю-", "чение.", "Это приключение."),
+            ("Это приклю-", "чение.", "Это приклю-чение."),
+            ("D-", "Did he find out?!", "D-Did he find out?!"),
+            ("well-", "known", "well-known"),
+            ("This was an adven\u{00ad}", "ture.", "This was an adventure."),
+            ("Это приклю\u{00ad}", "чение.", "Это приключение."),
         ] {
             let lines = [first, second].into_iter().enumerate().map(|(i, text)| {
                 RecognizedLine {
@@ -1628,6 +1645,28 @@ mod tests {
         assert!(!is_ocr_garbage("No..."));
         assert!(!is_ocr_garbage("Wait..."));
         assert!(!is_ocr_garbage("Go!"));
+    }
+
+    #[test]
+    fn test_first_person_words_survive_noise_filter_and_line_grouping() {
+        for word in ["I", "I!", "I...", "I'll", "I’ll", "Iʼll", "I'm", "I’d", "I've"] {
+            assert!(!is_spike_word(word), "valid English word rejected: {word}");
+            assert!(!is_ocr_garbage(word), "valid English line rejected: {word}");
+            let lines = [word, "protect you."].into_iter().enumerate().map(|(i, text)| {
+                RecognizedLine {
+                    text: text.into(), confidence: Some(0.99), words: vec![],
+                    rect: ScreenRect::new(100, 100 + i as i32 * 24, 150, 20),
+                }
+            }).collect();
+            let blocks = cluster_lines_into_blocks(lines, None);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, format!("{word} protect you."));
+        }
+        for noise in ["llll", "IIII", "||", "|I|", "I@II#O*$"] {
+            assert!(is_ocr_garbage(noise), "spike noise accepted: {noise}");
+        }
+        assert!(is_spike_word("11"));
+        assert!(!is_ocr_garbage("11"), "pure HUD numbers remain legitimate");
     }
 
     #[tokio::test]

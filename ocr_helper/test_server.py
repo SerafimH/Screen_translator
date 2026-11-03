@@ -609,6 +609,52 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(merge_ocr_lines([]), [])
         self.assertEqual(merge_ocr_lines([[], []]), [])
 
+    def test_merge_keeps_complete_negated_reading_over_confident_clipped_suffix(self):
+        full = {"text": "DO NOT OPEN THE DOOR", "score": 0.95,
+                "box": [[0, 0], [300, 0], [300, 30], [0, 30]],
+                "words": [{"text": "NOT", "score": 0.94,
+                           "box": [[40, 0], [80, 0], [80, 30], [40, 30]]}]}
+        clipped = {"text": "OPEN THE DOOR", "score": 0.99,
+                   "box": [[95, 0], [300, 0], [300, 30], [95, 30]]}
+        for groups in ([[full], [clipped]], [[clipped], [full]]):
+            with self.subTest(groups=groups):
+                merged = merge_ocr_lines(groups)
+                self.assertEqual(merged, [full])
+                self.assertEqual(merged[0]["words"], full["words"])
+
+    def test_merge_does_not_guess_word_completion_or_combine_unique_fragments(self):
+        same_box = [[0, 0], [100, 0], [100, 30], [0, 30]]
+        # A substring inside a word is not evidence of a clipped phrase.
+        short = (same_box, "IN", 0.99)
+        long = (same_box, "BEGINNER", 0.91)
+        self.assertEqual(merge_ocr_lines([[long], [short]]), [short])
+        left = ([[0, 0], [300, 0], [300, 30], [0, 30]], "PLEASE FOLLOW THE", 0.96)
+        right = ([[70, 0], [370, 0], [370, 30], [70, 30]], "FOLLOW THE INSTRUCTIONS", 0.99)
+        for groups in ([[left], [right]], [[right], [left]]):
+            merged = merge_ocr_lines(groups)
+            self.assertEqual(len(merged), 2)
+            self.assertCountEqual(merged, [left, right])
+        nearly_same_region = ([[10, 0], [310, 0], [310, 30], [10, 30]],
+                              "FOLLOW THE INSTRUCTIONS", 0.99)
+        self.assertCountEqual(merge_ocr_lines([[left], [nearly_same_region]]),
+                              [left, nearly_same_region])
+
+    def test_merge_compares_confidence_only_for_competing_same_region_readings(self):
+        box = [[0, 0], [200, 0], [200, 30], [0, 30]]
+        weaker = (box, "OPEN THE FLOOR", 0.87)
+        stronger = (box, "OPEN THE DOOR", 0.97)
+        self.assertEqual(merge_ocr_lines([[weaker], [stronger]]), [stronger])
+        # Different content in partially overlapping boxes can be two real
+        # handwritten lines; neither reading covers the other's text region.
+        top = (box, "THIS IS REAL", 0.95)
+        lower = ([[0, 8], [200, 8], [200, 38], [0, 38]], "ANOTHER LINE", 0.99)
+        self.assertCountEqual(merge_ocr_lines([[top], [lower]]), [top, lower])
+        # Narrow lettering can lose a space after punctuation without changing
+        # any glyph. Differently padded variants remain one reading.
+        joined = (box, "WAIT!WE HAVE TO GO", 0.93)
+        spaced = ([[0, -4], [200, -4], [200, 36], [0, 36]], "WAIT! WE HAVE TO GO", 0.99)
+        self.assertEqual(merge_ocr_lines([[joined], [spaced]]), [spaced])
+
     def test_process_request_with_variants(self):
         from ocr_helper import server
         if server.np is None or server.cv2 is None:

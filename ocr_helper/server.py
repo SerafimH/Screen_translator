@@ -312,7 +312,8 @@ def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
     Чистая функция объединения строк от нескольких вариантов кадра:
     1. К каждому варианту отдельно применяется filter_ocr_lines.
     2. Все прошедшие фильтр строки объединяются.
-    3. При сильном перекрытии рамок (IoU прямоугольников > 0.5) оставляется строка с большей оценкой.
+    3. Полная строка сохраняется вместо охваченного ею обрезанного фрагмента.
+    4. Уверенность сравнивается для дубликатов и конкурирующих чтений той же области.
     """
     if not variant_groups:
         return []
@@ -341,6 +342,39 @@ def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
             return item.get("box")
         return item[0]
 
+    def _text(item):
+        return str(item.get("text", "") if isinstance(item, dict) else item[1]).casefold()
+
+    def _tokens(item):
+        return tuple(token for word in _text(item).split()
+                     if (token := word.strip('.,!?:;"“”«»()[]{}')))
+
+    def _is_clipped(full, fragment):
+        full_tokens, part_tokens = _tokens(full), _tokens(fragment)
+        if not part_tokens or len(full_tokens) <= len(part_tokens):
+            return False
+        if not any(full_tokens[i:i + len(part_tokens)] == part_tokens
+                   for i in range(len(full_tokens) - len(part_tokens) + 1)):
+            return False
+        outer, inner = _get_box(full), _get_box(fragment)
+        fx1, fx2 = min(p[0] for p in outer), max(p[0] for p in outer)
+        fy1, fy2 = min(p[1] for p in outer), max(p[1] for p in outer)
+        sx1, sx2 = min(p[0] for p in inner), max(p[0] for p in inner)
+        sy1, sy2 = min(p[1] for p in inner), max(p[1] for p in inner)
+        # Extra words alone can be hallucinations. Require additional image
+        # coverage as evidence of a complete line, allowing box rounding.
+        return (sx1 >= fx1 - 2 and sx2 <= fx2 + 2
+                and sy1 >= fy1 - 2 and sy2 <= fy2 + 2
+                and (fx2 - fx1) * (fy2 - fy1) > (sx2 - sx1) * (sy2 - sy1) * 1.03)
+
+    def _unique_fragment_coverage(left, right):
+        a, b = _tokens(left), _tokens(right)
+        if not any(a[-length:] == b[:length] for length in range(1, min(len(a), len(b)))):
+            return False
+        box_a, box_b = _get_box(left), _get_box(right)
+        return (min(p[0] for p in box_a) < min(p[0] for p in box_b) - 2
+                and max(p[0] for p in box_a) < max(p[0] for p in box_b) - 2)
+
     # Сортируем кандидатов по убыванию оценки уверенности
     candidates = sorted(all_kept, key=_get_score, reverse=True)
     merged = []
@@ -351,14 +385,32 @@ def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
             continue
 
         overlaps = False
-        for selected in merged:
+        replaced = []
+        for index, selected in enumerate(merged):
             sel_box = _get_box(selected)
             if sel_box and len(sel_box) >= 4:
-                if _compute_box_iou(cand_box, sel_box) > 0.5:
+                iou = _compute_box_iou(cand_box, sel_box)
+                if iou <= 0.5:
+                    continue
+                if _is_clipped(cand, selected):
+                    replaced.append(index)
+                elif _is_clipped(selected, cand):
+                    overlaps = True
+                    break
+                elif (_unique_fragment_coverage(cand, selected)
+                      or _unique_fragment_coverage(selected, cand)):
+                    continue
+                elif (_tokens(cand) == _tokens(selected)
+                      or "".join(_text(cand).split()) == "".join(_text(selected).split())
+                      or iou >= 0.85):
+                    # Confidence-sorted candidates compete only when they read
+                    # the same text or almost exactly the same image region.
                     overlaps = True
                     break
 
         if not overlaps:
+            for index in reversed(replaced):
+                del merged[index]
             merged.append(cand)
 
     return merged

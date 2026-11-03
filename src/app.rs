@@ -171,7 +171,7 @@ impl App {
                 })
                 .await;
 
-                let (_frame, sig) = match frame_res {
+                let (_frame, mut sig) = match frame_res {
                     Ok(Ok(pair)) => pair,
                     _ => continue,
                 };
@@ -181,10 +181,9 @@ impl App {
                         .last_signature
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    if let Some(prev) = last_sig_lock.as_ref()
-                        && !sig.has_changed(prev)
-                    {
-                        continue;
+                    if let Some(prev) = last_sig_lock.as_ref() {
+                        sig.inherit_text_regions(prev);
+                        if !sig.has_changed(prev) { continue; }
                     }
                 }
 
@@ -192,7 +191,7 @@ impl App {
                 let stable = tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(current_roi)).await;
                 let Ok(Ok(stable)) = stable else { continue; };
                 let stable_sig = FrameSignature::from_bgra(&stable.bgra_bytes, stable.width, stable.height);
-                if sig.has_changed(&stable_sig)
+                if stable_sig.has_changed(&sig)
                     || !auto_state.auto_mode.load(Ordering::Relaxed)
                     || auto_state.is_processing.load(Ordering::Relaxed)
                     || !auto_state.translator.automatic_retry_ready()
@@ -626,7 +625,7 @@ impl AppState {
             .then_some(target.sentence_text.as_str());
         let sentence_fut = async {
             if let Some(context) = context {
-                self.translator.translate_text(context, &cfg.source_lang, &cfg.target_lang, &cfg).await.ok()
+                self.translator.translate_context(context, &cfg.source_lang, &cfg.target_lang, &cfg).await.ok()
             } else { None }
         };
         let (details, sentence_translation) = tokio::join!(details_fut, sentence_fut);
@@ -780,7 +779,7 @@ impl AppState {
             "Captured {}x{} frame. Running OCR (mode: {:?})...",
             frame.width, frame.height, cfg.ocr_engine
         );
-        let sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
+        let mut sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
 
         let (blocks, raw_json) = match self.perform_ocr(&frame, &cfg).await {
             Ok(res) => res,
@@ -797,6 +796,8 @@ impl AppState {
         };
 
         let has_text = !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text));
+        sig.set_text_regions(blocks.iter().flat_map(|block| block.lines.iter().map(|line| line.rect)),
+                             frame.offset_x, frame.offset_y);
 
         let has_vision_support = cfg.gemini_api_key.is_some() || cfg.openai_api_key.is_some();
         let mut vision_error = None;
@@ -816,6 +817,8 @@ impl AppState {
             {
                 Ok(vision_blocks) => {
                     if !vision_blocks.is_empty() {
+                        sig.set_text_regions(vision_blocks.iter().map(|block| block.rect),
+                                             frame.offset_x, frame.offset_y);
                         let elapsed = start_time.elapsed().as_millis();
                         let status = format!(
                             "Vision OCR: {} блоков за {} мс",

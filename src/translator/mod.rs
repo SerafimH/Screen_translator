@@ -378,7 +378,8 @@ pub fn redact_secrets(input: &str) -> String {
     out
 }
 
-/// Cleans boundary noise characters and internal OCR letter-number confusions.
+/// Cleans boundary noise and whitespace without guessing internal letters,
+/// digits, names, or acronyms from text alone.
 pub fn clean_ocr_noise(text: &str) -> String {
     let mut s = text.trim().to_string();
 
@@ -387,51 +388,9 @@ pub fn clean_ocr_noise(text: &str) -> String {
         .trim_matches(|c: char| c.is_whitespace() || noise_chars.contains(&c))
         .to_string();
 
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut out_chars = Vec::with_capacity(len);
-
-    for i in 0..len {
-        let ch = chars[i];
-        let prev_alpha = if i > 0 {
-            chars[i - 1].is_alphabetic()
-        } else {
-            false
-        };
-        let next_alpha = if i + 1 < len {
-            chars[i + 1].is_alphabetic()
-        } else {
-            false
-        };
-
-        let prev_non_zero = chars[..i].iter().rposition(|&c| c != '0');
-        let next_non_zero = chars[i + 1..]
-            .iter()
-            .position(|&c| c != '0')
-            .map(|p| i + 1 + p);
-        let is_letter_o = match (prev_non_zero, next_non_zero) {
-            (Some(pi), Some(ni)) => chars[pi].is_alphabetic() && chars[ni].is_alphabetic(),
-            _ => false,
-        };
-
-        if ch == '0' && is_letter_o {
-            let ni = next_non_zero.unwrap();
-            let is_upper = chars[ni].is_uppercase();
-            out_chars.push(if is_upper { 'O' } else { 'o' });
-        } else if ch == '|' && (prev_alpha || next_alpha || i == 0) {
-            out_chars.push('I');
-        } else if ch == '1' && prev_alpha && next_alpha {
-            out_chars.push('l');
-        } else {
-            out_chars.push(ch);
-        }
-    }
-
-    let cleaned: String = out_chars.into_iter().collect();
-
     let mut out = String::new();
     let mut last_was_space = false;
-    for c in cleaned.chars() {
+    for c in s.chars() {
         if c.is_whitespace() {
             if !last_was_space {
                 out.push(' ');
@@ -455,63 +414,6 @@ pub fn is_translatable_text(text: &str) -> bool {
 /// Tokens containing foreign characters, symbols, or numbers (e.g. "•PA", "4EASE", "I@II#O*$") are rejected.
 pub fn is_valid_dictionary_word(word: &str) -> bool {
     crate::types::cursor_word_token(word).is_some()
-}
-
-/// Converts comic/game ALL CAPS text into readable, natural sentence casing.
-pub fn normalize_all_caps(text: &str) -> String {
-    let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
-    if alpha_chars.is_empty() {
-        return text.to_string();
-    }
-
-    let upper_count = alpha_chars.iter().filter(|c| c.is_uppercase()).count();
-    let lower_count = alpha_chars.iter().filter(|c| c.is_lowercase()).count();
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    if upper_count >= 4 && lower_count == 0 && words.len() >= 2 {
-        let mut result = String::with_capacity(text.len());
-        let mut capitalize_next = true;
-
-        for ch in text.chars() {
-            if ch.is_alphabetic() {
-                if capitalize_next {
-                    result.extend(ch.to_uppercase());
-                    capitalize_next = false;
-                } else {
-                    result.extend(ch.to_lowercase());
-                }
-            } else {
-                result.push(ch);
-                if ch == '.' || ch == '!' || ch == '?' {
-                    capitalize_next = true;
-                }
-            }
-        }
-
-        let mut words_fixed = Vec::new();
-        for word in result.split(' ') {
-            let lower = word.to_lowercase();
-            let core = word
-                .trim_matches(|c: char| !c.is_alphabetic())
-                .to_lowercase();
-            if lower == "i" {
-                words_fixed.push("I".to_string());
-            } else if let Some(rest) = lower.strip_prefix("i'") {
-                words_fixed.push(format!("I'{}", rest));
-            } else if matches!(
-                core.as_str(),
-                "hp" | "mp" | "exp" | "lv" | "atk" | "def" | "npc"
-            ) {
-                words_fixed.push(word.to_uppercase());
-            } else {
-                words_fixed.push(word.to_string());
-            }
-        }
-
-        words_fixed.join(" ")
-    } else {
-        text.to_string()
-    }
 }
 
 /// Cleans awkward spaces before Russian punctuation.
@@ -557,6 +459,10 @@ fn google_dialogue_input<'a>(text: &'a str, source: &str, target: &str) -> (&'a 
         return (text, 0);
     }
     (&text[first.len() - word.len()..], parts.len() - 1)
+}
+
+fn google_batchable_indices(indices: &[usize], texts: &[String], source: &str, target: &str) -> Vec<usize> {
+    indices.iter().copied().filter(|&i| google_dialogue_input(&texts[i], source, target).1 == 0).collect()
 }
 
 fn restore_russian_stutter(translated: &str, repeats: usize) -> String {
@@ -1582,6 +1488,20 @@ impl TranslatorService {
         target_lang: &str,
         config: &AppConfig,
     ) -> Result<String, String> {
+        self.translate_text_with_history(text, source_lang, target_lang, config, true).await
+    }
+
+    /// Translates cursor/menu context without treating a lookup as new dialogue.
+    pub async fn translate_context(
+        &self, text: &str, source_lang: &str, target_lang: &str, config: &AppConfig,
+    ) -> Result<String, String> {
+        self.translate_text_with_history(text, source_lang, target_lang, config, false).await
+    }
+
+    async fn translate_text_with_history(
+        &self, text: &str, source_lang: &str, target_lang: &str, config: &AppConfig,
+        record_history: bool,
+    ) -> Result<String, String> {
         if !is_translatable_text(text) {
             warn!("translate_text: skipping OCR garbage: {:?}", text);
             return Ok(text.to_string());
@@ -1591,8 +1511,7 @@ impl TranslatorService {
             warn!("translate_text: skipping noisy cleaned text: {:?}", cleaned);
             return Ok(text.to_string());
         }
-        let normalized = normalize_all_caps(&cleaned);
-        self.translate_normalized_text(&normalized, source_lang, target_lang, config, true)
+        self.translate_normalized_text(&cleaned, source_lang, target_lang, config, record_history)
             .await
     }
 
@@ -1681,7 +1600,7 @@ impl TranslatorService {
 
         if details.primary.is_empty() {
             match self
-                .translate_normalized_text(&normalize_all_caps(normalized), source_lang, target_lang, config, false)
+                .translate_normalized_text(normalized, source_lang, target_lang, config, false)
                 .await
             {
                 Ok(fallback_trans) => {
@@ -1829,14 +1748,20 @@ impl TranslatorService {
         if blocks.is_empty() {
             return TranslationBatchReport { blocks: Vec::new(), errors: Vec::new() };
         }
-        let cleaned: Vec<String> = blocks.iter().map(|b| normalize_all_caps(&clean_ocr_noise(&b.text))).collect();
+        let cleaned: Vec<String> = blocks.iter().map(|b| clean_ocr_noise(&b.text)).collect();
         let keys: Vec<String> = cleaned.iter().map(|text|
             self.cache_key("translation", text, &config.source_lang, &config.target_lang, config)).collect();
         let mut values: Vec<Option<String>> = cleaned.iter().zip(&keys).zip(blocks).map(|((text, key), block)| {
             if is_translatable_text(text) { self.cache.get(key) } else { Some(block.text.clone()) }
         }).collect();
         let uncached: Vec<usize> = values.iter().enumerate().filter_map(|(i, value)| value.is_none().then_some(i)).collect();
-        let texts: Vec<&str> = uncached.iter().map(|&i| cleaned[i].as_str()).collect();
+        // A joined Google request can only restore a stutter at its first
+        // position. Send stuttered blocks individually, including when they
+        // follow another bubble or are the only uncached part of the scene.
+        let batch_indices = if config.provider == TranslationProvider::Google {
+            google_batchable_indices(&uncached, &cleaned, &config.source_lang, &config.target_lang)
+        } else { uncached.clone() };
+        let texts: Vec<&str> = batch_indices.iter().map(|&i| cleaned[i].as_str()).collect();
         let mut errors = Vec::new();
         let batch = if texts.len() > 1 && config.provider == TranslationProvider::Google {
             Some(self.translate_provider_raw(&texts.join("\n[---]\n"), &config.source_lang, &config.target_lang, config)
@@ -1846,19 +1771,19 @@ impl TranslatorService {
             Some(self.translate_deepl_batch(&texts, &config.source_lang, &config.target_lang, key,
                 &self.context.format_history_context()).await)
         } else { None };
-        let batch_succeeded = if let Some(Ok(translated)) = batch.as_ref()
-            && translated.len() == uncached.len() {
-            for (&i, text) in uncached.iter().zip(translated) {
+        if let Some(Ok(translated)) = batch.as_ref()
+            && translated.len() == batch_indices.len() {
+            for (&i, text) in batch_indices.iter().zip(translated) {
                 let value = self.context.postprocess(&clean_russian_punctuation(text.trim()));
                 self.cache.insert(keys[i].clone(), value.clone());
                 values[i] = Some(value);
             }
-            true
-        } else { false };
-        if !batch_succeeded && !uncached.is_empty() {
+        }
+        let remaining = uncached.into_iter().filter(|&i| values[i].is_none()).collect::<Vec<_>>();
+        if !remaining.is_empty() {
             let mut tasks = tokio::task::JoinSet::new();
             let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
-            for i in uncached {
+            for i in remaining {
                 let service = self.clone();
                 let text = cleaned[i].clone();
                 let cfg = config.clone();
@@ -2015,6 +1940,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_context_requests_and_cache_hits_preserve_real_dialogue_history() {
+        let (base_url, server) = mock_responses(vec![
+            (200, String::new(), completion_response("Удалить сохранённую игру?")),
+        ]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::with_history_size(5);
+        for i in 0..5 {
+            service.context.record_translation(format!("My sister said {i}"), format!("Сестра сказала {i}"));
+        }
+        let history = service.context.get_recent_history();
+        for _ in 0..6 {
+            assert_eq!(service.translate_context("Delete saved game?", "en", "ru", &config).await.unwrap(),
+                       "Удалить сохранённую игру?");
+            assert_eq!(service.context.get_recent_history(), history);
+        }
+        assert_eq!(server.await.unwrap().len(), 1, "repeated context must reuse its cached translation");
+    }
+
+    #[tokio::test]
+    async fn translation_requests_preserve_acronyms_names_and_digit_identifiers() {
+        let inputs = ["HELP US REACH THE US.", "THE UN SENT AN AI ROBOT.",
+                      "John has H1N1. Room A1B is ready. Code A0A."];
+        let responses = inputs.iter().map(|_| (200, String::new(), completion_response("Перевод"))).collect();
+        let (base_url, server) = mock_responses(responses).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        for text in inputs {
+            service.translate_text(text, "en", "ru", &config).await.unwrap();
+        }
+        let requests = server.await.unwrap();
+        for (request, original) in requests.iter().zip(inputs) {
+            let body: serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["messages"][1]["content"].as_str(), Some(original));
+        }
+    }
+
+    #[tokio::test]
     async fn test_dictionary_fallback_does_not_enter_dialogue_history() {
         let (base_url, server) = mock_responses(vec![(200, String::new(), completion_response("я"))]).await;
         let config = openai_config(base_url);
@@ -2137,44 +2099,21 @@ mod tests {
         let dirty = " | _ The ancient sword ~ | ";
         assert_eq!(clean_ocr_noise(dirty), "The ancient sword");
 
-        let ocr_errors = "TH|S W0RLD";
-        assert_eq!(clean_ocr_noise(ocr_errors), "THIS WORLD");
-
-        let lower_errors = "c0me p1ayer";
-        assert_eq!(clean_ocr_noise(lower_errors), "come player");
-
-        // Game stats: digits next to letters must NOT convert '0' into 'O'/'o'
-        assert_eq!(clean_ocr_noise("100HP 50G 10s 50m"), "100HP 50G 10s 50m");
-
-        // Consecutive zeros in words must convert to 'O'/'o'
-        assert_eq!(clean_ocr_noise("B00M!"), "BOOM!");
-        assert_eq!(clean_ocr_noise("f00l"), "fool");
-        assert_eq!(clean_ocr_noise("S00N"), "SOON");
-
-        // Title-case words with scanned zeros must become lowercase inside
-        assert_eq!(clean_ocr_noise("S00n"), "Soon");
-        assert_eq!(clean_ocr_noise("C0me"), "Come");
+        for text in ["TH|S W0RLD", "c0me p1ayer", "100HP 50G 10s 50m", "B00M!",
+                     "f00l", "S00N", "S00n", "C0me", "H1N1", "Room A1B is ready.", "A0A"] {
+            assert_eq!(clean_ocr_noise(text), text, "text alone cannot prove an OCR substitution");
+        }
+        assert_eq!(clean_ocr_noise("  John\n  has\tH1N1.  "), "John has H1N1.");
     }
 
     #[test]
-    fn test_normalize_all_caps() {
-        let caps = "THE ANCIENT SWORD OF LIGHT! CAN YOU FIND IT? I MUST GO.";
-        let normal = normalize_all_caps(caps);
-        assert_eq!(
-            normal,
-            "The ancient sword of light! Can you find it? I must go."
-        );
-
-        // Keep mixed case unchanged
-        let mixed = "Already Normal Sentence.";
-        assert_eq!(normalize_all_caps(mixed), "Already Normal Sentence.");
-
-        // Stat abbreviations with trailing or wrapping punctuation
-        let stats = "YOUR HP: 100! (MP) RESTORED. CURRENT LV. 5 EXP +50.";
-        assert_eq!(
-            normalize_all_caps(stats),
-            "Your HP: 100! (MP) restored. Current LV. 5 EXP +50."
-        );
+    fn translation_cleanup_keeps_observed_case() {
+        for text in ["THE ANCIENT SWORD OF LIGHT! CAN YOU FIND IT? I MUST GO.",
+                     "Already Normal Sentence.", "HELP US REACH THE US.",
+                     "THE UN SENT AN AI ROBOT.", "POLISH IS NOT polish.",
+                     "YOUR HP: 100! (MP) RESTORED. CURRENT LV. 5 EXP +50."] {
+            assert_eq!(clean_ocr_noise(text), text);
+        }
     }
 
     #[test]
@@ -2203,6 +2142,22 @@ mod tests {
         assert_eq!(google_dialogue_input("D-Did he find out?!", "en", "ja"),
                    ("D-Did he find out?!", 0));
         assert_eq!(restore_russian_stutter("?!", 1), "?!");
+    }
+
+    #[test]
+    fn google_batch_isolates_each_stuttered_bubble_at_any_uncached_position() {
+        let texts = ["Hello.", "D-Did he find out?!", "Another bubble.", "W-What is that?!", "D-Day is here."]
+            .into_iter().map(str::to_string).collect::<Vec<_>>();
+        let all = [0, 1, 2, 3, 4];
+        assert_eq!(google_batchable_indices(&all, &texts, "en", "ru"), [0, 2, 4]);
+        assert!(google_batchable_indices(&[1, 3], &texts, "en-US", "ru-RU").is_empty());
+        assert_eq!(google_batchable_indices(&[1, 2], &texts, "en", "ru"), [2]);
+        assert_eq!(google_batchable_indices(&all, &texts, "en", "ja"), all);
+        for i in [1, 3] {
+            let (input, repeats) = google_dialogue_input(&texts[i], "en", "ru");
+            assert_eq!(repeats, 1);
+            assert!(!input.starts_with("D-") && !input.starts_with("W-"));
+        }
     }
 
     #[test]
