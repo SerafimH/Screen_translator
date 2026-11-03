@@ -92,6 +92,8 @@ pub struct RecognizedWord {
 /// A line of text containing multiple words.
 #[derive(Debug, Clone)]
 pub struct RecognizedLine {
+    /// Native WinRT does not report confidence.
+    pub confidence: Option<f32>,
     pub text: String,
     pub rect: ScreenRect,
     pub words: Vec<RecognizedWord>,
@@ -884,16 +886,40 @@ impl AppConfig {
         match toml::from_str::<AppConfigRaw>(content) {
             Ok(raw) => Self::from(raw),
             Err(e) => {
-                warn!("Failed to parse config TOML: {e}, falling back to defaults");
+                warn!("{}", safe_config_parse_error(content, &e));
                 Self::default()
             }
         }
     }
 }
 
+// TOML's Display includes source lines and can expose credentials, even for type errors.
+fn safe_config_parse_error(content: &str, error: &toml::de::Error) -> String {
+    let offset = error.span().map_or(0, |span| span.start).min(content.len());
+    let prefix = &content.as_bytes()[..offset];
+    let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+    let column = prefix.iter().rposition(|&b| b == b'\n').map_or(offset + 1, |i| offset - i);
+    format!("Invalid config TOML at line {line}, byte column {column}; falling back to defaults")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_errors_never_include_secret_source_or_values() {
+        for content in [
+            "openai_api_key = \"sk-audit-dummy-secret",
+            "font_size = \"sk-audit-dummy-secret\"",
+            "gemini_api_key = [\"audit-secret\"]",
+        ] {
+            let error = toml::from_str::<AppConfigRaw>(content).err().expect("invalid config");
+            let message = safe_config_parse_error(content, &error);
+            assert!(message.contains("line 1"));
+            assert!(!message.contains("secret"));
+            assert!(!message.contains("api_key"));
+        }
+    }
 
     #[test]
     fn test_from_points_all_quadrants() {
@@ -1239,6 +1265,7 @@ mod tests {
             text: "Hello world".to_string(),
             rect: ScreenRect::new(100, 100, 200, 30),
             lines: vec![RecognizedLine {
+                confidence: None,
                 text: "Hello world".to_string(),
                 rect: ScreenRect::new(100, 100, 200, 30),
                 words: vec![
@@ -1290,6 +1317,7 @@ mod tests {
             rect: ScreenRect::new(100, 100, 200, 50),
             lines: vec![
                 RecognizedLine {
+                    confidence: None,
                     text: "Top line".to_string(),
                     rect: ScreenRect::new(100, 100, 200, 30), // Y: 100..130, center Y = 115
                     words: vec![
@@ -1304,6 +1332,7 @@ mod tests {
                     ],
                 },
                 RecognizedLine {
+                    confidence: None,
                     text: "Bottom line".to_string(),
                     rect: ScreenRect::new(100, 120, 200, 30), // Y: 120..150, center Y = 135
                     words: vec![
@@ -1337,6 +1366,7 @@ mod tests {
             text: "Target".to_string(),
             rect: ScreenRect::new(100, 100, 100, 30),
             lines: vec![RecognizedLine {
+                confidence: None,
                 text: "Target".to_string(),
                 rect: ScreenRect::new(100, 100, 100, 30),
                 words: vec![RecognizedWord {
@@ -1367,6 +1397,7 @@ mod tests {
             text: "Target".to_string(),
             rect: ScreenRect::new(100, 100, 100, 30),
             lines: vec![RecognizedLine {
+                confidence: None,
                 text: "Target".to_string(),
                 rect: ScreenRect::new(100, 100, 100, 30),
                 words: vec![RecognizedWord {
@@ -1391,16 +1422,19 @@ mod tests {
         let h = 20;
         // 1. Три строки друг под другом (зазор между ними 5px <= 0.8 * 20 = 16)
         let line0 = RecognizedLine {
+            confidence: None,
             text: "Line 1".to_string(),
             rect: ScreenRect::new(100, 100, 200, h),
             words: Vec::new(),
         };
         let line1 = RecognizedLine {
+            confidence: None,
             text: "Line 2".to_string(),
             rect: ScreenRect::new(100, 125, 200, h),
             words: Vec::new(),
         };
         let line2 = RecognizedLine {
+            confidence: None,
             text: "Line 3".to_string(),
             rect: ScreenRect::new(100, 150, 200, h),
             words: Vec::new(),
@@ -1413,6 +1447,7 @@ mod tests {
 
         // 2. Строка далеко справа (не входит)
         let line_far_right = RecognizedLine {
+            confidence: None,
             text: "Far Right".to_string(),
             rect: ScreenRect::new(800, 125, 200, h),
             words: Vec::new(),
@@ -1423,6 +1458,7 @@ mod tests {
 
         // 3. Строка ниже с зазором 3 * h (не входит)
         let line_far_below = RecognizedLine {
+            confidence: None,
             text: "Far Below".to_string(),
             rect: ScreenRect::new(100, 100 + h + 3 * h, 200, h), // gap = 3 * h = 60 > 16
             words: Vec::new(),
@@ -1486,6 +1522,7 @@ mod tests {
             text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
             rect: ScreenRect::new(100, 100, 200, 30),
             lines: vec![RecognizedLine {
+                confidence: None,
                 text: "PLEASE FOLLOW INSTRUCTIONS!".to_string(),
                 rect: ScreenRect::new(100, 100, 200, 30),
                 words: vec![
@@ -1524,6 +1561,7 @@ mod tests {
             OcrBlock {
                 text: text.to_string(), rect,
                 lines: vec![RecognizedLine {
+                    confidence: None,
                     text: text.to_string(), rect,
                     words: vec![RecognizedWord { text: text.to_string(), rect }],
                 }],

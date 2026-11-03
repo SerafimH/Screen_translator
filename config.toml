@@ -21,13 +21,14 @@ provider = "google"
 # Режим OCR распознавания текста:
 # "winrt"  - Встроенный системный Windows.Media.Ocr (по умолчанию, без внешних зависимостей)
 # "helper" - Python-помощник на базе RapidOCR (модели PP-OCR, высокая точность на сложных фонах)
-# "auto"   - Автоматический режим (WinRT Pass 1 -> при низком качестве RapidOCR -> Vision fallback)
+# "auto"   - Сравнение WinRT и RapidOCR по областям -> разрешённый Vision fallback
 ocr_engine = "winrt"
 
 # Настройки OCR-помощника (RapidOCR Python):
 python_path = "ocr_helper/.venv/Scripts/python.exe"
 helper_timeout_ms = 5000
 helper_min_score = 0.5
+# Порог передаётся в RapidOCR и фильтрацию Python; диапазон 0..1.
 ocr_lang = "en"
 
 # Языки перевода (en -> ru для комиксов, манги и игр)
@@ -62,7 +63,9 @@ vision_fallback = false
 # openai_api_key = "gsk_..."
 openai_base_url = "https://api.groq.com/openai/v1"
 openai_model = "openai/gpt-oss-120b"
-# openai_vision_model = "llama-3.2-11b-vision-preview"
+# Для Groq укажите действующий ID модели с поддержкой изображений из списка /models.
+# Автоматического выбора Vision-модели нет; снятые с обслуживания preview-модели отклоняются.
+# openai_vision_model = "your-active-vision-model-id"
 
 # ------------------------------------------------------------------------------
 # Настройки интерфейса и авто-режима

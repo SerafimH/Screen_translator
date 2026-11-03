@@ -7,11 +7,14 @@ All logs, diagnostic messages, and warnings are directed to stderr.
 """
 
 from collections import OrderedDict
+from contextlib import redirect_stdout
 import json
 import logging
+import math
 import os
 import sys
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 try:
@@ -29,13 +32,14 @@ except ImportError:
 # -----------------------------------------------------------------------------
 SCREEN_TRANSLATOR_OCR_DEBUG_ENV = "SCREEN_TRANSLATOR_OCR_DEBUG"
 SCREEN_TRANSLATOR_OCR_VARIANTS_ENV = "SCREEN_TRANSLATOR_OCR_VARIANTS"
+SCREEN_TRANSLATOR_OCR_LANG_ENV = "SCREEN_TRANSLATOR_OCR_LANG"
 
 # Пороги масштабирования малых кадров
 SMALL_FRAME_PIXELS = 1_500_000
 UPSCALE_SMALL_FRAMES = 2
 
 # Пороги фильтрации мусора
-MIN_SCORE = 0.60              # Минимальная уверенность RapidOCR (меньше -> "low_score")
+MIN_SCORE = 0.50              # Default matches helper_min_score in the Rust client.
 MIN_SINGLE_CHAR_SCORE = 0.85  # Повышенная уверенность для односимвольных строк (меньше -> "too_short")
 MAX_SYMBOL_RATIO = 0.25       # Максимальная доля мусорных спецсимволов (больше -> "symbols")
 MIN_BOX_WIDTH = 6             # Минимальная ширина рамки в px (меньше -> "tiny_box")
@@ -201,10 +205,10 @@ def extract_lines_from_result(result) -> List[Dict[str, Any]]:
     return lines
 
 
-def filter_ocr_lines(lines):
+def filter_ocr_lines(lines, min_score=MIN_SCORE):
     """
     Чистая функция фильтрации OCR-строк по правилам:
-    1. score < MIN_SCORE (0.60) -> отбросить ("low_score")
+    1. score < min_score -> отбросить ("low_score")
     2. Пустой текст или нет ни одного alnum символа -> отбросить ("no_alnum")
     3. Доля мусорных спецсимволов среди непробельных > MAX_SYMBOL_RATIO (0.25) -> отбросить ("symbols")
     4. Односимвольные строки при score < MIN_SINGLE_CHAR_SCORE (0.85) -> отбросить ("too_short")
@@ -227,7 +231,7 @@ def filter_ocr_lines(lines):
         text = str(text) if text is not None else ""
 
         # 1. Порог уверенности
-        if score < MIN_SCORE:
+        if not math.isfinite(score) or score < min_score:
             rejected.append((item, "low_score"))
             continue
 
@@ -259,6 +263,7 @@ def filter_ocr_lines(lines):
                 1
                 for ch in non_spaces
                 if not ch.isalnum() and ch not in STANDARD_PUNCTUATION
+                and not (not ch.isascii() and unicodedata.category(ch).startswith("P"))
             )
             if (garbage_count / len(non_spaces)) > MAX_SYMBOL_RATIO:
                 rejected.append((item, "symbols"))
@@ -297,7 +302,7 @@ def _compute_box_iou(box_a, box_b) -> float:
     return inter_area / union_area
 
 
-def merge_ocr_lines(variant_groups):
+def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
     """
     Чистая функция объединения строк от нескольких вариантов кадра:
     1. К каждому варианту отдельно применяется filter_ocr_lines.
@@ -315,7 +320,7 @@ def merge_ocr_lines(variant_groups):
     for group in variant_groups:
         if not group:
             continue
-        kept, _ = filter_ocr_lines(group)
+        kept, _ = filter_ocr_lines(group, min_score)
         all_kept.extend(kept)
 
     if not all_kept:
@@ -389,7 +394,7 @@ def rescale_boxes_down(
     return rescaled
 
 
-def call_engine(ocr_exec, img):
+def call_engine(ocr_exec, img, min_score=MIN_SCORE):
     """Executes OCR with RapidOCR options if supported, falling back gracefully for mock engines."""
     try:
         return ocr_exec(
@@ -398,7 +403,7 @@ def call_engine(ocr_exec, img):
             use_cls=False,
             box_thresh=0.5,
             unclip_ratio=1.6,
-            text_score=0.5,
+            text_score=min_score,
         )
     except TypeError:
         return ocr_exec(img)
@@ -462,7 +467,8 @@ def score_ocr_candidate(text: str, score: float) -> float:
     return score - symbol_penalty + dict_bonus
 
 
-def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str, Any]:
+def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,
+                           min_score=MIN_SCORE) -> Dict[str, Any]:
     box = line.get("box")
     if not box or len(box) < 4 or cv2 is None or np is None or not isinstance(img_bgr, np.ndarray):
         return line
@@ -489,7 +495,7 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str,
     # Variant (b): min(R,G,B) -> negative
     neg_min = (255 - min_ch).astype(np.uint8)
     crop_neg = np.stack([neg_min, neg_min, neg_min], axis=2)
-    res_b = call_engine(ocr_exec, crop_neg)
+    res_b = call_engine(ocr_exec, crop_neg, min_score)
     lines_b = extract_lines_from_result(res_b)
     for lb in lines_b:
         _shift_box_coords(lb, x1, y1)
@@ -503,7 +509,7 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str,
     # Variant (c): bright mask min(R,G,B) >= 220 -> black text on white
     mask_ch = np.where(min_ch >= 220, 0, 255).astype(np.uint8)
     crop_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
-    res_c = call_engine(ocr_exec, crop_mask)
+    res_c = call_engine(ocr_exec, crop_mask, min_score)
     lines_c = extract_lines_from_result(res_c)
     for lc in lines_c:
         _shift_box_coords(lc, x1, y1)
@@ -517,19 +523,19 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec) -> Dict[str,
     return best_cand
 
 
-def _run_ocr_with_variants(img, ocr_exec):
+def _run_ocr_with_variants(img, ocr_exec, min_score=MIN_SCORE):
     """Прогоняет OCR на изображении и двух его вариантах (инверсия и белая маска)."""
-    res_orig = ocr_exec(img)
+    res_orig = call_engine(ocr_exec, img, min_score)
     lines_orig = extract_lines_from_result(res_orig)
 
     img_inv = 255 - img
-    res_inv = ocr_exec(img_inv)
+    res_inv = call_engine(ocr_exec, img_inv, min_score)
     lines_inv = extract_lines_from_result(res_inv)
 
     is_white = np.min(img, axis=2) >= 200
     mask_ch = np.where(is_white, 0, 255).astype(np.uint8)
     img_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
-    res_mask = ocr_exec(img_mask)
+    res_mask = call_engine(ocr_exec, img_mask, min_score)
     lines_mask = extract_lines_from_result(res_mask)
     return lines_orig, lines_inv, lines_mask
 
@@ -616,6 +622,11 @@ def process_request(
     if req_id is None:
         return {"ok": False, "error": "Missing 'id' or 'cmd' in request"}
 
+    min_score = header.get("min_score", MIN_SCORE)
+    if (isinstance(min_score, bool) or not isinstance(min_score, (int, float))
+            or not math.isfinite(min_score) or not 0 <= min_score <= 1):
+        return {"id": req_id, "ok": False, "error": "min_score must be between 0 and 1"}
+
     lang = str(header.get("lang", "")).strip().lower()
     base_lang = lang.split("-")[0].split("_")[0]
     supported_langs = {"en", "ch", "zh", "ja", "ko", "ru"}
@@ -680,21 +691,23 @@ def process_request(
             and isinstance(img_bgr, np.ndarray)
         )
         if use_upscale:
+            original = extract_lines_from_result(call_engine(ocr_exec, img_bgr, min_score))
             up_w = width * UPSCALE_SMALL_FRAMES
             up_h = height * UPSCALE_SMALL_FRAMES
             img_up = cv2.resize(
                 img_bgr, (up_w, up_h), interpolation=cv2.INTER_CUBIC
             )
-            result = call_engine(ocr_exec, img_up)
+            result = call_engine(ocr_exec, img_up, min_score)
             raw_lines = extract_lines_from_result(result)
             raw_lines = rescale_boxes_down(raw_lines, UPSCALE_SMALL_FRAMES)
+            raw_lines = original + raw_lines
         elif use_variants:
             lines_orig, lines_inv, lines_mask = _run_ocr_with_variants(
-                img_bgr, ocr_exec
+                img_bgr, ocr_exec, min_score
             )
             raw_lines = lines_orig + lines_inv + lines_mask
         else:
-            result = call_engine(ocr_exec, img_bgr)
+            result = call_engine(ocr_exec, img_bgr, min_score)
             raw_lines = extract_lines_from_result(result)
 
         # Step 3: Targeted retry pass on problematic boxes
@@ -702,13 +715,13 @@ def process_request(
             refined = []
             for item in raw_lines:
                 if is_problematic_line(item):
-                    item = refine_problematic_box(img_bgr, item, ocr_exec)
+                    item = refine_problematic_box(img_bgr, item, ocr_exec, min_score)
                 refined.append(item)
             raw_lines = refined
 
-        kept_lines, rejected_lines = filter_ocr_lines(raw_lines)
-        if use_variants:
-            kept_lines = merge_ocr_lines([kept_lines])
+        kept_lines, rejected_lines = filter_ocr_lines(raw_lines, min_score)
+        if use_variants or use_upscale:
+            kept_lines = merge_ocr_lines([kept_lines], min_score)
 
         if os.environ.get(SCREEN_TRANSLATOR_OCR_DEBUG_ENV) == "1":
             rejection_map = {id(item): reason for item, reason in rejected_lines}
@@ -788,6 +801,16 @@ def run_server(stdin=None, stdout=None, engine=None):
     if engine is None:
         models_dir = resolve_models_dir()
         engine = EngineManager(models_dir)
+        # The client waits up to 30 seconds for ready, whereas individual OCR
+        # requests use a shorter budget. Load the configured model here so a
+        # cold model download cannot trigger an endless request/restart loop.
+        # Third-party initialization may print; stdout remains protocol-only.
+        try:
+            with redirect_stdout(sys.stderr):
+                engine.get_engine(os.environ.get(SCREEN_TRANSLATOR_OCR_LANG_ENV) or "en")
+        except Exception:
+            logger.exception("Failed to initialize OCR models before ready")
+            raise
 
     # Send ready notification to client
     ready_msg = json.dumps({"event": "ready"}).encode("utf-8") + b"\n"

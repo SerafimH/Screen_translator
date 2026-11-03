@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetCursor, SetForegroundWindow,
     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
     TranslateMessage, UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -347,6 +347,51 @@ struct WindowThreadState {
     previous_foreground_hwnd: HWND,
 }
 
+fn virtual_screen_bounds() -> ScreenRect {
+    unsafe {
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if width > 0 && height > 0 {
+            ScreenRect::new(GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), width, height)
+        } else {
+            ScreenRect::new(0, 0, GetSystemMetrics(SM_CXSCREEN).max(1), GetSystemMetrics(SM_CYSCREEN).max(1))
+        }
+    }
+}
+
+/// No reference to WindowThreadState may remain live across SetWindowPos: it dispatches messages.
+unsafe fn refresh_display_geometry(hwnd: HWND, bounds: ScreenRect) -> Result<()> {
+    let was_dragging = {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowThreadState;
+        if ptr.is_null() { return Ok(()); }
+        let state = unsafe { &mut *ptr };
+        state.renderer.reconfigure(bounds)?;
+        state.virtual_x = bounds.x;
+        state.virtual_y = bounds.y;
+        state.virtual_w = bounds.width;
+        state.virtual_h = bounds.height;
+        let mut shared = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.active_roi.is_some_and(|roi| {
+            roi.x < bounds.x || roi.y < bounds.y
+                || roi.x as i64 + roi.width as i64 > bounds.x as i64 + bounds.width as i64
+                || roi.y as i64 + roi.height as i64 > bounds.y as i64 + bounds.height as i64
+        }) {
+            shared.active_roi = None;
+            let _ = state.event_tx.send(AppEvent::ResetRoi);
+        }
+        let was_dragging = state.is_dragging;
+        state.is_dragging = false;
+        was_dragging
+    };
+    SAVE_BUTTON.lock().unwrap_or_else(|e| e.into_inner()).target = None;
+    if was_dragging { let _ = unsafe { ReleaseCapture() }; }
+    unsafe {
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), bounds.x, bounds.y, bounds.width, bounds.height, SWP_NOACTIVATE)?;
+        PostMessageW(Some(hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0))?;
+    }
+    Ok(())
+}
+
 pub struct OverlayManager;
 
 impl OverlayManager {
@@ -401,18 +446,8 @@ impl OverlayManager {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
 
-                // Query full multi-monitor virtual screen bounds
-                let mut virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                let mut virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                let mut virtual_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                let mut virtual_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-                if virtual_w <= 0 || virtual_h <= 0 {
-                    virtual_x = 0;
-                    virtual_y = 0;
-                    virtual_w = GetSystemMetrics(SM_CXSCREEN);
-                    virtual_h = GetSystemMetrics(SM_CYSCREEN);
-                }
+                let bounds = virtual_screen_bounds();
+                let (virtual_x, virtual_y, virtual_w, virtual_h) = (bounds.x, bounds.y, bounds.width, bounds.height);
 
                 let cross_cursor = LoadCursorW(None, IDC_CROSS).unwrap_or_default();
 
@@ -640,6 +675,13 @@ unsafe extern "system" fn overlay_wndproc(
 
     if state_ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    if matches!(msg, WM_DISPLAYCHANGE | WM_DPICHANGED) {
+        if let Err(error) = unsafe { refresh_display_geometry(hwnd, virtual_screen_bounds()) } {
+            error!("Failed to refresh overlay display geometry: {:?}", error);
+        }
+        return LRESULT(0);
     }
 
     // SAFETY: state_ptr was initialized from Box::into_raw during window creation and is non-null
@@ -904,6 +946,62 @@ fn exit_selection_mode(state: &mut WindowThreadState) {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    #[test]
+    fn display_refresh_updates_bounds_preserves_cards_and_resets_offscreen_roi() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let hwnd = unsafe {
+            CreateWindowExW(WS_EX_LAYERED, w!("STATIC"), w!("Display refresh test"), WS_POPUP,
+                0, 0, 300, 200, None, None, None, None).unwrap()
+        };
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let card = TranslationBlock {
+            original_text: "word".to_string(), translated_text: "translation".to_string(),
+            rect: ScreenRect::new(10, 20, 80, 30),
+        };
+        let shared = Arc::new(Mutex::new(OverlaySharedState {
+            current_blocks: vec![card.clone()], cursor_card: Some(card),
+            active_roi: Some(ScreenRect::new(10, 20, 80, 30)), ..OverlaySharedState::default()
+        }));
+        let state = Box::new(WindowThreadState {
+            hwnd, renderer: OverlayRenderer::new(0, 0, 300, 200, "Segoe UI", 16.0, 0.9).unwrap(),
+            mode: AppMode::Normal, virtual_x: 0, virtual_y: 0, virtual_w: 300, virtual_h: 200,
+            is_dragging: false, drag_start: POINT::default(), drag_current: POINT::default(),
+            shared_state: shared.clone(), event_tx, keyboard_hook: HHOOK(core::ptr::null_mut()),
+            mouse_hook: HHOOK(core::ptr::null_mut()), previous_foreground_hwnd: HWND(core::ptr::null_mut()),
+        });
+        let ptr = Box::into_raw(state);
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize); }
+        let bounds = ScreenRect::new(-200, -100, 640, 480);
+        unsafe { refresh_display_geometry(hwnd, bounds).unwrap(); }
+        let state = unsafe { &*ptr };
+        assert_eq!((state.virtual_x, state.virtual_y, state.virtual_w, state.virtual_h), (-200, -100, 640, 480));
+        let mut actual = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut actual).unwrap(); }
+        assert_eq!((actual.left, actual.top, actual.right, actual.bottom), (-200, -100, 440, 380));
+        assert!(shared.lock().unwrap().active_roi.is_some());
+        assert!(event_rx.try_recv().is_err());
+        shared.lock().unwrap().active_roi = Some(ScreenRect::new(10000, 10000, 100, 100));
+        unsafe { refresh_display_geometry(hwnd, bounds).unwrap(); }
+        assert!(matches!(event_rx.try_recv(), Ok(AppEvent::ResetRoi)));
+        assert!(shared.lock().unwrap().active_roi.is_none());
+        assert_eq!(shared.lock().unwrap().current_blocks.len(), 1);
+        assert!(shared.lock().unwrap().cursor_card.is_some());
+        // Exercise both OS notification handlers without changing monitor settings.
+        for message in [WM_DISPLAYCHANGE, WM_DPICHANGED] {
+            unsafe { overlay_wndproc(hwnd, message, WPARAM(0), LPARAM(0)); }
+            let state = unsafe { &*ptr };
+            let actual_bounds = virtual_screen_bounds();
+            assert_eq!((state.virtual_x, state.virtual_y, state.virtual_w, state.virtual_h),
+                (actual_bounds.x, actual_bounds.y, actual_bounds.width, actual_bounds.height));
+        }
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(ptr));
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
 
     #[test]
     fn test_save_button_consumes_only_its_click_and_keeps_the_clicked_card() {

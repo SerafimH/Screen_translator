@@ -11,14 +11,21 @@ Write-Host "Setting up Python virtual environment for OCR Helper..." -Foreground
 # 1. Check Python installation
 $SystemPython = Get-Command python -ErrorAction SilentlyContinue
 if (-not $SystemPython) {
-    Write-Error "Python 3 is not installed or not in PATH. Please install Python 3.8-3.13."
+    Write-Error "Python is not installed or not in PATH. Please install Python 3.10-3.13."
+    exit 1
+}
+
+& $SystemPython.Source -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "OCR Helper requires Python 3.10-3.13 for its pinned dependencies."
     exit 1
 }
 
 # 2. Create .venv if not already present
 $VenvDir = Join-Path $ScriptDir ".venv"
-if (-not (Test-Path $VenvDir)) {
-    Write-Host "Creating virtual environment in $VenvDir..."
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+if (-not (Test-Path $VenvPython)) {
+    Write-Host "Creating or repairing virtual environment in $VenvDir..."
     & python -m venv .venv
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to create virtual environment."
@@ -29,9 +36,14 @@ if (-not (Test-Path $VenvDir)) {
 }
 
 # 3. Locate venv python.exe
-$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 if (-not (Test-Path $VenvPython)) {
     Write-Error "Virtual environment python executable not found at $VenvPython"
+    exit 1
+}
+
+& $VenvPython -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "The existing .venv uses an unsupported Python version. Recreate it with Python 3.10-3.13."
     exit 1
 }
 
@@ -45,4 +57,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "OCR Helper environment setup completed successfully!" -ForegroundColor Green
-Write-Host "Now run download_models.py to download OCR models." -ForegroundColor Yellow
+Write-Host "Now run .\.venv\Scripts\python.exe download_models.py to download OCR models." -ForegroundColor Yellow

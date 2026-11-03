@@ -4,6 +4,7 @@ version = "0.6.0"
 edition = "2024"
 
 [dependencies]
+httpdate = "1.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }

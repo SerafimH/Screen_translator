@@ -182,6 +182,7 @@ struct HelperOcrRequest<'a> {
     width: u32,
     height: u32,
     lang: &'a str,
+    min_score: f32,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -276,6 +277,29 @@ impl OcrHelperClient {
         self.is_ready.load(Ordering::Relaxed) && self.is_available.load(Ordering::Relaxed)
     }
 
+    /// A cancelled foreground request must not consume the one restart attempt.
+    /// Completed failures retain the limit until a successful session resets it.
+    async fn restart_session_with(&self, initialize: impl std::future::Future<Output = ()>) {
+        if self.restart_attempted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        struct RestartGuard<'a> {
+            attempted: &'a AtomicBool,
+            completed: bool,
+        }
+        impl Drop for RestartGuard<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.attempted.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut guard = RestartGuard { attempted: &self.restart_attempted, completed: false };
+        info!("Attempting one restart of OCR helper process...");
+        initialize.await;
+        guard.completed = true;
+    }
+
     async fn init_session(&self) {
         if self.is_initializing.swap(true, Ordering::SeqCst) {
             tracing::debug!(
@@ -291,13 +315,16 @@ impl OcrHelperClient {
             }
         }
         let _guard = InitGuard(&self.is_initializing);
+        self.is_ready.store(false, Ordering::SeqCst);
+        self.is_available.store(false, Ordering::SeqCst);
 
-        let (raw_python_path, raw_server_path, ocr_engine) = {
+        let (raw_python_path, raw_server_path, ocr_engine, ocr_lang) = {
             let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             (
                 cfg.python_path.clone(),
                 "ocr_helper/server.py".to_string(),
                 cfg.ocr_engine,
+                cfg.ocr_lang.clone(),
             )
         };
 
@@ -381,6 +408,10 @@ impl OcrHelperClient {
             c
         };
 
+        // Model loading belongs to the 30-second initialization budget, not
+        // the shorter per-frame recognition timeout. This applies to both the
+        // standalone executable and the Python script.
+        cmd.env("SCREEN_TRANSLATOR_OCR_LANG", ocr_lang);
         let job = match create_kill_on_close_job() {
             Ok(j) => j,
             Err(e) => {
@@ -456,36 +487,33 @@ impl OcrHelperClient {
         let ready_res =
             tokio::time::timeout(Duration::from_secs(30), stdout_lines.next_line()).await;
 
-        match ready_res {
+        let ready = match ready_res {
             Ok(Ok(Some(line))) => {
                 if let Ok(evt) = serde_json::from_str::<ReadyEventJson>(&line)
                     && evt.event.as_deref() == Some("ready")
                 {
                     info!("OCR helper reported ready event: {}", line);
-                    self.is_ready.store(true, Ordering::SeqCst);
-                    self.is_available.store(true, Ordering::SeqCst);
-                    self.has_warned.store(false, Ordering::SeqCst);
-                    self.restart_attempted.store(false, Ordering::SeqCst);
+                    true
                 } else {
                     warn!("Unexpected first line from OCR helper: {}", line);
-                    self.is_available.store(false, Ordering::SeqCst);
+                    false
                 }
             }
             Ok(Ok(None)) => {
                 warn!("OCR helper process stdout closed before ready event.");
-                self.is_available.store(false, Ordering::SeqCst);
+                false
             }
             Ok(Err(e)) => {
                 warn!("IO error waiting for OCR helper ready event: {}", e);
-                self.is_available.store(false, Ordering::SeqCst);
+                false
             }
             Err(_) => {
                 warn!("Timed out waiting 30s for OCR helper ready event.");
-                self.is_available.store(false, Ordering::SeqCst);
+                false
             }
-        }
+        };
 
-        if self.is_available.load(Ordering::SeqCst) {
+        if ready {
             let mut sess_lock = self.session.lock().await;
             *sess_lock = Some(ProcessSession {
                 _child: child,
@@ -493,6 +521,12 @@ impl OcrHelperClient {
                 stdout_lines,
                 _job: job,
             });
+            // Publish readiness only after ownership has moved into the session.
+            // Cancellation while awaiting the mutex cannot leave a phantom session.
+            self.is_ready.store(true, Ordering::SeqCst);
+            self.is_available.store(true, Ordering::SeqCst);
+            self.has_warned.store(false, Ordering::SeqCst);
+            self.restart_attempted.store(false, Ordering::SeqCst);
         }
     }
 
@@ -558,10 +592,7 @@ impl OcrHelperClient {
 
             if !self.is_ready() {
                 // If unavailable and restart has not been attempted yet, attempt one restart
-                if !self.restart_attempted.swap(true, Ordering::SeqCst) {
-                    info!("Attempting one restart of OCR helper process...");
-                    self.init_session().await;
-                }
+                self.restart_session_with(self.init_session()).await;
 
                 if !self.is_ready() {
                     if !self.has_warned.swap(true, Ordering::Relaxed) {
@@ -583,6 +614,7 @@ impl OcrHelperClient {
             width: frame.width,
             height: frame.height,
             lang,
+            min_score,
         };
 
         let mut header_bytes = serde_json::to_vec(&req_header)
@@ -782,6 +814,7 @@ impl OcrHelperClient {
             };
 
             recognized.push(RecognizedLine {
+                confidence: Some(line.score),
                 text: trimmed.to_string(),
                 rect,
                 words,
@@ -1053,6 +1086,40 @@ mod tests {
         // While is_initializing is true, init_session should return immediately without spawning
         client.init_session().await;
         assert!(client.is_initializing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_restart_allows_next_request_to_initialize() {
+        let client = Arc::new(OcrHelperClient {
+            session: tokio::sync::Mutex::new(None),
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            is_ready: Arc::new(AtomicBool::new(false)),
+            is_available: Arc::new(AtomicBool::new(false)),
+            is_initializing: Arc::new(AtomicBool::new(false)),
+            has_warned: Arc::new(AtomicBool::new(false)),
+            restart_attempted: Arc::new(AtomicBool::new(false)),
+            next_id: AtomicU64::new(1),
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client.restart_session_with(async {
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }).await;
+        });
+        started_rx.await.unwrap();
+        assert!(client.restart_attempted.load(Ordering::SeqCst));
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(!client.restart_attempted.load(Ordering::SeqCst));
+
+        let mut attempts = 0;
+        client.restart_session_with(async { attempts += 1; }).await;
+        assert_eq!(attempts, 1, "The next request must enter initialization");
+        // An actual completed failure keeps the existing one-attempt limit.
+        client.restart_session_with(async { attempts += 1; }).await;
+        assert_eq!(attempts, 1);
     }
 
     #[test]

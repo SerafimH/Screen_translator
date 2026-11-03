@@ -14,6 +14,83 @@ use windows::Storage::Streams::DataWriter;
 use crate::capture::CapturedFrame;
 use crate::types::{OcrBlock, RecognizedLine, RecognizedWord, ScreenRect, luma_from_bgr};
 
+/// Merge regional candidates without dropping text found only by one pass.
+pub fn merge_recognized_lines(lines: &mut Vec<RecognizedLine>, candidates: Vec<RecognizedLine>) {
+    for candidate in candidates {
+        if is_ocr_garbage(&candidate.text) { continue; }
+        let candidate_text = candidate.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let duplicate = lines.iter_mut().find(|line| {
+            let a = line.rect;
+            let b = candidate.rect;
+            let overlap = ((a.x as i64 + a.width as i64).min(b.x as i64 + b.width as i64)
+                - a.x.max(b.x) as i64).max(0)
+                * ((a.y as i64 + a.height as i64).min(b.y as i64 + b.height as i64)
+                    - a.y.max(b.y) as i64).max(0);
+            let area_a = (a.width as i64 * a.height as i64).max(1);
+            let area_b = (b.width as i64 * b.height as i64).max(1);
+            let existing_text = line.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            // A clipped tile edge is a duplicate only when its text is contained in
+            // the other result. Otherwise keep both partial lines: either may have
+            // words that the other tile did not capture.
+            let contained_text = existing_text.contains(&candidate_text)
+                || candidate_text.contains(&existing_text);
+            overlap as f64 / area_a.min(area_b) as f64 >= 0.65
+                && (contained_text || overlap as f64 / area_a.max(area_b) as f64 >= 0.85)
+        });
+        if let Some(existing) = duplicate {
+            let existing_text = existing.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            let candidate_is_fuller = candidate_text.len() > existing_text.len()
+                && candidate_text.contains(&existing_text);
+            let existing_is_fuller = existing_text.len() > candidate_text.len()
+                && existing_text.contains(&candidate_text);
+            // Completeness wins over the confidence of a clipped fragment. For
+            // competing full readings WinRT still defaults to confidence 0.85.
+            if candidate_is_fuller || (!existing_is_fuller
+                && candidate.confidence.unwrap_or(0.85) > existing.confidence.unwrap_or(0.85)) {
+                *existing = candidate;
+            }
+        } else { lines.push(candidate); }
+    }
+}
+
+pub fn ocr_tiles(width: u32, height: u32) -> Vec<ScreenRect> {
+    let mut tiles = Vec::new();
+    let side = if width.max(height) > 2000 { 1200 } else { width.max(height).max(1) };
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            tiles.push(ScreenRect::new(x as i32, y as i32, side.min(width - x) as i32, side.min(height - y) as i32));
+            if x + side >= width { break; }
+            x += side - 160;
+        }
+        if y + side >= height { break; }
+        y += side - 160;
+    }
+    tiles
+}
+
+/// Crop uses frame-local coordinates and retains the desktop offset.
+pub fn crop_frame(frame: &CapturedFrame, rect: ScreenRect) -> Result<CapturedFrame, String> {
+    if rect.is_empty() || rect.x < 0 || rect.y < 0
+        || rect.x as u64 + rect.width as u64 > frame.width as u64
+        || rect.y as u64 + rect.height as u64 > frame.height as u64
+        || frame.bgra_bytes.len() != frame.width as usize * frame.height as usize * 4
+    { return Err("Invalid OCR crop".to_string()); }
+    let mut bytes = Vec::with_capacity(rect.width as usize * rect.height as usize * 4);
+    for y in rect.y..rect.y + rect.height {
+        let start = (y as usize * frame.width as usize + rect.x as usize) * 4;
+        bytes.extend_from_slice(&frame.bgra_bytes[start..start + rect.width as usize * 4]);
+    }
+    Ok(CapturedFrame { bgra_bytes: bytes, width: rect.width as u32, height: rect.height as u32,
+        offset_x: frame.offset_x + rect.x, offset_y: frame.offset_y + rect.y })
+}
+
+struct CancelOnDrop<F: FnMut()>(F);
+impl<F: FnMut()> Drop for CancelOnDrop<F> {
+    fn drop(&mut self) { (self.0)(); }
+}
+
 fn save_debug_image(path: &str, buf: &[u8], width: u32, height: u32) {
     if std::env::var("SCREEN_TRANSLATOR_DEBUG_OCR").is_ok() {
         let _ = fs::create_dir_all("debug_ocr");
@@ -231,14 +308,21 @@ impl WinrtOcrEngine {
         );
 
         let mut best_lines = first_lines;
+        // Always compare the untouched image: manga cleanup can erase game text.
+        if let Ok(raw_lines) = self.run_ocr_pass(OcrPassParams {
+            bgra_bytes: &frame.bgra_bytes, width: frame.width, height: frame.height,
+            remap: RemapParams { pad: 0, scale: 1.0, offset_x: frame.offset_x, offset_y: frame.offset_y },
+        }).await {
+            merge_recognized_lines(&mut best_lines, raw_lines);
+        }
         let mut best_score = first_score;
 
         // If first pass found quality text, do not waste time on extra passes
         if best_score < 25 {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
 
             // Pass 2: Outlined text mask (meme font filter)
-            if std::time::Instant::now() < deadline {
+            if tokio::time::Instant::now() < deadline {
                 let bytes = frame.bgra_bytes.clone();
                 let fw = frame.width;
                 let fh = frame.height;
@@ -260,23 +344,21 @@ impl WinrtOcrEngine {
                         offset_y: frame.offset_y,
                     },
                 };
-                if let Ok(mask_lines) = self.run_ocr_pass(mask_pass).await {
+                if let Ok(Ok(mask_lines)) = tokio::time::timeout_at(deadline, self.run_ocr_pass(mask_pass)).await {
                     let score = score_recognized_lines(&mask_lines);
                     info!(
                         "OCR pass 2 (meme_mask): found {} raw lines (score={})",
                         mask_lines.len(),
                         score
                     );
-                    if score > best_score {
-                        best_score = score;
-                        best_lines = mask_lines;
-                    }
+                    best_score = best_score.max(score);
+                    merge_recognized_lines(&mut best_lines, mask_lines);
                 }
             }
 
             // Pass 3: Inverted manga buffer (if available)
             if best_score < 15
-                && std::time::Instant::now() < deadline
+                && tokio::time::Instant::now() < deadline
                 && let Some(inv) = &fallback_inv
             {
                 save_debug_image("inv.png", inv, prep.width, prep.height);
@@ -286,49 +368,20 @@ impl WinrtOcrEngine {
                     height: prep.height,
                     remap,
                 };
-                if let Ok(inv_lines) = self.run_ocr_pass(inv_pass).await {
+                if let Ok(Ok(inv_lines)) = tokio::time::timeout_at(deadline, self.run_ocr_pass(inv_pass)).await {
                     let score = score_recognized_lines(&inv_lines);
                     info!(
                         "OCR pass 3 (inverted_manga): found {} raw lines (score={})",
                         inv_lines.len(),
                         score
                     );
-                    if score > best_score {
-                        best_score = score;
-                        best_lines = inv_lines;
-                    }
-                }
-            }
-
-            // Pass 4: Raw image (no manga cleaner, e.g. for photo / clean game UI)
-            if best_score < 15 && std::time::Instant::now() < deadline {
-                let raw_pass = OcrPassParams {
-                    bgra_bytes: &frame.bgra_bytes,
-                    width: frame.width,
-                    height: frame.height,
-                    remap: RemapParams {
-                        pad: 0,
-                        scale: 1.0,
-                        offset_x: frame.offset_x,
-                        offset_y: frame.offset_y,
-                    },
-                };
-                if let Ok(raw_lines) = self.run_ocr_pass(raw_pass).await {
-                    let score = score_recognized_lines(&raw_lines);
-                    info!(
-                        "OCR pass 4 (raw): found {} raw lines (score={})",
-                        raw_lines.len(),
-                        score
-                    );
-                    if score > best_score {
-                        best_score = score;
-                        best_lines = raw_lines;
-                    }
+                    best_score = best_score.max(score);
+                    merge_recognized_lines(&mut best_lines, inv_lines);
                 }
             }
 
             // Pass 5: Upscaled & contrast-enhanced (for small / fine print)
-            if best_score < 15 && std::time::Instant::now() < deadline {
+            if best_score < 15 && tokio::time::Instant::now() < deadline {
                 let bytes = frame.bgra_bytes.clone();
                 let fw = frame.width;
                 let fh = frame.height;
@@ -350,16 +403,14 @@ impl WinrtOcrEngine {
                             offset_y: frame.offset_y,
                         },
                     };
-                    if let Ok(up_lines) = self.run_ocr_pass(up_pass).await {
+                    if let Ok(Ok(up_lines)) = tokio::time::timeout_at(deadline, self.run_ocr_pass(up_pass)).await {
                         let score = score_recognized_lines(&up_lines);
                         info!(
                             "OCR pass 5 (upscaled): found {} raw lines (score={})",
                             up_lines.len(),
                             score
                         );
-                        if score > best_score {
-                            best_lines = up_lines;
-                        }
+                        merge_recognized_lines(&mut best_lines, up_lines);
                     }
                 }
             }
@@ -418,8 +469,10 @@ impl WinrtOcrEngine {
                 .map_err(|e| format!("RecognizeAsync failed: {:?}", e))?
         };
 
-        let ocr_result = ocr_op
-            .await
+        let cancel_op = ocr_op.clone();
+        let _cancel = CancelOnDrop(move || { let _ = cancel_op.Cancel(); });
+        let ocr_result = tokio::time::timeout(std::time::Duration::from_secs(2), async { ocr_op.await })
+            .await.map_err(|_| "WinRT OCR timed out after 2 seconds".to_string())?
             .map_err(|e| format!("OCR recognition operation failed: {:?}", e))?;
 
         let lines_view = ocr_result
@@ -475,6 +528,7 @@ impl WinrtOcrEngine {
             let trimmed = line_text.trim();
             if !trimmed.is_empty() && !is_ocr_garbage(trimmed) {
                 lines.push(RecognizedLine {
+                    confidence: None,
                     text: trimmed.to_string(),
                     rect: line_rect,
                     words,
@@ -1065,8 +1119,10 @@ pub fn cluster_lines_into_blocks(
 
                     // Check hyphenated word wrap: "adven-" + "ture" -> "adventure"
                     let trimmed_block = block.text.trim_end();
-                    if trimmed_block.ends_with('-') && !trimmed_block.ends_with("--") {
-                        let base = trimmed_block.trim_end_matches('-').trim_end();
+                    if let Some(base) = trimmed_block.strip_suffix('-')
+                        && base.chars().next_back().is_some_and(char::is_alphabetic)
+                        && line.text.trim_start().chars().next().is_some_and(char::is_alphabetic)
+                    {
                         block.text = format!("{}{}", base, line.text.trim_start());
                     } else if !block.text.is_empty() {
                         block.text.push(' ');
@@ -1099,6 +1155,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_merge_keeps_missing_regions_and_uses_confidence() {
+        let line = |text: &str, x, confidence| RecognizedLine {
+            confidence, text: text.to_string(), rect: ScreenRect::new(x, 10, 100, 20), words: vec![],
+        };
+        let mut lines = vec![line("Native", 0, None)];
+        merge_recognized_lines(&mut lines, vec![line("Uncertain", 0, Some(0.6)), line("Missing dialogue", 200, Some(0.95))]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Native");
+        merge_recognized_lines(&mut lines, vec![line("Corrected", 0, Some(0.99))]);
+        assert_eq!(lines[0].text, "Corrected");
+        assert_eq!(lines[1].text, "Missing dialogue");
+        assert_eq!(lines[0].confidence, Some(0.99));
+    }
+
+    #[test]
+    fn test_merge_preserves_full_line_over_clipped_tile_in_either_order() {
+        let line = |text: &str, width, confidence| RecognizedLine {
+            text: text.to_string(), rect: ScreenRect::new(1100, 20, width, 20),
+            confidence, words: vec![],
+        };
+        let clipped = line("PLEASE", 100, Some(0.99));
+        let full = line("PLEASE FOLLOW INSTRUCTIONS", 300, None);
+        for (first, next) in [(clipped.clone(), full.clone()), (full.clone(), clipped)] {
+            let mut lines = vec![first];
+            merge_recognized_lines(&mut lines, vec![next]);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, full.text);
+            assert_eq!(lines[0].rect, full.rect);
+        }
+        let mut native_lines = vec![line("PLEASE", 100, None)];
+        merge_recognized_lines(&mut native_lines, vec![full]);
+        assert_eq!(native_lines[0].text, "PLEASE FOLLOW INSTRUCTIONS");
+    }
+
+    #[test]
+    fn test_merge_keeps_unique_words_in_overlapping_tile_fragments() {
+        let line = |text: &str, x| RecognizedLine {
+            text: text.to_string(), rect: ScreenRect::new(x, 20, 400, 20),
+            confidence: None, words: vec![],
+        };
+        let mut lines = vec![line("PLEASE FOLLOW THE", 1000)];
+        merge_recognized_lines(&mut lines, vec![line("FOLLOW THE INSTRUCTIONS", 1100)]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().any(|line| line.text.contains("PLEASE")));
+        assert!(lines.iter().any(|line| line.text.contains("INSTRUCTIONS")));
+    }
+
+    #[test]
+    fn test_tiles_cover_4k_and_crop_preserves_pixels_and_offsets() {
+        let tiles = ocr_tiles(3840, 2160);
+        assert!(tiles.len() > 1);
+        let mut covered = vec![false; 3840 * 2160];
+        for tile in &tiles {
+            assert!(tile.width <= 1200 && tile.height <= 1200);
+            for y in tile.y..tile.y + tile.height {
+                for x in tile.x..tile.x + tile.width { covered[y as usize * 3840 + x as usize] = true; }
+            }
+        }
+        assert!(covered.into_iter().all(|pixel| pixel));
+        let frame = CapturedFrame { bgra_bytes: (0..48).collect(), width: 4, height: 3, offset_x: -100, offset_y: 200 };
+        let cropped = crop_frame(&frame, ScreenRect::new(1, 1, 2, 2)).unwrap();
+        assert_eq!((cropped.offset_x, cropped.offset_y), (-99, 201));
+        assert_eq!(cropped.bgra_bytes, [&frame.bgra_bytes[20..28], &frame.bgra_bytes[36..44]].concat());
+        assert!(crop_frame(&frame, ScreenRect::new(3, 0, 2, 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_guard_runs_when_wait_times_out_or_task_is_aborted() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let task = async move {
+            let _guard = CancelOnDrop(move || { signal.store(true, Ordering::SeqCst); });
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), task).await.is_err());
+        assert!(cancelled.load(Ordering::SeqCst));
+        cancelled.store(false, Ordering::SeqCst);
+        let signal = cancelled.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = CancelOnDrop(move || { signal.store(true, Ordering::SeqCst); });
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn test_remap_rect_with_pad_and_scale() {
         let params = RemapParams {
             pad: 18,
@@ -1117,11 +1263,13 @@ mod tests {
     #[test]
     fn test_cluster_lines_hyphen_merging() {
         let line1 = RecognizedLine {
+            confidence: None,
             text: "This was an adven-".to_string(),
             rect: ScreenRect::new(100, 100, 200, 20),
             words: Vec::new(),
         };
         let line2 = RecognizedLine {
+            confidence: None,
             text: "ture of a lifetime.".to_string(),
             rect: ScreenRect::new(100, 124, 210, 20),
             words: Vec::new(),
@@ -1134,13 +1282,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_lines_preserves_dashes_and_numeric_ranges() {
+        for (first, second, expected) in [
+            ("Wait -", "come here", "Wait - come here"),
+            ("Damage: 10-", "20 points", "Damage: 10- 20 points"),
+            ("Option-", "2 is ready", "Option- 2 is ready"),
+            ("Wait--", "come here", "Wait-- come here"),
+            ("Это приклю-", "чение.", "Это приключение."),
+        ] {
+            let lines = [first, second].into_iter().enumerate().map(|(i, text)| {
+                RecognizedLine {
+                    confidence: None,
+                    text: text.to_string(),
+                    rect: ScreenRect::new(100, 100 + i as i32 * 24, 200, 20),
+                    words: Vec::new(),
+                }
+            }).collect();
+            let blocks = cluster_lines_into_blocks(lines, None);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, expected);
+        }
+    }
+
+    #[test]
     fn test_cluster_distinct_paragraphs() {
         let line1 = RecognizedLine {
+            confidence: None,
             text: "Top dialogue box.".to_string(),
             rect: ScreenRect::new(100, 100, 200, 20),
             words: Vec::new(),
         };
         let line2 = RecognizedLine {
+            confidence: None,
             text: "Far bottom dialogue box.".to_string(),
             rect: ScreenRect::new(100, 300, 200, 20), // 180px gap
             words: Vec::new(),
@@ -1436,11 +1609,13 @@ mod tests {
     fn test_score_recognized_lines_quality() {
         let garbage = vec![
             RecognizedLine {
+                confidence: None,
                 text: "|| // 1! \\".to_string(),
                 rect: ScreenRect::new(0, 0, 10, 10),
                 words: vec![],
             },
             RecognizedLine {
+                confidence: None,
                 text: "~~~___".to_string(),
                 rect: ScreenRect::new(0, 0, 10, 10),
                 words: vec![],
@@ -1454,11 +1629,13 @@ mod tests {
 
         let good = vec![
             RecognizedLine {
+                confidence: None,
                 text: "EXCUSE ME SIR".to_string(),
                 rect: ScreenRect::new(0, 0, 100, 20),
                 words: vec![],
             },
             RecognizedLine {
+                confidence: None,
                 text: "SHE ASKED FOR NO PICKLES".to_string(),
                 rect: ScreenRect::new(0, 50, 200, 20),
                 words: vec![],

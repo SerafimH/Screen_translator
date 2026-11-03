@@ -9,7 +9,7 @@ use windows::Win32::Foundation::POINT;
 use crate::capture::{CapturedFrame, FrameSignature, ScreenCapture};
 use crate::ocr::{
     OcrHelperClient, WinrtOcrEngine, cluster_lines_into_blocks, is_ocr_garbage,
-    score_recognized_lines,
+    merge_recognized_lines, crop_frame, ocr_tiles,
 };
 use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
@@ -72,11 +72,6 @@ struct AppState {
     is_processing: Arc<AtomicBool>,
     last_signature: Arc<Mutex<Option<FrameSignature>>>,
     current_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-}
-
-/// Checks whether WinRT Pass 1 yielded confident OCR text.
-pub fn is_pass1_confident(pass1_score: usize, pass1_lines_count: usize) -> bool {
-    pass1_score >= 12 && pass1_lines_count > 0
 }
 
 /// Checks whether RapidOCR helper returned valid non-garbage dialogue blocks.
@@ -159,6 +154,9 @@ impl App {
                 if auto_state.is_processing.load(Ordering::Relaxed) {
                     continue;
                 }
+                if !auto_state.translator.automatic_retry_ready() {
+                    continue;
+                }
 
                 let current_roi = *auto_state
                     .active_roi
@@ -172,7 +170,7 @@ impl App {
                 })
                 .await;
 
-                let (frame, sig) = match frame_res {
+                let (_frame, sig) = match frame_res {
                     Ok(Ok(pair)) => pair,
                     _ => continue,
                 };
@@ -189,8 +187,17 @@ impl App {
                     }
                 }
 
-                let task_state = auto_state.clone();
-                task_state.dispatch_translation_task(Some(frame));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let stable = tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(current_roi)).await;
+                let Ok(Ok(stable)) = stable else { continue; };
+                let stable_sig = FrameSignature::from_bgra(&stable.bgra_bytes, stable.width, stable.height);
+                if sig.has_changed(&stable_sig)
+                    || !auto_state.auto_mode.load(Ordering::Relaxed)
+                    || auto_state.is_processing.load(Ordering::Relaxed)
+                    || !auto_state.translator.automatic_retry_ready()
+                    || *auto_state.active_roi.lock().unwrap_or_else(|e| e.into_inner()) != current_roi
+                { continue; }
+                auto_state.dispatch_translation_task(Some(stable));
             }
         });
 
@@ -199,11 +206,13 @@ impl App {
             match event {
                 AppEvent::TriggerTranslate => {
                     crate::capture::reset_winrt_timeout_count();
+                    self.state.translator.reset_retry();
                     self.state.dispatch_translation_task(None);
                 }
 
                 AppEvent::RoiSelected(rect) => {
                     info!("ROI selected: {:?}", rect);
+                    self.state.translator.reset_retry();
                     *self
                         .state
                         .active_roi
@@ -228,6 +237,7 @@ impl App {
                 }
 
                 AppEvent::CycleProvider => {
+                    self.state.translator.reset_retry();
                     // Abort previous in-flight task on provider switch
                     if let Some(prev) = self
                         .state
@@ -261,6 +271,7 @@ impl App {
                 }
 
                 AppEvent::CycleOcrMode => {
+                    self.state.translator.reset_retry();
                     crate::capture::reset_winrt_timeout_count();
                     // Abort previous in-flight task on OCR mode switch
                     if let Some(prev) = self
@@ -317,16 +328,22 @@ impl App {
                 }
 
                 AppEvent::ResetRoi => {
+                    if let Some(task) = self.state.current_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        task.abort();
+                    }
+                    *self.state.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     *self
                         .state
                         .active_roi
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
                     self.state.overlay.set_active_roi(None);
+                    self.state.overlay.set_loading(false, Some("Область сброшена (полный экран)".to_string()));
                     info!("ROI reset to full screen.");
                 }
 
                 AppEvent::TranslateUnderCursor(pt) => {
+                    self.state.translator.reset_retry();
                     self.state.dispatch_cursor_translation_task(pt);
                 }
 
@@ -814,16 +831,19 @@ impl AppState {
             Err(e) => {
                 error!("OCR error: {}", e);
                 *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                self.overlay
-                    .update_blocks(Vec::new(), Some(format!("Ошибка OCR: {}", e)));
-                return;
+                if cfg.vision_fallback && (cfg.gemini_api_key.is_some() || cfg.openai_api_key.is_some()) {
+                    (Vec::new(), format!("Local OCR failed: {}", e))
+                } else {
+                    self.overlay.update_blocks(Vec::new(), Some(format!("Ошибка OCR: {}", e)));
+                    return;
+                }
             }
         };
 
         let has_text = !blocks.is_empty() && blocks.iter().any(|b| !is_ocr_garbage(&b.text));
 
         let has_vision_support = cfg.gemini_api_key.is_some() || cfg.openai_api_key.is_some();
-        let mut vision_failed = false;
+        let mut vision_error = None;
 
         // Step 4: Vision fallback if all local passes found nothing and vision_fallback is enabled with API key
         if !has_text && cfg.vision_fallback && has_vision_support {
@@ -853,15 +873,19 @@ impl AppState {
                     }
                 }
                 Err(err) => {
-                    vision_failed = true;
                     warn!("Vision OCR fallback failed: {}", err);
+                    vision_error = Some(err);
                 }
             }
         }
 
         if !has_text {
             let elapsed = start_time.elapsed().as_millis();
-            let status = if !cfg.vision_fallback {
+            let status = if let Some(error) = vision_error.as_deref() {
+                let reason = self.translator.retry_message().unwrap_or_else(|| error.to_string());
+                let reason = crate::translator::redact_secrets(&reason).chars().take(240).collect::<String>();
+                format!("Ошибка Vision OCR: {reason}")
+            } else if !cfg.vision_fallback {
                 format!(
                     "Текст не найден ({} мс). Для сложных картинок включите vision_fallback = true в config.toml",
                     elapsed
@@ -869,7 +893,7 @@ impl AppState {
             } else {
                 format!("Текст не найден ({} мс)", elapsed)
             };
-            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if vision_failed { None } else { Some(sig) };
+            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if vision_error.is_some() { None } else { Some(sig) };
             self.overlay.update_blocks(Vec::new(), Some(status));
             return;
         }
@@ -884,7 +908,9 @@ impl AppState {
             Some(format!("Перевод {} блоков текста...", valid_blocks.len())),
         );
 
-        let (translations, all_succeeded) = self.translator.translate_blocks(&valid_blocks, &cfg).await;
+        let report = self.translator.translate_blocks_report(&valid_blocks, &cfg).await;
+        let all_succeeded = report.errors.is_empty();
+        let translations = report.blocks;
 
         if cfg.dump_ocr {
             let res_text = translations
@@ -900,7 +926,8 @@ impl AppState {
         }
 
         let elapsed = start_time.elapsed().as_millis();
-        let status = format!("Переведено {} блоков за {} мс", translations.len(), elapsed);
+        let status = translation_status(translations.len(), elapsed, &report.errors,
+            self.translator.retry_message().as_deref());
         info!("{}", status);
 
         *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if all_succeeded { Some(sig) } else { None };
@@ -909,6 +936,23 @@ impl AppState {
     }
 
     async fn perform_ocr(
+        &self, frame: &CapturedFrame, cfg: &AppConfig,
+    ) -> Result<(Vec<OcrBlock>, String), String> {
+        let tiles = ocr_tiles(frame.width, frame.height);
+        if tiles.len() <= 1 { return self.perform_ocr_region(frame, cfg).await; }
+        let mut lines = Vec::new();
+        let mut raw = Vec::new();
+        for rect in tiles {
+            let tile = crop_frame(frame, rect)?;
+            let (blocks, response) = self.perform_ocr_region(&tile, cfg).await?;
+            merge_recognized_lines(&mut lines, blocks.into_iter().flat_map(|b| b.lines).collect());
+            raw.push(response);
+        }
+        Ok((cluster_lines_into_blocks(lines, Some((&frame.bgra_bytes, frame.width,
+            frame.height, frame.offset_x, frame.offset_y))), raw.join("\n")))
+    }
+
+    async fn perform_ocr_region(
         &self,
         frame: &CapturedFrame,
         cfg: &AppConfig,
@@ -950,56 +994,26 @@ impl AppState {
                 }
             }
             OcrMode::Auto => {
-                let Some(ocr) = &self.ocr else {
-                    // WinRT is not available, directly use RapidOCR helper
-                    return self.helper_ocr.recognize_with_raw(frame, &cfg.ocr_lang).await;
-                };
-
-                self.overlay.set_loading(
-                    true,
-                    Some("Распознавание (Auto: WinRT Pass 1)...".to_string()),
-                );
-                let pass1_lines = ocr.recognize_pass_1(frame).await.unwrap_or_default();
-                let pass1_score = score_recognized_lines(&pass1_lines);
-
-                if is_pass1_confident(pass1_score, pass1_lines.len()) {
-                    info!(
-                        "Auto mode: WinRT Pass 1 succeeded with high score ({})",
-                        pass1_score
-                    );
-                    let blocks = cluster_lines_into_blocks(
-                        pass1_lines,
-                        Some((
-                            &frame.bgra_bytes,
-                            frame.width,
-                            frame.height,
-                            frame.offset_x,
-                            frame.offset_y,
-                        )),
-                    );
-                    Ok((blocks, format!("WinRT Pass 1 (score: {})", pass1_score)))
-                } else {
-                    info!(
-                        "Auto mode: WinRT Pass 1 score is low ({}), trying RapidOCR helper...",
-                        pass1_score
-                    );
-                    self.overlay
-                        .set_loading(true, Some("Auto: пробую RapidOCR помощник...".to_string()));
-                    match self.helper_ocr.recognize_with_raw(frame, &cfg.ocr_lang).await {
-                        Ok((blocks, raw_json)) if is_helper_result_valid(&blocks) => {
-                            info!(
-                                "Auto mode: RapidOCR helper succeeded with {} blocks",
-                                blocks.len()
-                            );
-                            Ok((blocks, raw_json))
-                        }
-                        _ => {
-                            info!(
-                                "Auto mode: RapidOCR yielded no text, falling back to full WinRT multi-pass..."
-                            );
-                            let blocks = ocr.recognize(frame).await?;
-                            Ok((blocks, "WinRT Multi-pass".to_string()))
-                        }
+                self.overlay.set_loading(true, Some("Auto: сравнение локальных OCR...".to_string()));
+                let mut lines = Vec::new();
+                let mut native_error = None;
+                if let Some(ocr) = &self.ocr {
+                    match ocr.recognize(frame).await {
+                        Ok(blocks) => lines.extend(blocks.into_iter().flat_map(|b| b.lines)),
+                        Err(e) => native_error = Some(e),
+                    }
+                }
+                match self.helper_ocr.recognize_raw_lines_with_raw(frame, &cfg.ocr_lang).await {
+                    Ok((helper_lines, raw)) => {
+                        merge_recognized_lines(&mut lines, helper_lines);
+                        Ok((cluster_lines_into_blocks(lines, Some((&frame.bgra_bytes, frame.width,
+                            frame.height, frame.offset_x, frame.offset_y))), raw))
+                    }
+                    Err(e) if lines.is_empty() => Err(native_error.unwrap_or(e)),
+                    Err(e) => {
+                        warn!("RapidOCR unavailable: {}", e);
+                        Ok((cluster_lines_into_blocks(lines, Some((&frame.bgra_bytes, frame.width,
+                            frame.height, frame.offset_x, frame.offset_y))), "WinRT fallback".to_string()))
                     }
                 }
             }
@@ -1007,9 +1021,71 @@ impl AppState {
     }
 }
 
+fn translation_status(block_count: usize, elapsed_ms: u128, errors: &[String], retry: Option<&str>) -> String {
+    if errors.is_empty() {
+        format!("Переведено {block_count} блоков за {elapsed_ms} мс")
+    } else {
+        let reason = retry.or_else(|| errors.first().map(String::as_str)).unwrap_or("Неизвестная ошибка");
+        let reason = crate::translator::redact_secrets(reason).chars().take(240).collect::<String>();
+        format!("Ошибок перевода: {} из {block_count}. {reason}", errors.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_translation_status_shows_count_cause_and_hides_keys() {
+        let errors = vec!["OpenAI HTTP 401: Bearer sk-audit-secret".to_string()];
+        let status = translation_status(3, 42, &errors, None);
+        assert!(status.contains("1 из 3"));
+        assert!(status.contains("401"));
+        assert!(!status.contains("sk-audit-secret"));
+        assert!(!status.contains("Переведено"));
+        assert_eq!(translation_status(3, 42, &[], None), "Переведено 3 блоков за 42 мс");
+    }
+
+    #[tokio::test]
+    async fn test_local_ocr_error_reaches_configured_vision() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::overlay::OverlaySharedState;
+        use crate::types::TranslationProvider;
+        use windows::Win32::Foundation::HWND;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count]).contains("/chat/completions"));
+            let content = r#"[{"original":"Hello","translation":"Привет","box_2d":[0,0,1000,1000]}]"#;
+            let body = serde_json::json!({"choices":[{"message":{"content":content}}]}).to_string();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = Arc::new(Mutex::new(AppConfig {
+            ocr_engine: OcrMode::WinRt, vision_fallback: true,
+            provider: TranslationProvider::OpenAICompatible,
+            openai_api_key: Some("test-key".to_string()),
+            openai_base_url: format!("http://{}", address),
+            openai_vision_model: Some("test-vision".to_string()),
+            ..AppConfig::default()
+        }));
+        let shared = Arc::new(Mutex::new(OverlaySharedState::default()));
+        let state = AppState {
+            config: config.clone(), overlay: OverlayHandle { hwnd: HWND(std::ptr::null_mut()), shared_state: shared.clone() },
+            ocr: None, helper_ocr: OcrHelperClient::new(config), translator: Arc::new(TranslatorService::new()),
+            active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
+            is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            current_task: Arc::new(Mutex::new(None)),
+        };
+        let frame = CapturedFrame { width: 40, height: 40, bgra_bytes: vec![255; 40 * 40 * 4], offset_x: 0, offset_y: 0 };
+        tokio::time::timeout(std::time::Duration::from_secs(3), state.perform_translation(Some(frame))).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(shared.lock().unwrap().current_blocks[0].translated_text, "Привет");
+        assert!(!state.is_processing.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn bug_9_overlay_clear_empties_blocks_and_resets_state() {
@@ -1344,15 +1420,6 @@ mod tests {
 
     #[test]
     fn test_auto_ocr_fallback_predicates() {
-        // High score Pass 1 with lines
-        assert!(is_pass1_confident(15, 2));
-        // Exact threshold boundary: score 12 with lines
-        assert!(is_pass1_confident(12, 1));
-        // Low score Pass 1 (< 12)
-        assert!(!is_pass1_confident(11, 2));
-        // Zero lines with high score cannot be accepted
-        assert!(!is_pass1_confident(25, 0));
-
         // RapidOCR returns valid dialogue text
         let valid_block = OcrBlock {
             text: "Hello, traveler!".to_string(),

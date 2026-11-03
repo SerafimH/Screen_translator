@@ -1,16 +1,20 @@
+use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{Sender, channel};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
+use windows::Win32::Foundation::{HANDLE, LPARAM, WPARAM};
+use windows::Win32::System::Threading::GetThreadId;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HDC,
     HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, PostThreadMessageW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_QUIT,
 };
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -28,9 +32,52 @@ pub const SIGNATURE_ROWS: usize = 16;
 pub const DELTA_THRESHOLD: f32 = 3.5;
 pub const WINRT_MAX_CONSECUTIVE_TIMEOUTS: u64 = 3;
 pub const WINRT_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+const WINRT_CAPTURE_TIMEOUT: Duration = Duration::from_millis(600);
 
 static WINRT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_WINRT_TIMEOUT: Mutex<Option<Instant>> = Mutex::new(None);
+// Retain ownership until native initialization AND cleanup finish. A timed-out
+// driver call may not be interrupted safely, so later captures use GDI rather
+// than starting additional native workers. These are not Tokio blocking tasks.
+static WINRT_WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+#[derive(Debug, PartialEq, Eq)]
+enum WinrtCaptureError {
+    Busy,
+    TimedOut,
+    Failed(String),
+}
+
+fn bounded_capture<F>(
+    worker_slot: &Mutex<Option<JoinHandle<()>>>,
+    timeout: Duration,
+    capture: F,
+) -> Result<CapturedFrame, WinrtCaptureError>
+where
+    F: FnOnce(Sender<Result<CapturedFrame, WinrtCaptureError>>, Instant) + Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = channel();
+    {
+        let mut worker = worker_slot.lock().unwrap_or_else(|e| e.into_inner());
+        if worker.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return Err(WinrtCaptureError::Busy);
+        }
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("screen-capture-winrt".to_string())
+                .spawn(move || capture(tx, deadline))
+                .map_err(|e| WinrtCaptureError::Failed(format!("Failed to start capture worker: {e}")))?,
+        );
+    }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(WinrtCaptureError::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(WinrtCaptureError::Failed("WinRT capture worker ended without a frame".to_string()))
+        }
+    }
+}
 
 pub fn winrt_consecutive_timeouts() -> u64 {
     WINRT_TIMEOUT_COUNT.load(Ordering::Relaxed)
@@ -290,6 +337,18 @@ pub fn is_roi_within_primary_monitor(roi: &ScreenRect, primary_w: i32, primary_h
     roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= primary_w && roi.y + roi.height <= primary_h
 }
 
+fn winrt_covers_capture(
+    roi: Option<ScreenRect>,
+    primary_w: i32,
+    primary_h: i32,
+    virtual_screen: ScreenRect,
+) -> bool {
+    match roi {
+        Some(rect) => is_roi_within_primary_monitor(&rect, primary_w, primary_h),
+        None => virtual_screen == ScreenRect::new(0, 0, primary_w, primary_h),
+    }
+}
+
 pub struct ScreenCapture;
 
 impl ScreenCapture {
@@ -297,14 +356,25 @@ impl ScreenCapture {
     /// Windows.Graphics.Capture API (D3D11 GPU textures without yellow border),
     /// falling back cleanly to RAII-guarded GDI BitBlt if D3D11 capture is unavailable.
     pub fn capture_primary(roi: Option<ScreenRect>) -> Result<CapturedFrame, String> {
-        // If an ROI is specified and falls outside the primary monitor (e.g. on a secondary display),
-        // skip WinRT and immediately use the GDI fallback which supports virtual multi-monitor coordinates.
-        if let Some(r) = roi {
-            let primary_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-            let primary_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-            if !is_roi_within_primary_monitor(&r, primary_w, primary_h) {
-                return Self::capture_gdi_fallback(roi);
-            }
+        let (primary_w, primary_h, mut virtual_screen) = unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+                ScreenRect::new(
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                ),
+            )
+        };
+        if virtual_screen.is_empty() {
+            virtual_screen = ScreenRect::new(0, 0, primary_w, primary_h);
+        }
+        // WinRT captures one monitor. Full-screen capture must include the same
+        // virtual desktop as GDI, including monitors left of the primary one.
+        if !winrt_covers_capture(roi, primary_w, primary_h, virtual_screen) {
+            return Self::capture_gdi_fallback(roi);
         }
 
         // Attempt fast D3D11 WinRT Graphics Capture if circuit breaker is not tripped (or cooldown elapsed)
@@ -318,33 +388,18 @@ impl ScreenCapture {
     }
 
     fn capture_winrt(roi: Option<ScreenRect>) -> Result<CapturedFrame, String> {
-        let primary_monitor =
-            Monitor::primary().map_err(|e| format!("Failed to get primary monitor: {:?}", e))?;
-
-        let (mon_x, mon_y) = (0i32, 0i32);
-        let (tx, rx) = channel();
-
-        let settings = Settings::new(
-            primary_monitor,
-            CursorCaptureSettings::WithoutCursor,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
-            (roi, (mon_x, mon_y), tx),
-        );
-
-        let capture_control = WinrtSingleFrameCapture::start_free_threaded(settings)
-            .map_err(|e| format!("Failed to start WinRT capture: {e:?}"))?;
-
-        match rx.recv_timeout(Duration::from_millis(600)) {
+        match bounded_capture(&WINRT_WORKER, WINRT_CAPTURE_TIMEOUT, move |result_tx, deadline| {
+            Self::capture_winrt_worker(roi, result_tx, deadline);
+        }) {
             Ok(frame) => {
-                let _ = capture_control.wait();
                 reset_winrt_timeout_count();
                 Ok(frame)
             }
-            Err(_) => {
+            Err(WinrtCaptureError::Busy) => {
+                Err("Previous WinRT capture is still initializing or shutting down; using GDI".to_string())
+            }
+            Err(WinrtCaptureError::Failed(error)) => Err(error),
+            Err(WinrtCaptureError::TimedOut) => {
                 let count = WINRT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Ok(mut last) = LAST_WINRT_TIMEOUT.lock() {
                     *last = Some(Instant::now());
@@ -355,13 +410,74 @@ impl ScreenCapture {
                     );
                 } else {
                     warn!(
-                        "WinRT capture timed out after 600ms ({count}/{WINRT_MAX_CONSECUTIVE_TIMEOUTS}), stopping capture thread and falling back to GDI"
+                        "WinRT capture timed out after 600ms ({count}/{WINRT_MAX_CONSECUTIVE_TIMEOUTS}), falling back to GDI while the worker shuts down"
                     );
                 }
-                if let Err(e) = capture_control.stop() {
-                    warn!("Failed to gracefully stop WinRT capture thread: {e:?}");
-                }
                 Err("WinRT capture timed out or unavailable, using GDI".to_string())
+            }
+        }
+    }
+
+    fn capture_winrt_worker(
+        roi: Option<ScreenRect>,
+        result_tx: Sender<Result<CapturedFrame, WinrtCaptureError>>,
+        deadline: Instant,
+    ) {
+        let (frame_tx, frame_rx) = channel();
+        let start = || {
+            let primary_monitor = Monitor::primary()
+                .map_err(|e| format!("Failed to get primary monitor: {e:?}"))?;
+            let settings = Settings::new(
+                primary_monitor,
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::WithoutBorder,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Bgra8,
+                (roi, (0, 0), frame_tx),
+            );
+            // This method also waits for native initialization internally.
+            WinrtSingleFrameCapture::start_free_threaded(settings)
+                .map_err(|e| format!("Failed to start WinRT capture: {e:?}"))
+        };
+        let control = match start() {
+            Ok(control) => control,
+            Err(error) => {
+                let _ = result_tx.send(Err(WinrtCaptureError::Failed(error)));
+                return;
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match frame_rx.recv_timeout(remaining) {
+            Ok(frame) if !remaining.is_zero() => {
+                // Publish before joining: a stalled native cleanup must not
+                // withhold an already captured frame from the caller.
+                let _ = result_tx.send(Ok(frame));
+                if let Err(error) = control.wait() {
+                    warn!("WinRT capture cleanup failed: {error:?}");
+                }
+            }
+            _ => {
+                let _ = result_tx.send(Err(WinrtCaptureError::TimedOut));
+                // Keep the native thread handle even if posting WM_QUIT fails:
+                // CaptureControl::stop would detach it on that error, permitting
+                // a later request to create another potentially hung thread.
+                control.halt_handle().store(true, Ordering::Relaxed);
+                let native_worker = control.into_thread_handle();
+                let thread_id = unsafe { GetThreadId(HANDLE(native_worker.as_raw_handle())) };
+                if thread_id != 0
+                    && let Err(error) = unsafe {
+                        PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                    }
+                {
+                    warn!("Failed to signal WinRT capture shutdown: {error:?}");
+                }
+                // Only this dedicated std worker joins. The caller has already
+                // returned, and its slot remains occupied until native exit.
+                if native_worker.join().is_err() {
+                    warn!("WinRT capture thread panicked during shutdown");
+                }
             }
         }
     }
@@ -475,6 +591,11 @@ impl ScreenCapture {
             if lines == 0 {
                 return Err("GetDIBits failed to copy frame bytes".to_string());
             }
+            // BI_RGB32's high byte is unused, not alpha. Captured desktop pixels
+            // are opaque; preserving that byte can make Vision/debug PNGs invisible.
+            for pixel in bgra_bytes.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
 
             Ok(CapturedFrame {
                 bgra_bytes,
@@ -490,6 +611,79 @@ impl ScreenCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame() -> CapturedFrame {
+        CapturedFrame {
+            bgra_bytes: vec![0, 0, 0, 255],
+            width: 1,
+            height: 1,
+            offset_x: 0,
+            offset_y: 0,
+        }
+    }
+
+    #[test]
+    fn capture_deadline_includes_initialization_and_retains_stalled_worker() {
+        let workers = Mutex::new(None);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let result = bounded_capture(&workers, Duration::from_millis(20), move |tx, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _ = tx.send(Ok(test_frame()));
+        });
+        assert!(matches!(result, Err(WinrtCaptureError::TimedOut)));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Repeated requests cannot create more workers while native startup is
+        // stuck, even if a user manually resets the capture circuit breaker.
+        for _ in 0..10 {
+            let result = bounded_capture(&workers, Duration::from_millis(20), |_, _| {
+                panic!("a stalled worker must prevent additional captures");
+            });
+            assert!(matches!(result, Err(WinrtCaptureError::Busy)));
+        }
+        release_tx.send(()).unwrap();
+        workers.lock().unwrap().take().unwrap().join().unwrap();
+        let frame = bounded_capture(&workers, Duration::from_secs(2), |tx, _| {
+            tx.send(Ok(test_frame())).unwrap();
+        })
+        .unwrap();
+        assert_eq!(frame.bgra_bytes, vec![0, 0, 0, 255]);
+        workers.lock().unwrap().take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn captured_frame_returns_before_native_cleanup_finishes() {
+        let workers = Mutex::new(None);
+        let (release_tx, release_rx) = channel();
+        let frame = bounded_capture(&workers, Duration::from_secs(2), move |tx, _| {
+            tx.send(Ok(test_frame())).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        assert_eq!((frame.width, frame.height), (1, 1));
+        let next = bounded_capture(&workers, Duration::from_millis(20), |_, _| {
+            panic!("cleanup must finish before another native capture starts");
+        });
+        assert!(matches!(next, Err(WinrtCaptureError::Busy)));
+        release_tx.send(()).unwrap();
+        workers.lock().unwrap().take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn full_screen_capture_has_identical_scope_with_both_backends() {
+        let (width, height) = (1920, 1080);
+        assert!(winrt_covers_capture(None, width, height, ScreenRect::new(0, 0, width, height)));
+        for desktop in [
+            ScreenRect::new(0, 0, 3840, 1080),
+            ScreenRect::new(-1920, 0, 3840, 1080),
+            ScreenRect::new(0, -1080, 1920, 2160),
+        ] {
+            assert!(!winrt_covers_capture(None, width, height, desktop));
+            assert!(winrt_covers_capture(Some(ScreenRect::new(100, 100, 800, 600)), width, height, desktop));
+            assert!(!winrt_covers_capture(Some(ScreenRect::new(-500, 100, 300, 300)), width, height, desktop));
+        }
+    }
 
     /// BUG-2 regression: GdiObjectGuard must hold the HGDIOBJ that was actually selected
     /// into the DC — not a second copy produced by a duplicate `.into()` call.

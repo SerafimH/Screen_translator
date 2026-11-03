@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{error, warn};
 
 use crate::capture::CapturedFrame;
@@ -377,15 +378,6 @@ pub fn redact_secrets(input: &str) -> String {
     out
 }
 
-async fn ensure_http_success(resp: reqwest::Response, service: &str) -> Result<reqwest::Response, String> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(redact_secrets(&format!("{service} HTTP {status}: {body}")));
-    }
-    Ok(resp)
-}
-
 /// Cleans boundary noise characters and internal OCR letter-number confusions.
 pub fn clean_ocr_noise(text: &str) -> String {
     let mut s = text.trim().to_string();
@@ -535,28 +527,18 @@ pub fn normalize_all_caps(text: &str) -> String {
 
 /// Cleans awkward spaces before Russian punctuation.
 pub fn clean_russian_punctuation(text: &str) -> String {
-    let mut s = text.to_string();
-    let bad_pairs = [
-        (" ,", ","),
-        (" .", "."),
-        (" !", "!"),
-        (" ?", "?"),
-        (" :", ":"),
-        (" ;", ";"),
-    ];
-    for (bad, good) in bad_pairs {
-        s = s.replace(bad, good);
-    }
-
-    let mut out = String::new();
+    let mut out = String::with_capacity(text.len());
     let mut last_space = false;
-    for ch in s.chars() {
+    for ch in text.chars() {
         if ch == ' ' {
             if !last_space {
                 out.push(' ');
                 last_space = true;
             }
         } else {
+            if last_space && matches!(ch, ',' | '.' | '!' | '?' | ':' | ';') {
+                out.pop();
+            }
             out.push(ch);
             last_space = false;
         }
@@ -579,9 +561,10 @@ pub fn strip_html_tags(s: &str) -> String {
     }
     out.replace("&quot;", "\"")
         .replace("&#39;", "'")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+        // Decode ampersands last so escaped entity names remain literal text.
+        .replace("&amp;", "&")
 }
 
 /// Rich translation details for a standalone word, including dictionary synonyms and usage examples.
@@ -760,21 +743,33 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
-/// Resolves the vision model name for OpenAI/Groq compatible providers with intelligent defaults.
+fn is_groq_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).ok().and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host == "groq.com" || host.ends_with(".groq.com"))
+}
+
+/// Groq requires an explicit current vision model, independent of the text model.
 pub fn resolve_openai_vision_model<'a>(
     explicit_model: Option<&'a str>,
     base_url: &str,
     text_model: &'a str,
-) -> &'a str {
-    if let Some(explicit) = explicit_model {
-        return explicit;
+) -> Result<&'a str, String> {
+    let explicit_model = explicit_model.map(str::trim).filter(|model| !model.is_empty());
+    if is_groq_url(base_url) {
+        let model = explicit_model.ok_or_else(||
+            "Groq Vision: задайте openai_vision_model в config.toml (отдельную модель с поддержкой изображений)".to_string())?;
+        if matches!(model, "llama-3.2-11b-vision-preview" | "llama-3.2-90b-vision-preview") {
+            return Err("Groq Vision: указанная модель снята с обслуживания; обновите openai_vision_model".to_string());
+        }
+        return Ok(model);
     }
-    if base_url.contains("groq.com") && !text_model.contains("vision") {
-        "llama-3.2-11b-vision-preview"
-    } else if base_url.contains("openai.com") && !text_model.contains("gpt-4") {
-        "gpt-4o-mini"
+    if let Some(explicit) = explicit_model {
+        Ok(explicit)
+    } else if reqwest::Url::parse(base_url).ok().and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host == "api.openai.com") && !text_model.contains("gpt-4") {
+        Ok("gpt-4o-mini")
     } else {
-        text_model
+        Ok(text_model)
     }
 }
 
@@ -847,11 +842,67 @@ pub fn assemble_batch_translations(
     Ok(results)
 }
 
+#[derive(Default)]
+struct RetryState {
+    failures: u32,
+    until: Option<Instant>,
+    permanent: bool,
+    message: Option<String>,
+}
+
+impl RetryState {
+    fn ready(&self) -> bool {
+        !self.permanent && self.until.is_none_or(|until| Instant::now() >= until)
+    }
+
+    fn display_message(&self, label: &str) -> Option<String> {
+        let message = self.message.as_ref()?;
+        if self.permanent {
+            Some(format!("{label} остановлен: проверьте настройки и нажмите Alt+T. {message}"))
+        } else if let Some(remaining) = self.until.and_then(|until| until.checked_duration_since(Instant::now())) {
+            Some(format!("{label}: повтор через {} с. {message}", remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)))
+        } else { Some(message.clone()) }
+    }
+
+    fn fail(&mut self, message: String, status: Option<u16>, retry_after: Option<Duration>) {
+        if self.permanent { return; }
+        self.failures = self.failures.saturating_add(1);
+        self.permanent = status.is_some_and(|code| (400..500).contains(&code)
+            && !matches!(code, 408 | 425 | 429));
+        let backoff = Duration::from_secs(5 * (1u64 << self.failures.saturating_sub(1).min(4))).min(Duration::from_secs(60));
+        let delay = retry_after.unwrap_or(backoff).max(backoff);
+        if let Some(deadline) = Instant::now().checked_add(delay) {
+            // Concurrent failures may extend a server's Retry-After, never shorten it.
+            self.until = Some(self.until.map_or(deadline, |existing| existing.max(deadline)));
+        } else {
+            // An unreasonable Retry-After must never turn an overflow into an immediate retry.
+            self.permanent = true;
+        }
+        self.message = Some(message);
+    }
+}
+
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+        .or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(now).unwrap_or_default()))
+}
+
+pub struct TranslationBatchReport {
+    pub blocks: Vec<TranslationBlock>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestRoute { Text, Vision }
+
 #[derive(Clone)]
 pub struct TranslatorService {
     client: reqwest::Client,
     context: Arc<ContextManager>,
     cache: Arc<TranslationCache>,
+    retry: Arc<Mutex<RetryState>>,
+    vision_retry: Arc<Mutex<RetryState>>,
+    validated_vision_models: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl Default for TranslatorService {
@@ -876,6 +927,9 @@ impl TranslatorService {
             client,
             context: Arc::new(ContextManager::new(max_history)),
             cache: Arc::new(TranslationCache::new(500)),
+            retry: Arc::new(Mutex::new(RetryState::default())),
+            vision_retry: Arc::new(Mutex::new(RetryState::default())),
+            validated_vision_models: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -885,6 +939,103 @@ impl TranslatorService {
 
     pub fn cache(&self) -> &TranslationCache {
         &self.cache
+    }
+
+    pub fn automatic_retry_ready(&self) -> bool {
+        self.retry.lock().unwrap_or_else(|e| e.into_inner()).ready()
+    }
+
+    pub fn retry_message(&self) -> Option<String> {
+        let text = self.retry.lock().unwrap_or_else(|e| e.into_inner()).display_message("Автоповтор");
+        text.or_else(|| self.vision_retry.lock().unwrap_or_else(|e| e.into_inner()).display_message("Vision"))
+    }
+
+    pub fn reset_retry(&self) {
+        *self.retry.lock().unwrap_or_else(|e| e.into_inner()) = RetryState::default();
+        *self.vision_retry.lock().unwrap_or_else(|e| e.into_inner()) = RetryState::default();
+    }
+
+    fn retry_state(&self, route: RequestRoute) -> &Mutex<RetryState> {
+        match route { RequestRoute::Text => &self.retry, RequestRoute::Vision => &self.vision_retry }
+    }
+
+    fn check_retry(&self, route: RequestRoute) -> Result<(), String> {
+        let state = self.retry_state(route).lock().unwrap_or_else(|e| e.into_inner());
+        if state.ready() { Ok(()) } else { Err(state.message.clone().unwrap_or_else(|| "Повторные запросы временно приостановлены".to_string())) }
+    }
+
+    fn configuration_error(&self, message: String) -> String {
+        let message = redact_secrets(&message);
+        self.vision_retry.lock().unwrap_or_else(|e| e.into_inner()).fail(message.clone(), Some(400), None);
+        message
+    }
+
+    fn translation_error(&self, message: String) -> String {
+        self.route_error(message, RequestRoute::Text)
+    }
+
+    fn vision_error(&self, message: String) -> String {
+        self.route_error(message, RequestRoute::Vision)
+    }
+
+    fn route_error(&self, message: String, route: RequestRoute) -> String {
+        let message = redact_secrets(&message);
+        let mut state = self.retry_state(route).lock().unwrap_or_else(|e| e.into_inner());
+        if state.ready() { state.fail(message.clone(), None, None); }
+        message
+    }
+
+    async fn send_request(&self, request: reqwest::RequestBuilder, service: &str) -> Result<reqwest::Response, String> {
+        let route = if service.contains("Vision") || service == "Groq models" { RequestRoute::Vision } else { RequestRoute::Text };
+        self.check_retry(route)?;
+        let response = request.send().await.map_err(|error| {
+            let message = redact_secrets(&format!("{service}: {error}"));
+            self.retry_state(route).lock().unwrap_or_else(|e| e.into_inner()).fail(message.clone(),
+                if error.is_builder() { Some(400) } else { None }, None);
+            message
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()).and_then(|value| retry_after_delay(value, SystemTime::now()));
+            let body = response.text().await.unwrap_or_default();
+            let message = redact_secrets(&format!("{service} HTTP {status}: {body}"));
+            self.retry_state(route).lock().unwrap_or_else(|e| e.into_inner()).fail(message.clone(), Some(status.as_u16()), retry_after);
+            return Err(message);
+        }
+        let mut state = self.retry_state(route).lock().unwrap_or_else(|e| e.into_inner());
+        // A concurrent success must not erase a new error/cooldown from another request.
+        if state.ready() { *state = RetryState::default(); }
+        Ok(response)
+    }
+
+    fn cache_key(&self, purpose: &str, text: &str, source: &str, target: &str, config: &AppConfig) -> String {
+        let (backend, model, contextual) = match config.provider {
+            TranslationProvider::DeepL if config.deepl_api_key.is_some() => ("deepl".to_string(), "", true),
+            TranslationProvider::Gemini if config.gemini_api_key.is_some() => ("gemini".to_string(), GEMINI_MODEL, true),
+            TranslationProvider::OpenAICompatible if config.openai_api_key.is_some() =>
+                (config.openai_base_url.trim_end_matches('/').to_string(), config.openai_model.as_str(), true),
+            _ => ("google".to_string(), "", false),
+        };
+        let history = contextual.then(|| self.context.get_recent_history());
+        // A JSON tuple keeps text, model, endpoint, and history boundaries unambiguous.
+        serde_json::json!([purpose, backend, model, source, target, text, history]).to_string()
+    }
+
+    async fn validate_groq_vision_model(&self, base_url: &str, api_key: &str, model: &str) -> Result<(), String> {
+        let key = serde_json::json!([base_url.trim_end_matches('/'), model, api_key]).to_string();
+        let mut validated = self.validated_vision_models.lock().await;
+        if validated.contains(&key) { return Ok(()); }
+        let response = self.send_request(self.client.get(format!("{}/models", base_url.trim_end_matches('/')))
+            .bearer_auth(api_key), "Groq models").await?;
+        let body: serde_json::Value = response.json().await
+            .map_err(|e| self.vision_error(format!("Groq models: {e}")))?;
+        if !body.get("data").and_then(|data| data.as_array()).is_some_and(|models|
+            models.iter().any(|item| item.get("id").and_then(|id| id.as_str()) == Some(model))) {
+            return Err(self.configuration_error(format!("Groq Vision: модель {model} отсутствует в списке доступных моделей; обновите openai_vision_model")));
+        }
+        validated.insert(key);
+        Ok(())
     }
 
     /// Translates raw text using the configured provider.
@@ -958,16 +1109,11 @@ impl TranslatorService {
         );
         let body = format!("q={}", urlencode(text));
 
-        let resp = self
-            .client
+        let request = self.client
             .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "Google").await?;
+            .body(body);
+        let resp = self.send_request(request, "Google").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1058,17 +1204,12 @@ impl TranslatorService {
             body["context"] = serde_json::json!(context);
         }
 
-        let resp = self
-            .client
+        let request = self.client
             .post(endpoint)
             .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("DeepL network error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "DeepL").await?;
+            .json(&body);
+        let resp = self.send_request(request, "DeepL").await?;
 
         let body_str = resp
             .text()
@@ -1116,15 +1257,10 @@ impl TranslatorService {
             }
         });
 
-        let resp = self
-            .client
+        let request = self.client
             .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("Gemini network error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "Gemini").await?;
+            .json(&body);
+        let resp = self.send_request(request, "Gemini").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1185,17 +1321,12 @@ impl TranslatorService {
             "temperature": 0.3
         });
 
-        let resp = self
-            .client
+        let request = self.client
             .post(&endpoint)
             .timeout(std::time::Duration::from_secs(15))
             .header("Authorization", format!("Bearer {}", api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("OpenAI network error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "OpenAI").await?;
+            .json(&body);
+        let resp = self.send_request(request, "OpenAI").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1228,6 +1359,8 @@ impl TranslatorService {
         frame: &CapturedFrame,
         config: &AppConfig,
     ) -> Result<Vec<TranslationBlock>, String> {
+        // Optional Vision failures must not suspend capture or local OCR/text translation.
+        self.check_retry(RequestRoute::Vision)?;
         let png_bytes = bgra_to_png(&frame.bgra_bytes, frame.width, frame.height)?;
         let roi = ScreenRect::new(
             frame.offset_x,
@@ -1236,49 +1369,34 @@ impl TranslatorService {
             frame.height as i32,
         );
 
-        // TODO: gpt-oss-120b не принимает изображения, для vision нужна отдельная модель
-        let openai_vision_model = resolve_openai_vision_model(
-            config.openai_vision_model.as_deref(),
-            &config.openai_base_url,
-            &config.openai_model,
-        );
-
-        if config.provider == TranslationProvider::Gemini
+        let result = if config.provider == TranslationProvider::Gemini
             && let Some(key) = &config.gemini_api_key
         {
-            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi)
-                .await
+            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi).await
         } else if config.provider == TranslationProvider::OpenAICompatible
             && let Some(key) = &config.openai_api_key
         {
-            self.translate_openai_vision(
-                &png_bytes,
-                &config.target_lang,
-                &config.openai_base_url,
-                key,
-                openai_vision_model,
-                &roi,
-            )
-            .await
+            self.translate_configured_openai_vision(&png_bytes, config, key, &roi).await
         } else if let Some(key) = &config.gemini_api_key {
-            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi)
-                .await
+            self.translate_gemini_vision(&png_bytes, &config.target_lang, key, &roi).await
         } else if let Some(key) = &config.openai_api_key {
-            self.translate_openai_vision(
-                &png_bytes,
-                &config.target_lang,
-                &config.openai_base_url,
-                key,
-                openai_vision_model,
-                &roi,
-            )
-            .await
+            self.translate_configured_openai_vision(&png_bytes, config, key, &roi).await
         } else {
-            Err(
-                "Vision OCR fallback requires a configured Gemini or OpenAI/Groq API key"
-                    .to_string(),
-            )
+            Err(self.configuration_error("Vision OCR fallback requires a configured Gemini or OpenAI/Groq API key".to_string()))
+        };
+        result.map_err(|message| self.vision_error(message))
+    }
+
+    async fn translate_configured_openai_vision(
+        &self, png: &[u8], config: &AppConfig, key: &str, roi: &ScreenRect,
+    ) -> Result<Vec<TranslationBlock>, String> {
+        let model = resolve_openai_vision_model(config.openai_vision_model.as_deref(),
+            &config.openai_base_url, &config.openai_model)
+            .map_err(|message| self.configuration_error(message))?;
+        if is_groq_url(&config.openai_base_url) {
+            self.validate_groq_vision_model(&config.openai_base_url, key, model).await?;
         }
+        self.translate_openai_vision(png, &config.target_lang, &config.openai_base_url, key, model, roi).await
     }
 
     async fn translate_gemini_vision(
@@ -1318,16 +1436,11 @@ impl TranslatorService {
             }]
         });
 
-        let resp = self
-            .client
+        let request = self.client
             .post(&url)
             .timeout(std::time::Duration::from_secs(15))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("Gemini Vision network error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "Gemini Vision").await?;
+            .json(&body);
+        let resp = self.send_request(request, "Gemini Vision").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1395,17 +1508,12 @@ impl TranslatorService {
             "temperature": 0.2
         });
 
-        let resp = self
-            .client
+        let request = self.client
             .post(&endpoint)
             .timeout(std::time::Duration::from_secs(15))
             .header("Authorization", format!("Bearer {}", api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("OpenAI Vision network error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "OpenAI Vision").await?;
+            .json(&body);
+        let resp = self.send_request(request, "OpenAI Vision").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1468,21 +1576,18 @@ impl TranslatorService {
             return Ok(String::new());
         }
 
-        let cache_key = format!(
-            "{}:{}:{}:{}",
-            config.provider.as_str(),
-            source_lang,
-            target_lang,
-            normalized
-        );
+        let cache_key = self.cache_key("translation", normalized, source_lang, target_lang, config);
         if let Some(cached) = self.cache.get(&cache_key) {
+            if record_history {
+                self.context.record_translation(normalized.to_string(), cached.clone());
+            }
             return Ok(cached);
         }
 
         let preprocessed = self.context.preprocess(normalized);
         let raw = self
             .translate_provider_raw(preprocessed, source_lang, target_lang, config)
-            .await?;
+            .await.map_err(|message| self.translation_error(message))?;
         let clean_ru = clean_russian_punctuation(&raw);
         let final_text = self.context.postprocess(&clean_ru);
 
@@ -1524,13 +1629,7 @@ impl TranslatorService {
             return WordDetails::default();
         }
 
-        let cache_key = format!(
-            "dict:{}:{}:{}:{}",
-            config.provider.as_str(),
-            source_lang,
-            target_lang,
-            normalized.to_lowercase()
-        );
+        let cache_key = self.cache_key("dictionary", &normalized.to_lowercase(), source_lang, target_lang, config);
 
         if let Some(cached_json) = self.cache.get(&cache_key)
             && let Ok(details) = serde_json::from_str::<WordDetails>(&cached_json) {
@@ -1549,7 +1648,7 @@ impl TranslatorService {
 
         if details.primary.is_empty() {
             match self
-                .translate_normalized_text(&normalize_all_caps(normalized), source_lang, target_lang, config, true)
+                .translate_normalized_text(&normalize_all_caps(normalized), source_lang, target_lang, config, false)
                 .await
             {
                 Ok(fallback_trans) => {
@@ -1588,14 +1687,9 @@ impl TranslatorService {
             urlencode(word)
         );
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| redact_secrets(&format!("HTTP request error: {:?}", e)))?;
-
-        let resp = ensure_http_success(resp, "Google Dict").await?;
+        let request = self.client
+            .get(&url);
+        let resp = self.send_request(request, "Google Dict").await?;
 
         let json: serde_json::Value = resp
             .json()
@@ -1688,211 +1782,290 @@ impl TranslatorService {
         })
     }
 
-    /// Translates a batch of OCR blocks using batching or parallel JoinSet dispatch.
+    /// Compatibility entry point; detailed errors are available to the HUD through the report.
     pub async fn translate_blocks(
-        &self,
-        blocks: &[OcrBlock],
-        config: &AppConfig,
+        &self, blocks: &[OcrBlock], config: &AppConfig,
     ) -> (Vec<TranslationBlock>, bool) {
+        let report = self.translate_blocks_report(blocks, config).await;
+        (report.blocks, report.errors.is_empty())
+    }
+
+    pub async fn translate_blocks_report(
+        &self, blocks: &[OcrBlock], config: &AppConfig,
+    ) -> TranslationBatchReport {
         if blocks.is_empty() {
-            return (Vec::new(), true);
+            return TranslationBatchReport { blocks: Vec::new(), errors: Vec::new() };
         }
-
-        let cleaned_texts: Vec<String> = blocks
-            .iter()
-            .map(|b| {
-                let cleaned = clean_ocr_noise(&b.text);
-                normalize_all_caps(&cleaned)
-            })
-            .collect();
-
-        // 1. Check in-memory cache
-        let mut all_cached = true;
-        let mut cached_results = Vec::with_capacity(blocks.len());
-
-        for (i, text) in cleaned_texts.iter().enumerate() {
-            if !is_translatable_text(text) {
-                warn!("translate_blocks: skipping translation for OCR garbage block: {:?}", blocks[i].text);
-                cached_results.push(Some(blocks[i].text.clone()));
-                continue;
+        let cleaned: Vec<String> = blocks.iter().map(|b| normalize_all_caps(&clean_ocr_noise(&b.text))).collect();
+        let keys: Vec<String> = cleaned.iter().map(|text|
+            self.cache_key("translation", text, &config.source_lang, &config.target_lang, config)).collect();
+        let mut values: Vec<Option<String>> = cleaned.iter().zip(&keys).zip(blocks).map(|((text, key), block)| {
+            if is_translatable_text(text) { self.cache.get(key) } else { Some(block.text.clone()) }
+        }).collect();
+        let uncached: Vec<usize> = values.iter().enumerate().filter_map(|(i, value)| value.is_none().then_some(i)).collect();
+        let texts: Vec<&str> = uncached.iter().map(|&i| cleaned[i].as_str()).collect();
+        let mut errors = Vec::new();
+        let batch = if texts.len() > 1 && config.provider == TranslationProvider::Google {
+            Some(self.translate_provider_raw(&texts.join("\n[---]\n"), &config.source_lang, &config.target_lang, config)
+                .await.map(|value| value.split("[---]").map(str::to_string).collect::<Vec<_>>()))
+        } else if texts.len() > 1 && config.provider == TranslationProvider::DeepL
+            && let Some(key) = &config.deepl_api_key {
+            Some(self.translate_deepl_batch(&texts, &config.source_lang, &config.target_lang, key,
+                &self.context.format_history_context()).await)
+        } else { None };
+        let batch_succeeded = if let Some(Ok(translated)) = batch.as_ref()
+            && translated.len() == uncached.len() {
+            for (&i, text) in uncached.iter().zip(translated) {
+                let value = self.context.postprocess(&clean_russian_punctuation(text.trim()));
+                self.cache.insert(keys[i].clone(), value.clone());
+                values[i] = Some(value);
             }
-            let cache_key = format!(
-                "{}:{}:{}:{}",
-                config.provider.as_str(),
-                config.source_lang,
-                config.target_lang,
-                text
-            );
-            if let Some(trans) = self.cache.get(&cache_key) {
-                cached_results.push(Some(trans));
-            } else {
-                cached_results.push(None);
-                all_cached = false;
+            true
+        } else { false };
+        if !batch_succeeded && !uncached.is_empty() {
+            let mut tasks = tokio::task::JoinSet::new();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+            for i in uncached {
+                let service = self.clone();
+                let text = cleaned[i].clone();
+                let cfg = config.clone();
+                let semaphore = semaphore.clone();
+                tasks.spawn(async move {
+                    let _permit = semaphore.acquire().await.ok();
+                    (i, service.translate_normalized_text(&text, &cfg.source_lang, &cfg.target_lang, &cfg, false).await)
+                });
             }
-        }
-
-        if all_cached {
-            return (blocks
-                .iter()
-                .zip(cached_results)
-                .map(|(b, trans)| TranslationBlock {
-                    original_text: b.text.clone(),
-                    translated_text: trans.unwrap_or_else(|| b.text.clone()),
-                    rect: b.rect,
-                })
-                .collect(), true);
-        }
-
-        // Only unresolved blocks go to providers; filtered text stays in its original slot.
-        let uncached_indices: Vec<usize> = cached_results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| if c.is_none() { Some(i) } else { None })
-            .collect();
-        let text_refs: Vec<&str> = uncached_indices
-            .iter()
-            .map(|&i| cleaned_texts[i].as_str())
-            .collect();
-
-        // 2. Context-aware batch translation
-        let batch_result = if text_refs.len() > 1 && config.provider == TranslationProvider::Google {
-            let combined = text_refs.join("\n[---]\n");
-            Some(self
-                .translate_provider_raw(&combined, &config.source_lang, &config.target_lang, config)
-                .await
-                .map(|translated| translated.split("[---]").map(str::to_string).collect::<Vec<_>>()))
-        } else if blocks.len() > 1
-            && config.provider == TranslationProvider::DeepL
-            && let Some(key) = &config.deepl_api_key
-        {
-            let ctx = self.context.format_history_context();
-            Some(self
-                .translate_deepl_batch(
-                    &text_refs,
-                    &config.source_lang,
-                    &config.target_lang,
-                    key,
-                    &ctx,
-                )
-                .await)
-        } else {
-            None
-        };
-
-        if let Some(Ok(batch_translated)) = batch_result
-            && batch_translated.len() == uncached_indices.len()
-        {
-            let mut processed_translations = Vec::with_capacity(batch_translated.len());
-            for (&idx, trans) in uncached_indices.iter().zip(batch_translated) {
-                let clean_part = clean_russian_punctuation(trans.trim());
-                let final_text = self.context.postprocess(&clean_part);
-                let key = format!(
-                    "{}:{}:{}:{}",
-                    config.provider.as_str(),
-                    config.source_lang,
-                    config.target_lang,
-                    cleaned_texts[idx]
-                );
-                self.cache.insert(key, final_text.clone());
-                self.context
-                    .record_translation(cleaned_texts[idx].clone(), final_text.clone());
-                processed_translations.push(final_text);
-            }
-
-            if let Ok(merged_texts) = assemble_batch_translations(
-                &cached_results,
-                &uncached_indices,
-                &processed_translations,
-            ) {
-                return (blocks
-                    .iter()
-                    .zip(merged_texts)
-                    .map(|(b, trans)| TranslationBlock {
-                        original_text: b.text.clone(),
-                        translated_text: trans,
-                        rect: b.rect,
-                    })
-                    .collect(), true);
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok((i, Ok(value))) => values[i] = Some(value),
+                    Ok((i, Err(message))) => {
+                        // The retry gate returns the original HTTP/network cause; do not hide it behind the source text.
+                        let message = self.translation_error(message);
+                        error!("Failed to translate block '{}': {}", blocks[i].text, message);
+                        errors.push(message);
+                    }
+                    Err(error) => errors.push(self.translation_error(format!("Translation task failed: {error}"))),
+                }
             }
         }
-
-        // 3. Fallback: parallel per-block translation
-        let mut join_set = tokio::task::JoinSet::new();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
-
-        let mut collected: Vec<(usize, TranslationBlock, bool)> = Vec::with_capacity(blocks.len());
-        for (idx, block) in blocks.iter().enumerate() {
-            if let Some(translated_text) = &cached_results[idx] {
-                collected.push((
-                    idx,
-                    TranslationBlock {
-                        original_text: block.text.clone(),
-                        translated_text: translated_text.clone(),
-                        rect: block.rect,
-                    },
-                    is_translatable_text(&cleaned_texts[idx]),
-                ));
-                continue;
+        let mut translated_blocks = Vec::with_capacity(blocks.len());
+        for (i, block) in blocks.iter().enumerate() {
+            if let Some(value) = &values[i] {
+                if is_translatable_text(&cleaned[i]) {
+                    // Record actual dialogue order, including cached repetitions.
+                    self.context.record_translation(cleaned[i].clone(), value.clone());
+                }
             }
-            let this = self.clone();
-            let orig_text = block.text.clone();
-            let clean_text = cleaned_texts[idx].clone();
-            let rect = block.rect;
-            let cfg = config.clone();
-            let sem = semaphore.clone();
-
-            join_set.spawn(async move {
-                let _permit = sem.acquire().await.ok();
-                let res = this
-                    .translate_normalized_text(&clean_text, &cfg.source_lang, &cfg.target_lang, &cfg, false)
-                    .await;
-                (idx, orig_text, rect, res)
+            translated_blocks.push(TranslationBlock {
+                original_text: block.text.clone(),
+                translated_text: values[i].take().unwrap_or_else(|| format!("[Err: {}]", block.text)),
+                rect: block.rect,
             });
         }
-
-        let mut all_succeeded = true;
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok((idx, orig_text, rect, trans_res)) => {
-                    let (translated_text, is_ok) = match trans_res {
-                        Ok(t) => (t, true),
-                        Err(e) => {
-                            all_succeeded = false;
-                            error!("Failed to translate block '{}': {}", orig_text, e);
-                            (format!("[Err: {}]", orig_text), false)
-                        }
-                    };
-                    collected.push((
-                        idx,
-                        TranslationBlock {
-                            original_text: orig_text,
-                            translated_text,
-                            rect,
-                        },
-                        is_ok,
-                    ));
-                }
-                Err(e) => {
-                    all_succeeded = false;
-                    error!("Join error during block translation: {:?}", e);
-                }
-            }
-        }
-
-        collected.sort_by_key(|(idx, _, _)| *idx);
-        for (idx, block, is_ok) in &collected {
-            if *is_ok {
-                self.context
-                    .record_translation(cleaned_texts[*idx].clone(), block.translated_text.clone());
-            }
-        }
-        (collected.into_iter().map(|(_, block, _)| block).collect(), all_succeeded)
+        TranslationBatchReport { blocks: translated_blocks, errors }
     }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mock_responses(responses: Vec<(u16, String, String)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, headers, body) in responses {
+                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 4096];
+                    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer)).await.unwrap().unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = header.lines().filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse().unwrap()).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (address, task)
+    }
+
+    fn openai_config(base_url: String) -> AppConfig {
+        AppConfig {
+            provider: TranslationProvider::OpenAICompatible,
+            openai_api_key: Some("dummy-test-key".into()),
+            openai_base_url: base_url, openai_model: "mock-text-model".into(),
+            ..AppConfig::default()
+        }
+    }
+
+    fn completion_response(text: &str) -> String {
+        serde_json::json!({"choices":[{"message":{"content":text}}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_contextual_cache_does_not_reuse_a_different_dialogue_context() {
+        let (base_url, server) = mock_responses(vec![
+            (200, String::new(), completion_response("первый контекст")),
+            (200, String::new(), completion_response("другой контекст")),
+        ]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        let first_key = service.cache_key("translation", "Hello", "en", "ru", &config);
+        assert_eq!(service.translate_text("Hello", "en", "ru", &config).await.unwrap(), "первый контекст");
+        service.context.record_translation("A woman is speaking".into(), "Говорит женщина".into());
+        assert_ne!(first_key, service.cache_key("translation", "Hello", "en", "ru", &config));
+        assert_eq!(service.translate_text("Hello", "en", "ru", &config).await.unwrap(), "другой контекст");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("A woman is speaking"));
+        let mut other_model = config.clone();
+        other_model.openai_model = "different-model".into();
+        assert_ne!(service.cache_key("translation", "Hello", "en", "ru", &config),
+            service.cache_key("translation", "Hello", "en", "ru", &other_model));
+    }
+
+    #[tokio::test]
+    async fn test_cached_repeated_dialogue_updates_history() {
+        let service = TranslatorService::new();
+        let config = AppConfig::default();
+        service.cache.insert(service.cache_key("translation", "Hello", "en", "ru", &config), "Привет".into());
+        for _ in 0..2 {
+            assert_eq!(service.translate_text("Hello", "en", "ru", &config).await.unwrap(), "Привет");
+        }
+        assert_eq!(service.context.get_recent_history().len(), 2);
+        assert!(service.context.get_recent_history().iter().all(|(original, _)| original == "Hello"));
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_fallback_does_not_enter_dialogue_history() {
+        let (base_url, server) = mock_responses(vec![(200, String::new(), completion_response("я"))]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        assert_eq!(service.lookup_word_details("I", "en", "ru", &config).await.primary, "я");
+        assert!(service.context.get_recent_history().is_empty());
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_http_configuration_error_is_reported_and_blocks_retries_until_reset() {
+        let (base_url, server) = mock_responses(vec![(401, String::new(), "{\"error\":\"invalid API key\"}".into())]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        let blocks = vec![OcrBlock { text: "Hello world".into(), rect: ScreenRect::new(0, 0, 100, 20), lines: vec![] }];
+        let report = service.translate_blocks_report(&blocks, &config).await;
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("HTTP 401"));
+        assert!(!service.automatic_retry_ready());
+        assert!(service.retry_message().unwrap().contains("Alt+T"));
+        assert_eq!(server.await.unwrap().len(), 1);
+        let next = service.translate_blocks_report(&blocks, &config).await;
+        assert_eq!(next.errors, report.errors, "A gated retry must preserve the HTTP cause");
+        service.reset_retry();
+        assert!(service.automatic_retry_ready());
+        assert!(service.retry_message().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_honors_retry_after_and_network_backoff_is_bounded() {
+        let (base_url, server) = mock_responses(vec![(429, "Retry-After: 120\r\n".into(), "busy".into())]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::new();
+        assert!(service.translate_text("Hello world", "en", "ru", &config).await.unwrap_err().contains("429"));
+        assert!(!service.automatic_retry_ready());
+        assert!(service.retry_message().unwrap().contains("повтор через"));
+        assert!(service.retry.lock().unwrap().until.unwrap().saturating_duration_since(Instant::now()) > Duration::from_secs(119));
+        server.await.unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let header = httpdate::fmt_http_date(now + Duration::from_secs(90));
+        assert_eq!(retry_after_delay(&header, now), Some(Duration::from_secs(90)));
+        assert_eq!(retry_after_delay("invalid", now), None);
+        let mut state = RetryState::default();
+        for expected in [5, 10, 20, 40, 60, 60] {
+            state.fail("network".into(), None, None);
+            let remaining = state.until.unwrap().saturating_duration_since(Instant::now());
+            assert!(remaining <= Duration::from_secs(expected));
+            assert!(remaining > Duration::from_secs(expected - 1));
+        }
+        state.fail("invalid key".into(), Some(403), None);
+        state.fail("network".into(), None, None);
+        assert!(state.permanent, "Concurrent transient errors must not erase a configuration failure");
+    }
+
+    #[test]
+    fn test_concurrent_transient_failures_cannot_shorten_retry_after() {
+        let mut state = RetryState::default();
+        state.fail("rate limited".into(), Some(429), Some(Duration::from_secs(120)));
+        let server_deadline = state.until.unwrap();
+        state.fail("unavailable".into(), Some(503), None);
+        assert!(state.until.unwrap() >= server_deadline);
+        state.fail("network failed".into(), None, None);
+        assert!(state.until.unwrap() >= server_deadline);
+        assert!(!state.ready());
+    }
+
+    #[tokio::test]
+    async fn test_groq_model_validation_is_cached_and_missing_models_are_rejected() {
+        let (base_url, server) = mock_responses(vec![(200, String::new(), "{\"data\":[{\"id\":\"available-vision\"}]}".into())]).await;
+        let service = TranslatorService::new();
+        service.validate_groq_vision_model(&base_url, "key", "available-vision").await.unwrap();
+        service.validate_groq_vision_model(&base_url, "key", "available-vision").await.unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /models "));
+        let (base_url, server) = mock_responses(vec![(200, String::new(), "{\"data\":[]}".into())]).await;
+        let service = TranslatorService::new();
+        assert!(service.validate_groq_vision_model(&base_url, "key", "missing-vision").await.unwrap_err().contains("missing-vision"));
+        assert!(service.automatic_retry_ready());
+        assert!(!service.vision_retry.lock().unwrap().ready());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_optional_vision_failure_does_not_pause_local_ocr_or_text_translation() {
+        let service = TranslatorService::new();
+        let mut config = AppConfig {
+            provider: TranslationProvider::Google, vision_fallback: true,
+            openai_api_key: Some("dummy-groq-key".into()),
+            openai_vision_model: None,
+            ..AppConfig::default()
+        };
+        let frame = CapturedFrame { bgra_bytes: vec![255; 16], width: 2, height: 2, offset_x: 0, offset_y: 0 };
+        let first = service.translate_image_direct_vision(&frame, &config).await.unwrap_err();
+        assert!(first.contains("openai_vision_model"));
+        assert!(service.automatic_retry_ready(), "Auto capture and local OCR must continue");
+        assert!(!service.vision_retry.lock().unwrap().ready());
+        service.cache.insert(service.cache_key("translation", "Readable dialogue", "en", "ru", &config), "Читаемая реплика".into());
+        assert_eq!(service.translate_text("Readable dialogue", "en", "ru", &config).await.unwrap(), "Читаемая реплика");
+
+        // Even if another request could reach a server now, the Vision-specific gate suppresses it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.openai_base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.openai_vision_model = Some("mock-vision".into());
+        assert_eq!(service.translate_image_direct_vision(&frame, &config).await.unwrap_err(), first);
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+
+        let (base_url, server) = mock_responses(vec![(200, String::new(), completion_response("Текстовый сервис работает"))]).await;
+        let text_config = openai_config(base_url);
+        assert_eq!(service.translate_text("Fresh dialogue", "en", "ru", &text_config).await.unwrap(), "Текстовый сервис работает");
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert!(!service.vision_retry.lock().unwrap().ready(), "Text success must not erase Vision recovery state");
+        service.reset_retry();
+        assert!(service.automatic_retry_ready());
+        assert!(service.vision_retry.lock().unwrap().ready());
+    }
 
     #[test]
     fn test_clean_ocr_noise() {
@@ -1946,6 +2119,16 @@ mod tests {
             clean_russian_punctuation(messy),
             "Привет, как дела? Это отлично!"
         );
+    }
+
+    #[test]
+    fn test_clean_russian_punctuation_multiple_spaces() {
+        assert_eq!(
+            clean_russian_punctuation("  Привет   ,  мир  !  Как дела   ?  Хорошо  .  Да  :  точно  ;  "),
+            "Привет, мир! Как дела? Хорошо. Да: точно;"
+        );
+        assert_eq!(clean_russian_punctuation("Привет, мир!"), "Привет, мир!");
+        assert_eq!(clean_russian_punctuation("   "), "");
     }
 
     #[test]
@@ -2198,6 +2381,14 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_html_tags_decodes_entities_once() {
+        assert_eq!(
+            strip_html_tags("<b>&amp;lt;word&amp;gt;</b> &amp;quot; &amp;#39; &amp;amp;"),
+            "&lt;word&gt; &quot; &#39; &amp;"
+        );
+    }
+
+    #[test]
     fn test_deepl_target_lang_normalization() {
         assert_eq!(deepl_target_lang("en"), "EN-US");
         assert_eq!(deepl_target_lang("EN"), "EN-US");
@@ -2222,42 +2413,14 @@ mod tests {
 
     #[test]
     fn test_resolve_openai_vision_model() {
-        assert_eq!(
-            resolve_openai_vision_model(
-                Some("custom-vision-v1"),
-                "https://api.groq.com/openai/v1",
-                "llama-text"
-            ),
-            "custom-vision-v1"
-        );
-        assert_eq!(
-            resolve_openai_vision_model(
-                None,
-                "https://api.groq.com/openai/v1",
-                "meta-llama/llama-4-scout-17b-16e-instruct"
-            ),
-            "llama-3.2-11b-vision-preview"
-        );
-        assert_eq!(
-            resolve_openai_vision_model(
-                None,
-                "https://api.groq.com/openai/v1",
-                "llama-3.2-90b-vision-preview"
-            ),
-            "llama-3.2-90b-vision-preview"
-        );
-        assert_eq!(
-            resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-3.5-turbo"),
-            "gpt-4o-mini"
-        );
-        assert_eq!(
-            resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-4o"),
-            "gpt-4o"
-        );
-        assert_eq!(
-            resolve_openai_vision_model(None, "http://localhost:11434/v1", "llava:latest"),
-            "llava:latest"
-        );
+        for model in [None, Some(""), Some(" "), Some("llama-3.2-11b-vision-preview"), Some("llama-3.2-90b-vision-preview")] {
+            assert!(resolve_openai_vision_model(model, "https://api.groq.com/openai/v1", "text-model").is_err());
+        }
+        assert_eq!(resolve_openai_vision_model(Some("available-vision"), "https://api.groq.com/openai/v1", "text-model").unwrap(), "available-vision");
+        assert_eq!(resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-3.5-turbo").unwrap(), "gpt-4o-mini");
+        assert_eq!(resolve_openai_vision_model(None, "https://api.openai.com/v1", "gpt-4o").unwrap(), "gpt-4o");
+        assert_eq!(resolve_openai_vision_model(None, "http://localhost:11434/v1", "llava:latest").unwrap(), "llava:latest");
+        assert!(!is_groq_url("https://groq.com.invalid/v1"));
     }
 
     #[tokio::test]
@@ -2323,11 +2486,11 @@ mod tests {
 
         // Prepopulate cache for blocks 0 and 2; block 1 is omitted to trigger translation processing
         service.cache.insert(
-            "openai_compatible:en:ru:First block".to_string(),
+            service.cache_key("translation", "First block", "en", "ru", &config),
             "Первый блок".to_string(),
         );
         service.cache.insert(
-            "openai_compatible:en:ru:Third block".to_string(),
+            service.cache_key("translation", "Third block", "en", "ru", &config),
             "Третий блок".to_string(),
         );
 
@@ -2370,15 +2533,17 @@ mod tests {
         assert_eq!(history[0], ("First block".to_string(), "Первый блок".to_string()));
         assert_eq!(history[1], ("Third block".to_string(), "Третий блок".to_string()));
 
-        // When all blocks are cached, translate_blocks returns results without polluting history
+        // Contextual results must be cached under the new history snapshot. Repetitions still enter history.
+        service.cache.insert(service.cache_key("translation", "First block", "en", "ru", &config), "?????? ????".into());
+        service.cache.insert(service.cache_key("translation", "Third block", "en", "ru", &config), "?????? ????".into());
         service.cache.insert(
-            "openai_compatible:en:ru:Second block".to_string(),
+            service.cache_key("translation", "Second block", "en", "ru", &config),
             "Второй блок".to_string(),
         );
         let (cached_results, all_succeeded) = service.translate_blocks(&blocks, &config).await;
         assert!(all_succeeded);
         assert_eq!(cached_results[1].translated_text, "Второй блок");
-        assert_eq!(service.context.get_recent_history().len(), 2);
+        assert_eq!(service.context.get_recent_history().len(), 5);
     }
 
     #[test]
@@ -2511,7 +2676,7 @@ mod tests {
     async fn test_dictionary_single_letter_bypasses_ocr_artifact_filter() {
         let service = TranslatorService::new();
         let config = AppConfig { provider: TranslationProvider::OpenAICompatible, ..Default::default() };
-        service.cache.insert("openai_compatible:en:ru:I".to_string(), "pronoun".to_string());
+        service.cache.insert(service.cache_key("translation", "I", "en", "ru", &config), "pronoun".to_string());
         let details = service.lookup_word_details("I", "en", "ru", &config).await;
         assert_eq!(details.primary, "pronoun");
     }

@@ -1,0 +1,38 @@
+[
+  {
+    "file": "please_follow.png",
+    "kind": "speech bubble",
+    "lines": ["PLEASE FOLLOW", "INSTRUCTIONS!"],
+    "max_cer": 0.15
+  },
+  {
+    "file": "utube_shorts.png",
+    "kind": "speech bubble on patterned background",
+    "lines": ["LET'S POST", "IT ON UTUBE", "SHORTS!"],
+    "max_cer": 0.15
+  },
+  {
+    "file": "new_era_white_glow.png",
+    "kind": "white glowing text",
+    "lines": ["HAS ENTERED", "A NEW ERA."],
+    "max_cer": 0.15
+  },
+  {
+    "file": "meme_no_pickles.png",
+    "kind": "outlined text on a photo",
+    "lines": ["EXCUSE ME SIR", "SHE ASKED FOR NO PICKLES"],
+    "max_cer": 0.15
+  },
+  {
+    "file": "small_subtitle.png",
+    "kind": "synthetic small outlined subtitle",
+    "lines": ["Please wait for the next mission."],
+    "max_cer": 0.15
+  },
+  {
+    "file": "small_subtitle_noisy.png",
+    "kind": "synthetic small subtitle on a patterned background",
+    "lines": ["Please wait for the next mission."],
+    "max_cer": 0.15
+  }
+]

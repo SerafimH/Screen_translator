@@ -40,6 +40,45 @@ class MockEngine:
 
 
 class TestOcrHelperProtocol(unittest.TestCase):
+    def test_ready_follows_model_warmup_and_keeps_stdout_clean(self):
+        for configured, expected in (("ja-JP", "ja"), ("", "en")):
+            output = io.BytesIO()
+            stderr = io.StringIO()
+
+            def load_engine(models_dir, lang):
+                self.assertEqual(output.getvalue(), b"")
+                self.assertEqual(lang, expected)
+                print("loader output belongs on stderr")
+                return MockEngine()
+
+            with self.subTest(lang=configured), \
+                 patch.dict(os.environ, {"SCREEN_TRANSLATOR_OCR_LANG": configured}), \
+                 patch("ocr_helper.server.resolve_models_dir", return_value=None), \
+                 patch("ocr_helper.server.create_ocr_engine", side_effect=load_engine), \
+                 patch("sys.stderr", stderr):
+                run_server(stdin=io.BytesIO(), stdout=output)
+            self.assertEqual(json.loads(output.getvalue()), {"event": "ready"})
+            self.assertIn("loader output", stderr.getvalue())
+
+    def test_failed_warmup_does_not_report_ready(self):
+        output = io.BytesIO()
+        with patch("ocr_helper.server.resolve_models_dir", return_value=None), \
+             patch("ocr_helper.server.create_ocr_engine", side_effect=RuntimeError("load failed")):
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                run_server(stdin=io.BytesIO(), stdout=output)
+        self.assertEqual(output.getvalue(), b"")
+
+    def test_short_cjk_dialogue_keeps_native_punctuation(self):
+        box = [[0, 0], [40, 0], [40, 20], [0, 20]]
+        for text in ("はい？", "何？", "是。", "不！", "「はい」", "你好，世界！"):
+            with self.subTest(text=text):
+                kept, rejected = filter_ocr_lines([(box, text, 0.99)])
+                self.assertEqual(len(kept), 1)
+                self.assertEqual(rejected, [])
+        kept, rejected = filter_ocr_lines([(box, "I@II#O*$", 0.99)])
+        self.assertEqual(kept, [])
+        self.assertEqual(rejected[0][1], "symbols")
+
     def test_read_exact(self):
         data = b"1234567890"
         stream = io.BytesIO(data)
@@ -121,6 +160,7 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(lines[0]["text"], "Start Game")
         self.assertEqual(lines[0]["score"], 0.88)
 
+    @patch("ocr_helper.server.should_upscale_frame", lambda *_: False)
     def test_successful_recognition(self):
         mock_res = [
             [[[0, 0], [50, 0], [50, 20], [0, 20]], "Test", 0.99]
@@ -301,8 +341,8 @@ class TestOcrHelperProtocol(unittest.TestCase):
         kept, rej = filter_ocr_lines([(valid_box, "終末のワルキューレ", 0.9)])
         self.assertEqual(len(kept), 1)
 
-        # 9. Оценка уверенности меньше 0.60 -> отброшено ("low_score")
-        kept, rej = filter_ocr_lines([(valid_box, "Valid text", 0.55)])
+        # 9. Оценка уверенности меньше 0.50 -> отброшено ("low_score")
+        kept, rej = filter_ocr_lines([(valid_box, "Valid text", 0.45)])
         self.assertEqual(len(kept), 0)
         self.assertEqual(rej[0][1], "low_score")
 
@@ -315,6 +355,7 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(len(kept), 0)
         self.assertEqual(rej[0][1], "tiny_box")
 
+    @patch("ocr_helper.server.should_upscale_frame", lambda *_: False)
     def test_process_request_filters_garbage_lines(self):
         valid_box = [[0, 0], [100, 0], [100, 20], [0, 20]]
         mock_output = [
@@ -328,6 +369,48 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(len(resp["lines"]), 1)
         self.assertEqual(resp["lines"][0]["text"], "Chapter 126")
+
+    @patch("ocr_helper.server.should_upscale_frame", lambda *_: False)
+    def test_request_threshold_reaches_engine_and_filter(self):
+        received = []
+
+        def engine(img, **kwargs):
+            received.append(kwargs["text_score"])
+            return [{"box": [[0, 0], [100, 0], [100, 20], [0, 20]],
+                     "text": "Hello world", "score": 0.55}]
+
+        for threshold, count in ((0.5, 1), (0.6, 0), (0.3, 1)):
+            received.clear()
+            header = {"id": 1, "width": 2, "height": 2, "lang": "en",
+                      "min_score": threshold}
+            result = process_request(header, bytes(12), engine)
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(result["lines"]), count)
+            self.assertTrue(received)
+            self.assertTrue(all(score == threshold for score in received))
+            if count:
+                self.assertEqual(result["lines"][0]["score"], 0.55)
+
+        for invalid in (-0.1, 1.1, float("nan"), float("inf"), "0.5", True):
+            header["min_score"] = invalid
+            self.assertFalse(process_request(header, bytes(12), engine)["ok"])
+
+    def test_merge_preserves_lower_configured_threshold(self):
+        line = {"box": [[0, 0], [100, 0], [100, 20], [0, 20]],
+                "text": "Hello world", "score": 0.35}
+        self.assertEqual(merge_ocr_lines([[line]], min_score=0.3), [line])
+        self.assertEqual(merge_ocr_lines([[line]], min_score=0.4), [])
+
+    def test_benchmark_quality_detects_missing_and_wrong_text(self):
+        from ocr_helper.benchmark import edit_distance, quality
+        self.assertEqual(edit_distance("kitten", "sitting"), 3)
+        self.assertEqual(edit_distance("", "abc"), 3)
+        exact = quality(["Hello world", "Goodbye"], ["HELLO WORLD", "Goodbye"])
+        self.assertEqual(exact["cer"], 0)
+        self.assertEqual(exact["missing_lines"], 0)
+        partial = quality(["Hello world", "Goodbye"], ["Hello world"])
+        self.assertGreater(partial["cer"], 0)
+        self.assertEqual(partial["missing_lines"], 1)
 
     def test_debug_dump_enabled(self):
         import shutil
@@ -466,6 +549,8 @@ class TestOcrHelperProtocol(unittest.TestCase):
             def __call__(self, img_bgr):
                 if hasattr(img_bgr, "shape"):
                     received_shapes.append(img_bgr.shape)
+                    if img_bgr.shape[0] == 4:
+                        return []
                 box_up = [[20.0, 20.0], [60.0, 20.0], [60.0, 40.0], [20.0, 40.0]]
                 return [{"box": box_up, "text": "Upscaled text", "score": 0.90}]
 
@@ -479,7 +564,27 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(resp["lines"][0]["box"], expected_box)
         # Verify engine received upscaled 8x8 image (4*2, 4*2)
         if received_shapes:
-            self.assertEqual(received_shapes[0][:2], (8, 8))
+            self.assertEqual([shape[:2] for shape in received_shapes], [(4, 4), (8, 8)])
+
+    def test_upscale_preserves_original_only_line_and_prefers_confidence(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required")
+
+        def engine(img, **kwargs):
+            if img.shape[0] == 100:
+                return [
+                    {"text": "Original only", "score": 0.95,
+                     "box": [[10, 10], [100, 10], [100, 30], [10, 30]]},
+                    {"text": "READ", "score": 0.86,
+                     "box": [[10, 60], [100, 60], [100, 80], [10, 80]]}]
+            return [{"text": "READY", "score": 0.99,
+                     "box": [[20, 120], [200, 120], [200, 160], [20, 160]]}]
+
+        result = process_request({"id": 1, "width": 120, "height": 100, "lang": "en"},
+                                 bytes(120 * 100 * 3), engine)
+        self.assertTrue(result["ok"])
+        self.assertEqual({line["text"] for line in result["lines"]}, {"Original only", "READY"})
 
 
 if __name__ == "__main__":

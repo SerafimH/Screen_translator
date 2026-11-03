@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, E_FAIL, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -82,6 +82,20 @@ impl Drop for BitmapGuard {
     }
 }
 
+// Restore the previous object before BitmapGuard attempts to delete the selected bitmap.
+struct SelectedBitmapGuard {
+    dc: HDC,
+    previous: HGDIOBJ,
+}
+
+impl Drop for SelectedBitmapGuard {
+    fn drop(&mut self) {
+        if !self.dc.is_invalid() {
+            unsafe { SelectObject(self.dc, self.previous); }
+        }
+    }
+}
+
 pub struct D2dDrawGuard<'a> {
     rt: &'a ID2D1DCRenderTarget,
     active: bool,
@@ -116,6 +130,11 @@ pub struct OverlayRenderer {
     origin_y: i32,
     width: i32,
     height: i32,
+    font_family: String,
+    font_size: f32,
+    overlay_bg_alpha: f32,
+    #[cfg(test)]
+    next_render_error: Option<windows::core::HRESULT>,
     hdc_mem: HDC,
     hbitmap: HGDIOBJ,
     old_bitmap: HGDIOBJ,
@@ -147,6 +166,9 @@ impl OverlayRenderer {
         font_size: f32,
         overlay_bg_alpha: f32,
     ) -> Result<Self> {
+        if width <= 0 || height <= 0 {
+            return Err(windows::core::Error::from_hresult(E_FAIL));
+        }
         unsafe {
             // 1. Create 32-bit ARGB DIB Section and memory DC.
             //    hdc_screen, hdc_mem and hbitmap are protected by RAII guards so they are
@@ -188,6 +210,10 @@ impl OverlayRenderer {
             let mut bitmap_guard = BitmapGuard(hbitmap.into());
 
             let old_bitmap = SelectObject(hdc_mem_raw, bitmap_guard.0);
+            if old_bitmap.is_invalid() {
+                return Err(windows::core::Error::from_hresult(E_FAIL));
+            }
+            let mut selection_guard = SelectedBitmapGuard { dc: hdc_mem_raw, previous: old_bitmap };
             // hdc_screen can now be released early, before Direct2D initialization.
             drop(_screen_guard);
 
@@ -353,12 +379,18 @@ impl OverlayRenderer {
             // guards do not delete them on exit. OverlayRenderer::drop will delete them.
             let hdc_mem = mem_guard.take();
             let hbitmap = bitmap_guard.take();
+            selection_guard.dc = HDC(core::ptr::null_mut());
 
             Ok(Self {
                 origin_x,
                 origin_y,
                 width,
                 height,
+                font_family: font_family.to_string(),
+                font_size,
+                overlay_bg_alpha,
+                #[cfg(test)]
+                next_render_error: None,
                 hdc_mem,
                 hbitmap,
                 old_bitmap,
@@ -382,8 +414,30 @@ impl OverlayRenderer {
         }
     }
 
+    /// Replace size-dependent and device-dependent resources only after allocation succeeds.
+    pub fn reconfigure(&mut self, bounds: ScreenRect) -> Result<()> {
+        let replacement = Self::new(bounds.x, bounds.y, bounds.width, bounds.height,
+            &self.font_family, self.font_size, self.overlay_bg_alpha)?;
+        *self = replacement;
+        Ok(())
+    }
+
     /// Renders the complete scene (translation cards, HUD bar, ROI selection) and flushes to DWM.
     pub fn render(&mut self, hwnd: HWND, scene: &RenderScene) -> Result<Option<ScreenRect>> {
+        match self.render_once(hwnd, scene) {
+            Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
+                self.reconfigure(ScreenRect::new(self.origin_x, self.origin_y, self.width, self.height))?;
+                self.render_once(hwnd, scene)
+            }
+            result => result,
+        }
+    }
+
+    fn render_once(&mut self, hwnd: HWND, scene: &RenderScene) -> Result<Option<ScreenRect>> {
+        #[cfg(test)]
+        if let Some(error) = self.next_render_error.take() {
+            return Err(windows::core::Error::from_hresult(error));
+        }
         let mut save_button = None;
         unsafe {
             let bind_rect = RECT {
@@ -711,6 +765,62 @@ impl Drop for OverlayRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_bitmap_is_restored_before_failure_cleanup() {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, GetCurrentObject, OBJ_BITMAP};
+        unsafe {
+            let screen = GetDC(None);
+            let _screen_guard = ScreenDcGuard(screen);
+            let memory = CreateCompatibleDC(Some(screen));
+            let _memory_guard = MemDcGuard(memory);
+            let bitmap = CreateCompatibleBitmap(screen, 20, 20);
+            let mut bitmap_guard = BitmapGuard(bitmap.into());
+            let previous = SelectObject(memory, bitmap_guard.0);
+            {
+                let _selection_guard = SelectedBitmapGuard { dc: memory, previous };
+                assert_eq!(GetCurrentObject(memory, OBJ_BITMAP), bitmap_guard.0);
+                // Leaving this scope models an early return during Direct2D initialization.
+            }
+            assert_eq!(GetCurrentObject(memory, OBJ_BITMAP), previous);
+            assert!(DeleteObject(bitmap_guard.take()).as_bool());
+        }
+    }
+
+    #[test]
+    fn renderer_reconfigures_geometry_and_recovers_a_lost_target() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_POPUP};
+        let hwnd = unsafe {
+            CreateWindowExW(WS_EX_LAYERED, w!("STATIC"), w!("Renderer recovery test"),
+                WS_POPUP, 0, 0, 200, 150, None, None, None, None).unwrap()
+        };
+        let mut renderer = OverlayRenderer::new(0, 0, 200, 150, "Segoe UI", 18.0, 0.8).unwrap();
+        let old_bitmap = renderer.hbitmap;
+        renderer.reconfigure(ScreenRect::new(-400, -200, 640, 480)).unwrap();
+        assert_ne!(renderer.hbitmap, old_bitmap);
+        assert_eq!((renderer.origin_x, renderer.origin_y, renderer.width, renderer.height), (-400, -200, 640, 480));
+        assert_eq!((renderer.font_family.as_str(), renderer.font_size, renderer.overlay_bg_alpha), ("Segoe UI", 18.0, 0.8));
+        let card = TranslationBlock {
+            original_text: "word".to_string(), translated_text: "translation".to_string(),
+            rect: ScreenRect::new(100, 220, 420, 20),
+        };
+        let scene = RenderScene {
+            blocks: &[], cursor_card: Some(&card), save_button_enabled: true,
+            active_roi: None, auto_mode: false, provider_name: "Google", ocr_engine_name: "WinRT",
+            mode: AppMode::Normal, selection_rect: None, status_msg: None, is_loading: false,
+        };
+        let before_loss = renderer.hbitmap;
+        renderer.next_render_error = Some(D2DERR_RECREATE_TARGET);
+        let button = renderer.render(hwnd, &scene).unwrap().unwrap();
+        assert_ne!(renderer.hbitmap, before_loss);
+        assert!(button.x >= -400 && button.x + button.width <= 240);
+        assert!(button.y >= -200 && button.y + button.height <= 280);
+        renderer.next_render_error = Some(E_FAIL);
+        assert_eq!(renderer.render(hwnd, &scene).unwrap_err().code(), E_FAIL);
+        assert!(renderer.reconfigure(ScreenRect::new(0, 0, 0, 100)).is_err());
+        assert_eq!((renderer.width, renderer.height), (640, 480));
+        unsafe { DestroyWindow(hwnd).unwrap(); }
+    }
 
     #[test]
     fn bug_3_raii_guard_defuse_and_take() {
