@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -37,6 +38,8 @@ SCREEN_TRANSLATOR_OCR_LANG_ENV = "SCREEN_TRANSLATOR_OCR_LANG"
 # Пороги масштабирования малых кадров
 SMALL_FRAME_PIXELS = 1_500_000
 UPSCALE_SMALL_FRAMES = 2
+MAX_RETRY_CALLS = 8
+MAX_RETRY_SECONDS = 1.5
 
 # Пороги фильтрации мусора
 MIN_SCORE = 0.50              # Default matches helper_min_score in the Rust client.
@@ -210,6 +213,31 @@ def extract_lines_from_result(result) -> List[Dict[str, Any]]:
     return lines
 
 
+def align_detected_words(line):
+    """Join detected fragments to the confirmed tokens without inventing boxes."""
+    words = line.get("words") or []
+    tokens = line.get("text", "").split()
+    if not words or "".join(tokens) != "".join(w["text"] for w in words):
+        return line
+    if len(tokens) == len(words) and all(token == word["text"] for token, word in zip(tokens, words)):
+        return line
+    aligned, index = [], 0
+    for token in tokens:
+        pieces, text = [], ""
+        while index < len(words) and len(text) < len(token):
+            pieces.append(words[index])
+            text += words[index]["text"]
+            index += 1
+        if text != token:
+            return line
+        xs = [p[0] for word in pieces for p in word["box"]]
+        ys = [p[1] for word in pieces for p in word["box"]]
+        aligned.append({"text": token, "score": min(w.get("score", 0) for w in pieces),
+                        "box": [[min(xs), min(ys)], [max(xs), min(ys)],
+                                [max(xs), max(ys)], [min(xs), max(ys)]]})
+    return {**line, "words": aligned}
+
+
 def filter_ocr_lines(lines, min_score=MIN_SCORE):
     """
     Чистая функция фильтрации OCR-строк по правилам:
@@ -307,10 +335,11 @@ def _compute_box_iou(box_a, box_b) -> float:
     return inter_area / union_area
 
 
-def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
+def merge_ocr_lines(variant_groups, min_score=MIN_SCORE, *, filter_before_merge=True):
     """
     Чистая функция объединения строк от нескольких вариантов кадра:
-    1. К каждому варианту отдельно применяется filter_ocr_lines.
+    1. К каждому варианту отдельно применяется filter_ocr_lines, если filter_before_merge=True.
+       Перед уточняющим распознаванием фильтрация откладывается, чтобы сохранить проблемные рамки.
     2. Все прошедшие фильтр строки объединяются.
     3. Полная строка сохраняется вместо охваченного ею обрезанного фрагмента.
     4. Уверенность сравнивается для дубликатов и конкурирующих чтений той же области.
@@ -326,7 +355,7 @@ def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
     for group in variant_groups:
         if not group:
             continue
-        kept, _ = filter_ocr_lines(group, min_score)
+        kept = filter_ocr_lines(group, min_score)[0] if filter_before_merge else group
         all_kept.extend(kept)
 
     if not all_kept:
@@ -392,7 +421,24 @@ def merge_ocr_lines(variant_groups, min_score=MIN_SCORE):
                 iou = _compute_box_iou(cand_box, sel_box)
                 if iou <= 0.5:
                     continue
-                if _is_clipped(cand, selected):
+                spacing_only = "".join(_text(cand).split()) == "".join(_text(selected).split())
+                if spacing_only and not filter_before_merge and isinstance(cand, dict) and isinstance(selected, dict):
+                    def disputed(item):
+                        spaced = " ".join(w["text"] for w in item.get("words", []))
+                        return (item.get("_spacing_check", False) or
+                                (spaced != item["text"] and "".join(spaced.split()) == "".join(item["text"].split())))
+                    if disputed(cand) or disputed(selected) or _text(cand) != _text(selected):
+                        cand["_spacing_check"] = selected["_spacing_check"] = True
+                if (not spacing_only and not filter_before_merge and iou >= 0.85
+                        and isinstance(cand, dict) and isinstance(selected, dict)
+                        and (cand.get("_word_check") or selected.get("_word_check")
+                             or any(0.9 <= _get_score(item) < 0.97 for item in (cand, selected)))):
+                    cand["_word_check"] = selected["_word_check"] = True
+                detected_spacing = (isinstance(cand, dict) and isinstance(selected, dict)
+                                    and len(cand.get("words") or []) > len(selected.get("words") or []))
+                if spacing_only and detected_spacing and _get_score(cand) >= max(0.95, _get_score(selected) - 0.01):
+                    replaced.append(index)
+                elif _is_clipped(cand, selected):
                     replaced.append(index)
                 elif _is_clipped(selected, cand):
                     overlaps = True
@@ -584,10 +630,176 @@ def lettering_variants(img, condensed=False):
         yield cv2.cvtColor(prepared, cv2.COLOR_GRAY2BGR), out_w / width, out_h / height
 
 
+class _RetryBudget:
+    """Bound optional OCR work across all crops and normalization variants."""
+
+    def __init__(self, calls=MAX_RETRY_CALLS, seconds=MAX_RETRY_SECONDS):
+        self.remaining = calls
+        self.deadline = time.perf_counter() + seconds
+
+    def available(self):
+        return self.remaining > 0 and time.perf_counter() < self.deadline
+
+    def take(self):
+        if not self.available():
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _retry_lines(ocr_exec, image, min_score, budget):
+    if not budget.take():
+        return []
+    return extract_lines_from_result(call_engine(ocr_exec, image, min_score))
+
+
+def _refinement_loses_text(original, candidate, min_score):
+    """A more confident fragment must not erase an already credible reading."""
+    if not filter_ocr_lines([original], min(min_score, MIN_SCORE))[0]:
+        return False
+    tokens = lambda text: tuple(word.strip('.,!?:;"“”«»()[]{}').casefold()
+                                for word in str(text).split())
+    full, part = tokens(original.get("text", "")), tokens(candidate.get("text", ""))
+    if not part or len(part) >= len(full):
+        return False
+    if any(full[i:i + len(part)] == part for i in range(len(full) - len(part) + 1)):
+        return True
+    outer, inner = original.get("box"), candidate.get("box")
+    if not outer or not inner:
+        return False
+    return (min(p[0] for p in inner) >= min(p[0] for p in outer) - 2
+            and max(p[0] for p in inner) <= max(p[0] for p in outer) + 2
+            and min(p[1] for p in inner) >= min(p[1] for p in outer) - 2
+            and max(p[1] for p in inner) <= max(p[1] for p in outer) + 2
+            and _compute_box_iou(outer, inner) < 0.97)
+
+
+def refine_confirmed_words(img, line, ocr_exec, min_score, budget):
+    """Resolve credible line errors and digit/letter ambiguity by image agreement."""
+    words = line.get("words") or []
+    if not words or not budget.available() or cv2 is None or np is None:
+        return line
+    ambiguous = [i for i, word in enumerate(words) if re.search(r"\d[OIlo]|[OIlo]\d", word["text"])]
+    weak_line = line.get("_word_check", False) or 0.9 <= float(line.get("score", 0)) < 0.97
+    spaced = " ".join(word["text"] for word in words)
+    spacing_conflict = (line.get("_spacing_check", False) or
+                        (spaced != line["text"] and "".join(spaced.split()) == "".join(line["text"].split())))
+    if not ambiguous and not weak_line and not spacing_conflict:
+        return line
+    # A whole-line consensus may correct one word while retaining another word
+    # whose readings conflict. Numeric ambiguities get a tight independent crop.
+    targets = ambiguous if ambiguous else [None]
+    replacements = {}
+    for target in targets:
+        box = words[target]["box"] if target is not None else line["box"]
+        pad = 4 if target is not None else 12
+        x1 = max(0, int(min(p[0] for p in box)) - pad)
+        y1 = max(0, int(min(p[1] for p in box)) - pad)
+        x2 = min(img.shape[1], int(max(p[0] for p in box)) + pad)
+        y2 = min(img.shape[0], int(max(p[1] for p in box)) + pad)
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            continue
+        views, line_views = [], []
+        for prepared, sx, sy in lettering_variants(img[y1:y2, x1:x2], target is not None and target not in ambiguous):
+            if not budget.available():
+                break
+            candidates = rescale_boxes_down(_retry_lines(ocr_exec, prepared, min_score, budget), sx, sy)
+            candidates, _ = filter_ocr_lines(candidates, max(0.85 if target is not None else 0.9, min_score))
+            detected = []
+            matching_lines = []
+            for candidate in candidates:
+                _shift_box_coords(candidate, x1, y1)
+                if _compute_box_iou(box, candidate["box"]) > 0.5:
+                    matching_lines.append(candidate)
+                detected.extend(candidate.get("words") or [candidate])
+            views.append(detected)
+            line_views.append(matching_lines)
+        if len(views) != 2:
+            continue
+        if (target is None and spacing_conflict and all(len(view) == 1 for view in line_views)
+                and line_views[0][0]["text"] == line_views[1][0]["text"]
+                and "".join(line_views[0][0]["text"].split()) == "".join(line["text"].split())):
+            return align_detected_words(line_views[0][0])
+        if spacing_conflict:
+            continue
+        for index in ([target] if target is not None else range(len(words))):
+            original = words[index]
+            votes = []
+            for view in views:
+                matches = [word for word in view if float(word.get("score", 0)) >= max(0.95, min_score)
+                           and _compute_box_iou(original["box"], word["box"]) > 0.5]
+                if len(matches) != 1:
+                    break
+                votes.append(matches[0])
+            if len(votes) == 2 and votes[0]["text"].casefold() != votes[1]["text"].casefold():
+                if target is None and index not in targets and len(targets) < 3:
+                    targets.append(index)
+                continue
+            if len(votes) != 2:
+                continue
+            confirmed = min(votes, key=lambda word: word["score"])
+            if confirmed["text"].strip(".,!?:;…").casefold() == original["text"].strip(".,!?:;…").casefold():
+                continue
+            text = confirmed["text"].upper() if original["text"].isupper() else confirmed["text"]
+            replacements[index] = {**confirmed, "text": text}
+    if not replacements:
+        return line
+    updated = [replacements.get(i, word) for i, word in enumerate(words)]
+    return {**line, "text": " ".join(word["text"] for word in updated), "words": updated}
+
+
+def refine_suspicious_ending(img_bgr, line, ocr_exec, min_score, budget):
+    """Confirm a damaged terminal token with two normalized word crops."""
+    words = line.get("words") or []
+    if not words or not budget.available() or cv2 is None or np is None:
+        return line
+    word = words[-1]
+    text = str(word.get("text", ""))
+    # This only selects a crop to re-read; punctuation is never deleted by a
+    # spelling rule. Acronyms, domains and ordinary sentence endings stay alone.
+    suspicious = re.fullmatch(r"([A-Za-z][A-Za-z'’\-]{2,})[.!?][A-Za-z]{1,2}[.!?]", text)
+    box = word.get("box")
+    if not suspicious or not box or len(box) < 4 or not line.get("text", "").rstrip().endswith(text):
+        return line
+    height, width = img_bgr.shape[:2]
+    x1 = max(0, int(min(p[0] for p in box)) - 8)
+    y1 = max(0, int(min(p[1] for p in box)) - 8)
+    x2 = min(width, int(max(p[0] for p in box)) + 8)
+    y2 = min(height, int(max(p[1] for p in box)) + 8)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return line
+    readings = []
+    for prepared, sx, sy in lettering_variants(img_bgr[y1:y2, x1:x2]):
+        if not budget.available():
+            return line
+        candidates = rescale_boxes_down(_retry_lines(ocr_exec, prepared, min_score, budget), sx, sy)
+        candidates, _ = filter_ocr_lines(candidates, max(0.95, min_score))
+        matching = []
+        for candidate in candidates:
+            _shift_box_coords(candidate, x1, y1)
+            if (candidate["text"].rstrip(".!?").casefold() == suspicious.group(1).casefold()
+                    and _compute_box_iou(box, candidate["box"]) > 0.5):
+                matching.append(candidate)
+        if len(matching) != 1:
+            return line
+        readings.append(matching[0])
+    if (len(readings) != 2 or readings[0]["text"] != readings[1]["text"]
+            or _compute_box_iou(readings[0]["box"], readings[1]["box"]) <= 0.5):
+        return line
+    confirmed = min(readings, key=lambda candidate: candidate["score"])
+    # Keep the surrounding sentence and its geometry; update the word geometry
+    # too, so cursor lookups cannot retain the rejected terminal fragment.
+    return {**line, "text": line["text"].rstrip()[:-len(text)] + confirmed["text"],
+            "words": [*words[:-1], confirmed],
+            "score": min(float(line.get("score", 0)), confirmed["score"])}
+
+
 def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,
-                           min_score=MIN_SCORE, english_lettering=False) -> Dict[str, Any]:
+                           min_score=MIN_SCORE, english_lettering=False, budget=None) -> Dict[str, Any]:
+    budget = _RetryBudget() if budget is None else budget
     box = line.get("box")
-    if not box or len(box) < 4 or cv2 is None or np is None or not isinstance(img_bgr, np.ndarray):
+    if (not budget.available() or not box or len(box) < 4 or cv2 is None
+            or np is None or not isinstance(img_bgr, np.ndarray)):
         return line
     xs = [p[0] for p in box]
     ys = [p[1] for p in box]
@@ -607,52 +819,43 @@ def refine_problematic_box(img_bgr, line: Dict[str, Any], ocr_exec,
     best_cand = line
     best_eval = score_ocr_candidate(line.get("text", ""), float(line.get("score", 0.0) or 0.0))
 
+    def consider(candidates, sx=1.0, sy=1.0, spacing_margin=False):
+        nonlocal best_cand, best_eval
+        candidates = rescale_boxes_down(candidates, sx, sy)
+        candidates, _ = filter_ocr_lines(candidates, min_score)
+        for candidate in candidates:
+            _shift_box_coords(candidate, x1, y1)
+            if _compute_box_iou(box, candidate["box"]) <= 0.5:
+                continue
+            if (_refinement_loses_text(line, candidate, min_score)
+                    or _refinement_loses_text(best_cand, candidate, min_score)):
+                continue
+            value = score_ocr_candidate(candidate["text"], float(candidate["score"]))
+            same_letters = ("".join(str(line.get("text", "")).split())
+                            == "".join(candidate["text"].split()))
+            margin = 0.005 if spacing_margin and same_letters else 0.05
+            if value > best_eval + margin:
+                best_eval, best_cand = value, candidate
+
     min_ch = np.min(crop, axis=2)
 
     # Variant (b): min(R,G,B) -> negative
     neg_min = (255 - min_ch).astype(np.uint8)
     crop_neg = np.stack([neg_min, neg_min, neg_min], axis=2)
-    res_b = call_engine(ocr_exec, crop_neg, min_score)
-    lines_b = extract_lines_from_result(res_b)
-    for lb in lines_b:
-        _shift_box_coords(lb, x1, y1)
-        if _compute_box_iou(box, lb["box"]) <= 0.5:
-            continue
-        eval_b = score_ocr_candidate(lb.get("text", ""), float(lb.get("score", 0.0) or 0.0))
-        if eval_b > best_eval + 0.05:
-            best_eval = eval_b
-            best_cand = lb
+    consider(_retry_lines(ocr_exec, crop_neg, min_score, budget))
+    if not budget.available():
+        return best_cand
 
     # Variant (c): bright mask min(R,G,B) >= 220 -> black text on white
     mask_ch = np.where(min_ch >= 220, 0, 255).astype(np.uint8)
     crop_mask = np.stack([mask_ch, mask_ch, mask_ch], axis=2)
-    res_c = call_engine(ocr_exec, crop_mask, min_score)
-    lines_c = extract_lines_from_result(res_c)
-    for lc in lines_c:
-        _shift_box_coords(lc, x1, y1)
-        if _compute_box_iou(box, lc["box"]) <= 0.5:
-            continue
-        eval_c = score_ocr_candidate(lc.get("text", ""), float(lc.get("score", 0.0) or 0.0))
-        if eval_c > best_eval + 0.05:
-            best_eval = eval_c
-            best_cand = lc
+    consider(_retry_lines(ocr_exec, crop_mask, min_score, budget))
 
     if english_lettering:
         for prepared, sx, sy in lettering_variants(crop, is_condensed_lettering(line)):
-            candidates = rescale_boxes_down(
-                extract_lines_from_result(call_engine(ocr_exec, prepared, min_score)), sx, sy)
-            candidates, _ = filter_ocr_lines(candidates, min_score)
-            for candidate in candidates:
-                _shift_box_coords(candidate, x1, y1)
-                if _compute_box_iou(box, candidate["box"]) <= 0.5:
-                    continue
-                value = score_ocr_candidate(candidate["text"], candidate["score"])
-                # A spacing-only improvement cannot change the actual letters.
-                same_letters = ("".join(str(line.get("text", "")).split())
-                                == "".join(candidate["text"].split()))
-                margin = 0.005 if same_letters else 0.05
-                if value > best_eval + margin:
-                    best_eval, best_cand = value, candidate
+            if not budget.available():
+                break
+            consider(_retry_lines(ocr_exec, prepared, min_score, budget), sx, sy, spacing_margin=True)
     return best_cand
 
 
@@ -846,14 +1049,26 @@ def process_request(
         # Step 3: Targeted retry pass on problematic boxes. English lettering
         # passes are bounded and keep every word box in original coordinates.
         if np is not None and isinstance(img_bgr, np.ndarray):
+            # Deduplicate before spending the shared retry budget, retaining
+            # damaged readings for rescue. Apply text/score filters afterwards.
+            raw_lines = merge_ocr_lines([raw_lines], filter_before_merge=False)
+            # Resolve spacing evidence before spending remaining retries on
+            # lower-confidence letter readings elsewhere in a dense paragraph.
+            raw_lines.sort(key=lambda item: ("".join(item["text"].split()) !=
+                "".join(w["text"] for w in item.get("words", [])) or
+                " ".join(w["text"] for w in item.get("words", [])) == item["text"]))
             refined = []
             lettering_budget = 4
+            retry_budget = _RetryBudget()
             for item in raw_lines:
+                if base_lang == "en":
+                    item = refine_confirmed_words(img_bgr, item, ocr_exec, min_score, retry_budget)
+                    item = refine_suspicious_ending(img_bgr, item, ocr_exec, min_score, retry_budget)
                 font_retry = (base_lang == "en" and lettering_budget > 0
                               and (is_problematic_line(item) or is_condensed_lettering(item)))
-                if is_problematic_line(item) or font_retry:
+                if retry_budget.available() and (is_problematic_line(item) or font_retry):
                     item = refine_problematic_box(img_bgr, item, ocr_exec, min_score,
-                                                  english_lettering=font_retry)
+                                                  english_lettering=font_retry, budget=retry_budget)
                     lettering_budget -= int(font_retry)
                 refined.append(item)
             raw_lines = refined
@@ -863,8 +1078,10 @@ def process_request(
             if base_lang == "en" and not filter_ocr_lines(raw_lines, min_score)[0]:
                 recovered = []
                 for prepared, sx, sy in lettering_variants(img_bgr):
-                    candidates = rescale_boxes_down(extract_lines_from_result(
-                        call_engine(ocr_exec, prepared, min_score)), sx, sy)
+                    if not retry_budget.available():
+                        break
+                    candidates = rescale_boxes_down(
+                        _retry_lines(ocr_exec, prepared, min_score, retry_budget), sx, sy)
                     recovered.append(filter_ocr_lines(candidates, max(0.85, min_score))[0])
                 if len(recovered) == 2:
                     raw_lines.extend(a for a in recovered[0] if any(
@@ -875,10 +1092,14 @@ def process_request(
         kept_lines, rejected_lines = filter_ocr_lines(raw_lines, min_score)
         if use_variants or use_upscale:
             kept_lines = merge_ocr_lines([kept_lines], min_score)
+        kept_ids = {id(line) for line in kept_lines}
+        kept_lines = [align_detected_words(line) for line in kept_lines]
+        for line in kept_lines:
+            line.pop("_spacing_check", None)
+            line.pop("_word_check", None)
 
         if os.environ.get(SCREEN_TRANSLATOR_OCR_DEBUG_ENV) == "1":
             rejection_map = {id(item): reason for item, reason in rejected_lines}
-            kept_ids = {id(item) for item in kept_lines}
             debug_items = []
             for i, item in enumerate(raw_lines):
                 box = item.get("box") if isinstance(item, dict) else item[0]

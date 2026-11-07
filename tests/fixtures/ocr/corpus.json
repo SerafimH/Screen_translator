@@ -42,7 +42,8 @@
     "lines": [
       "Please wait for the next mission."
     ],
-    "max_cer": 0.15
+    "max_cer": 0.0,
+    "max_wer": 0.0
   },
   {
     "file": "small_subtitle_noisy.png",
@@ -50,7 +51,8 @@
     "lines": [
       "Please wait for the next mission."
     ],
-    "max_cer": 0.15
+    "max_cer": 0.0,
+    "max_wer": 0.0
   },
   {
     "file": "english_thin_10.png",
@@ -91,57 +93,330 @@
   {
     "file": "manga_comic.png",
     "kind": "synthetic English comic speech lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_italic.png",
     "kind": "synthetic bold italic comic lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_condensed.png",
     "kind": "synthetic horizontally compressed bold comic lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_heavy.png",
     "kind": "synthetic heavy Impact lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_outline.png",
     "kind": "synthetic white comic lettering with a black outline",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_low_contrast.png",
     "kind": "synthetic faint dark comic lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_handwritten.png",
     "kind": "synthetic English handwritten lettering",
-    "lines": ["WAIT! WE HAVE TO GET OUT OF HERE!"],
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
   },
   {
     "file": "manga_handwritten_black.png",
     "kind": "user-provided handwritten English text on a black manga panel",
-    "lines": ["D-Did he", "find out?!"],
+    "lines": [
+      "D-Did he",
+      "find out?!"
+    ],
     "max_cer": 0.0,
     "max_wer": 0.0
+  },
+  {
+    "file": "manhwa_01.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "KAYDEN!",
+      "ARE YOU ALRIGHT?!"
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "KAYDEN! ARE YOU ALRIGHT?!"
+    ]
+  },
+  {
+    "file": "manhwa_02.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "NO,",
+      "MY WHOLE",
+      "BODY HURTS",
+      "LIKE HELL."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "NO, MY WHOLE BODY HURTS LIKE HELL."
+    ]
+  },
+  {
+    "file": "manhwa_03.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "I CAN BARELY",
+      "MOVE ONE OF MY",
+      "ARMS, AND MY CORE",
+      "IS COMPLETELY",
+      "OVERLOADED..."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "I CAN BARELY MOVE ONE OF MY ARMS, AND MY CORE IS COMPLETELY OVERLOADED..."
+    ]
+  },
+  {
+    "file": "manhwa_04.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "DON'T LOOK",
+      "AT ME LIKE THAT.",
+      "I FOUGHT",
+      "TWO TOP 10'S",
+      "YOU KNOW?"
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "DON'T LOOK AT ME LIKE THAT.",
+      "I FOUGHT TWO TOP 10'S YOU KNOW?"
+    ]
+  },
+  {
+    "file": "manhwa_05.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "STILL, IF IT'S",
+      "ONLY THIS BAD,",
+      "THEN I'M FINE, SO",
+      "DON'T WORRY."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "STILL, IF IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WORRY."
+    ]
+  },
+  {
+    "file": "manhwa_06.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "I'LL HEAD",
+      "DOWN AND GET",
+      "SOME REST TO",
+      "RECOVER."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "I'LL HEAD DOWN AND GET SOME REST TO RECOVER."
+    ]
+  },
+  {
+    "file": "manhwa_07.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "I WON THIS",
+      "TIME, TOO."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "I WON THIS TIME, TOO."
+    ]
+  },
+  {
+    "file": "manhwa_08.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "JUST LIKE",
+      "YOU SAID, I HAD",
+      "A HELL OF A",
+      "FIGHT."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "JUST LIKE YOU SAID, I HAD A HELL OF A FIGHT."
+    ]
+  },
+  {
+    "file": "manhwa_09.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "IAN PATRICK",
+      "WAS ALIVE."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "IAN PATRICK WAS ALIVE."
+    ]
+  },
+  {
+    "file": "manhwa_10.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "THAT'S RIGHT.",
+      "ALTHOUGH HIS",
+      "CONDITION WASN'T",
+      "GREAT,"
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "THAT'S RIGHT. ALTHOUGH HIS CONDITION WASN'T GREAT,"
+    ]
+  },
+  {
+    "file": "manhwa_11.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "I RESCUED",
+      "HIM FROM WHERE",
+      "THEY WERE HOLDING HIM",
+      "CAPTIVE AND SENT HIM",
+      "TO VERAMONTE."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "I RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE."
+    ]
+  },
+  {
+    "file": "manhwa_12.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "THANK YOU",
+      "SO MUCH!"
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "THANK YOU SO MUCH!"
+    ]
+  },
+  {
+    "file": "manhwa_13.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "EVEN THOUGH",
+      "THE OUTCOME WAS",
+      "ALREADY DECIDED, IT",
+      "CAUGHT ME OFF GUARD",
+      "WHEN THEY RUSHED IN",
+      "LIKE THEY WANTED TO",
+      "DIE TOGETHER."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "EVEN THOUGH THE OUTCOME WAS ALREADY DECIDED, IT CAUGHT ME OFF GUARD WHEN THEY RUSHED IN LIKE THEY WANTED TO DIE TOGETHER."
+    ]
+  },
+  {
+    "file": "manhwa_14.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "HOLDING BACK",
+      "JUST BECAUSE THE",
+      "ENEMY SAID THEY",
+      "SURRENDER..."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "HOLDING BACK JUST BECAUSE THE ENEMY SAID THEY SURRENDER..."
+    ]
+  },
+  {
+    "file": "manhwa_15.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "D-Did he",
+      "find out?!"
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "D-Did he find out?!"
+    ]
+  },
+  {
+    "file": "manhwa_16.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "BUT THIS",
+      "PLACE FEELS LIKE A",
+      "COMPLETELY DIFFERENT",
+      "WORLD."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "BUT THIS PLACE FEELS LIKE A COMPLETELY DIFFERENT WORLD."
+    ]
+  },
+  {
+    "file": "manhwa_17.png",
+    "kind": "user-provided manhwa screenshot",
+    "lines": [
+      "COME TO",
+      "THINK OF IT...",
+      "KARTEIN AND",
+      "PLUTON AREN'T THE",
+      "ONLY ONES SHOWING",
+      "SIDES NO ONE COULD'VE",
+      "EVER IMAGINED."
+    ],
+    "max_cer": 0.0,
+    "max_wer": 0.0,
+    "blocks": [
+      "COME TO THINK OF IT...",
+      "KARTEIN AND PLUTON AREN'T THE ONLY ONES SHOWING SIDES NO ONE COULD'VE EVER IMAGINED."
+    ]
   }
 ]

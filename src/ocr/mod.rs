@@ -40,17 +40,19 @@ pub fn merge_recognized_lines(lines: &mut Vec<RecognizedLine>, candidates: Vec<R
             // A clipped tile edge is a duplicate only when its text is contained in
             // the other result. Otherwise keep both partial lines: either may have
             // words that the other tile did not capture.
-            let contained_text = existing_text.contains(&candidate_text)
-                || candidate_text.contains(&existing_text);
+            let contained_text = contains_word_sequence(&existing_text, &candidate_text)
+                || contains_word_sequence(&candidate_text, &existing_text);
             overlap as f64 / area_a.min(area_b) as f64 >= 0.65
                 && (contained_text || overlap as f64 / area_a.max(area_b) as f64 >= 0.85)
         });
         if let Some(existing) = duplicate {
             let existing_text = existing.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-            let candidate_is_fuller = candidate_text.len() > existing_text.len()
-                && candidate_text.contains(&existing_text);
-            let existing_is_fuller = existing_text.len() > candidate_text.len()
-                && existing_text.contains(&candidate_text);
+            let candidate_is_fuller = word_tokens(&candidate_text).len() > word_tokens(&existing_text).len()
+                && contains_word_sequence(&candidate_text, &existing_text)
+                && covers_additional_region(candidate.rect, existing.rect);
+            let existing_is_fuller = word_tokens(&existing_text).len() > word_tokens(&candidate_text).len()
+                && contains_word_sequence(&existing_text, &candidate_text)
+                && covers_additional_region(existing.rect, candidate.rect);
             // Completeness wins over the confidence of a clipped fragment. For
             // competing full readings WinRT still defaults to confidence 0.85.
             if candidate_is_fuller || (!existing_is_fuller
@@ -61,6 +63,28 @@ pub fn merge_recognized_lines(lines: &mut Vec<RecognizedLine>, candidates: Vec<R
             lines.insert(index.min(lines.len()), candidate);
         } else { lines.push(candidate); }
     }
+}
+
+fn word_tokens(text: &str) -> Vec<&str> {
+    text.split_whitespace().map(|word| word.trim_matches(|ch: char|
+        matches!(ch, '.' | ',' | '!' | '?' | ':' | ';' | '"' | '“' | '”' | '«' | '»'
+                      | '(' | ')' | '[' | ']' | '{' | '}')))
+        .filter(|word| !word.is_empty()).collect()
+}
+
+fn contains_word_sequence(full: &str, fragment: &str) -> bool {
+    let full = word_tokens(full);
+    let fragment = word_tokens(fragment);
+    !fragment.is_empty() && full.windows(fragment.len()).any(|words| words == fragment)
+}
+
+fn covers_additional_region(full: ScreenRect, fragment: ScreenRect) -> bool {
+    !full.is_empty() && !fragment.is_empty()
+        && fragment.x as i64 >= full.x as i64 - 2
+        && fragment.y as i64 >= full.y as i64 - 2
+        && fragment.x as i64 + fragment.width as i64 <= full.x as i64 + full.width as i64 + 2
+        && fragment.y as i64 + fragment.height as i64 <= full.y as i64 + full.height as i64 + 2
+        && full.width as f64 * full.height as f64 > fragment.width as f64 * fragment.height as f64 * 1.03
 }
 
 fn strong_line_covers_unscored(strong: &RecognizedLine, unscored: &RecognizedLine) -> bool {
@@ -1168,15 +1192,15 @@ pub fn cluster_lines_into_blocks(
                 && center_distance >= min_h / 2;
 
             if (v_gap >= -6 || overlapping_baselines) && v_gap <= (avg_line_h * 1.45) as i32 {
-                let x_overlap = line.rect.x.max(block.rect.x)
-                    <= (line.rect.x + line.rect.width).min(block.rect.x + block.rect.width);
-                let left_aligned = (line.rect.x - block.rect.x).abs() <= 50;
-                let center_aligned = ((line.rect.x + line.rect.width / 2)
-                    - (block.rect.x + block.rect.width / 2))
-                    .abs()
-                    <= 60;
+                // Require overlap of at least 30% of the narrower adjacent
+                // line. Fixed alignment tolerances joined short diagonal
+                // labels; the block's union could also bridge separate columns.
+                let overlap = ((line.rect.x as i64 + line.rect.width as i64)
+                    .min(previous.rect.x as i64 + previous.rect.width as i64)
+                    - line.rect.x.max(previous.rect.x) as i64).max(0);
+                let min_width = line.rect.width.min(previous.rect.width).max(1) as i64;
 
-                if x_overlap || left_aligned || center_aligned {
+                if overlap * 10 >= min_width * 3 {
                     block.rect = block.rect.union(&line.rect);
 
                     // A visible hyphen may belong to a compound or stutter.
@@ -1233,6 +1257,26 @@ mod tests {
         assert_eq!(lines[0].text, "Corrected");
         assert_eq!(lines[1].text, "Missing dialogue");
         assert_eq!(lines[0].confidence, Some(0.99));
+    }
+
+    #[test]
+    fn merge_does_not_expand_a_short_word_based_on_substring_or_extra_characters() {
+        let line = |text: &str, rect, confidence| RecognizedLine {
+            text: text.into(), rect, confidence: Some(confidence), words: vec![],
+        };
+        let rect = ScreenRect::new(10, 10, 100, 20);
+        for (short, longer) in [("IN", "BEGINNER"), ("HE", "THE"), ("GO", "GOLD")] {
+            for (first, second) in [(line(short, rect, 0.99), line(longer, rect, 0.91)),
+                                   (line(longer, rect, 0.91), line(short, rect, 0.99))] {
+                let mut lines = vec![first];
+                merge_recognized_lines(&mut lines, vec![second]);
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].text, short);
+            }
+        }
+        let mut lines = vec![line("OPEN THE DOOR", rect, 0.99)];
+        merge_recognized_lines(&mut lines, vec![line("DO NOT OPEN THE DOOR", rect, 0.8)]);
+        assert_eq!(lines[0].text, "OPEN THE DOOR", "extra text without additional image coverage is not proof");
     }
 
     #[test]
@@ -1437,6 +1481,63 @@ mod tests {
             line("Other bubble", ScreenRect::new(500, 126, 214, 65)),
         ], None);
         assert_eq!(other_panel.len(), 2, "nearby panels must remain separate");
+    }
+
+    #[test]
+    fn test_cluster_keeps_diagonal_and_barely_overlapping_labels_separate() {
+        for (upper_x, lower_x) in [(20, 65), (65, 20), (20, 50), (20, 45), (45, 20)] {
+            for (offset_x, offset_y) in [(0, 0), (-300, 500)] {
+                let upper = RecognizedLine {
+                    text: "YES".into(), confidence: Some(0.99), words: vec![],
+                    rect: ScreenRect::new(offset_x + upper_x, offset_y + 20, 30, 20),
+                };
+                let lower = RecognizedLine {
+                    text: "NO".into(), confidence: Some(0.99), words: vec![],
+                    rect: ScreenRect::new(offset_x + lower_x, offset_y + 48, 30, 20),
+                };
+                let pixels = vec![255; 120 * 100 * 4];
+                for reversed in [false, true] {
+                    let lines = if reversed { vec![lower.clone(), upper.clone()] }
+                        else { vec![upper.clone(), lower.clone()] };
+                    let blocks = cluster_lines_into_blocks(lines,
+                        Some((&pixels, 120, 100, offset_x, offset_y)));
+                    assert_eq!(blocks.len(), 2, "labels at {upper_x}/{lower_x} must stay separate");
+                    assert_eq!(blocks[0].text, "YES");
+                    assert_eq!(blocks[0].rect, upper.rect);
+                    assert_eq!(blocks[1].text, "NO");
+                    assert_eq!(blocks[1].rect, lower.rect);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cluster_matches_the_previous_line_without_bridging_through_block_bounds() {
+        let line = |text: &str, x, y, width| RecognizedLine {
+            text: text.into(), rect: ScreenRect::new(x, y, width, 20),
+            confidence: None, words: vec![],
+        };
+        let blocks = cluster_lines_into_blocks(vec![
+            line("A long dialogue line", 10, 20, 180),
+            line("continues", 10, 48, 30),
+            line("Other label", 160, 76, 30),
+        ], None);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "A long dialogue line continues");
+        assert_eq!(blocks[0].lines.len(), 2);
+        assert_eq!(blocks[1].text, "Other label");
+
+        // Centred and indented paragraph lines still overlap the narrower line.
+        for middle_x in [20, 90, 140] {
+            let blocks = cluster_lines_into_blocks(vec![
+                line("A long dialogue line", 20, 20, 180),
+                line("continues", middle_x, 48, 40),
+                line("and finishes here", 30, 76, 160),
+            ], None);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, "A long dialogue line continues and finishes here");
+            assert_eq!(blocks[0].lines.len(), 3);
+        }
     }
 
     #[test]

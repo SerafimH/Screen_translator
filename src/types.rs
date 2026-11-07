@@ -325,7 +325,17 @@ pub fn cursor_word_spelling(raw: &str) -> Option<String> {
 }
 
 pub fn cursor_word_key(raw: &str) -> Option<String> {
-    cursor_word_spelling(raw).map(|word| word.to_lowercase())
+    cursor_word_spelling(raw).or_else(|| cursor_lookup_token(raw).map(|word|
+        word.replace(['’', '‘', 'ʼ'], "'"))).map(|word| word.to_lowercase())
+}
+
+/// Numeric labels may select their paragraph even though they are not dictionary words.
+pub fn cursor_lookup_token(raw: &str) -> Option<&str> {
+    let token = raw.trim().trim_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | ':' | ';' | '(' | ')' | '"'));
+    let digits = token.strip_suffix("'s").or_else(|| token.strip_suffix("'S"))
+        .or_else(|| token.strip_suffix("’s")).or_else(|| token.strip_suffix("’S")).unwrap_or(token);
+    if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) { Some(token) }
+    else { cursor_word_token(raw) }
 }
 
 /// Keeps only the observed token; nearby line text cannot expand a short reading.
@@ -393,7 +403,7 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
         word_confidence: word.confidence,
         word_is_estimated: word.is_estimated,
         line_rect: line.rect,
-        word_text: cursor_word_token(&word.text).map(str::to_owned),
+        word_text: cursor_lookup_token(&word.text).map(str::to_owned),
         word_rect: Some(word.rect),
         sentence_text,
         sentence_rect,

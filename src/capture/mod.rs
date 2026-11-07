@@ -1,4 +1,5 @@
 use std::os::windows::io::AsRawHandle;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -112,6 +113,7 @@ pub struct FrameSignature {
     edges: Vec<u64>,
     text_mask: Vec<u64>,
     dimensions: (u32, u32),
+    pixels_hash: u64,
 }
 
 impl Default for FrameSignature {
@@ -121,6 +123,7 @@ impl Default for FrameSignature {
             edges: Vec::new(),
             text_mask: Vec::new(),
             dimensions: (0, 0),
+            pixels_hash: 0,
         }
     }
 }
@@ -180,7 +183,13 @@ impl FrameSignature {
             }
         }
 
-        Self { luma, edges, text_mask: Vec::new(), dimensions: (width, height) }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bgra.hash(&mut hasher);
+        Self { luma, edges, text_mask: Vec::new(), dimensions: (width, height), pixels_hash: hasher.finish() }
+    }
+
+    pub fn same_pixels_as(&self, other: &Self) -> bool {
+        self.dimensions == other.dimensions && self.pixels_hash == other.pixels_hash
     }
 
     /// Scope fine changes to known text. Outside animation still uses the

@@ -15,8 +15,10 @@ use crate::overlay::{AppEvent, OverlayHandle, OverlayManager};
 use crate::translator::TranslatorService;
 use crate::types::{
     AppConfig, OcrBlock, OcrMode, ScreenRect, TextUnderCursor, TranslationBlock,
-    cursor_word_key, cursor_word_token, find_text_under_cursor,
+    cursor_word_key, cursor_lookup_token, find_text_under_cursor,
 };
+#[cfg(test)]
+use crate::types::cursor_word_token;
 
 /// RAII Guard that ensures `is_processing` is unconditionally reset to false upon completion or error.
 #[derive(Debug)]
@@ -72,6 +74,7 @@ struct AppState {
     auto_mode: Arc<AtomicBool>,
     is_processing: Arc<AtomicBool>,
     last_signature: Arc<Mutex<Option<FrameSignature>>>,
+    last_scene_content: Arc<Mutex<Vec<(String, ScreenRect)>>>,
     current_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -123,6 +126,7 @@ impl App {
             auto_mode: Arc::new(AtomicBool::new(false)),
             is_processing: Arc::new(AtomicBool::new(false)),
             last_signature: Arc::new(Mutex::new(None)),
+            last_scene_content: Arc::new(Mutex::new(Vec::new())),
             current_task: Arc::new(Mutex::new(None)),
         };
 
@@ -144,6 +148,7 @@ impl App {
             };
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
+            let mut last_scan = None;
 
             loop {
                 interval.tick().await;
@@ -183,7 +188,9 @@ impl App {
                         .unwrap_or_else(|e| e.into_inner());
                     if let Some(prev) = last_sig_lock.as_ref() {
                         sig.inherit_text_regions(prev);
-                        if !sig.has_changed(prev) { continue; }
+                    }
+                    if !auto_frame_needs_ocr(&sig, last_sig_lock.as_ref(), last_scan, Instant::now()) {
+                        continue;
                     }
                 }
 
@@ -197,6 +204,7 @@ impl App {
                     || !auto_state.translator.automatic_retry_ready()
                     || *auto_state.active_roi.lock().unwrap_or_else(|e| e.into_inner()) != current_roi
                 { continue; }
+                last_scan = Some(Instant::now());
                 auto_state.dispatch_translation_task(Some(stable));
             }
         });
@@ -386,32 +394,27 @@ pub fn spawn_cancellable_task<Fut>(task_slot: &Arc<Mutex<Option<JoinHandle<()>>>
 where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let prev = {
-        let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
-        slot_lock.take()
-    };
+    // Keep cancellation and replacement atomic with Clear/provider switches.
+    // Tokio never polls a spawned future synchronously, so the new task may
+    // safely access this mutex after spawn returns and the guard is released.
+    let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = slot_lock.take();
+    #[cfg(test)]
+    tests::after_dispatch_slot_taken();
     if let Some(prev) = &prev {
         prev.abort();
     }
 
-    let handle = tokio::spawn(async move {
+    *slot_lock = Some(tokio::spawn(async move {
         if let Some(prev) = prev {
             let _ = prev.await;
         }
         fut.await;
-    });
-
-    let mut slot_lock = task_slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(newer) = slot_lock.take() {
-        handle.abort();
-        *slot_lock = Some(newer);
-    } else {
-        *slot_lock = Some(handle);
-    }
+    }));
 }
 
 pub const CURSOR_CAPTURE_WIDTH: i32 = 1000;
-pub const CURSOR_CAPTURE_HEIGHT: i32 = 360;
+pub const CURSOR_CAPTURE_HEIGHT: i32 = 800;
 
 pub fn cursor_capture_roi(
     pt: POINT,
@@ -534,7 +537,8 @@ impl AppState {
             .clone();
 
         // If an active ROI was manually selected and contains the cursor, capture that ROI;
-        // otherwise, capture a focused region (800x240) centered on the cursor clamped to virtual screen coordinates.
+        // Otherwise capture enough vertical context for a complete manhwa
+        // paragraph (1000x800), clamped to the current monitor's bounds.
         let active = *self.active_roi.lock().unwrap_or_else(|e| e.into_inner());
         let (vx, vy, vw, vh, primary_w, primary_h) = unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{
@@ -625,7 +629,7 @@ impl AppState {
             .then_some(target.sentence_text.as_str());
         let sentence_fut = async {
             if let Some(context) = context {
-                self.translator.translate_context(context, &cfg.source_lang, &cfg.target_lang, &cfg).await.ok()
+                self.translator.translate_context_in_scene(context, &blocks, &cfg).await.ok()
             } else { None }
         };
         let (details, sentence_translation) = tokio::join!(details_fut, sentence_fut);
@@ -662,6 +666,11 @@ impl AppState {
         if !cursor_is_still_on_target(&target) {
             info!("Cursor left the verified word or Shift was released, skipping card display.");
             self.overlay.set_loading(false, Some("Готов".to_string()));
+            return;
+        }
+        if !cursor_image_is_current(&frame, &target).await || !cursor_is_still_on_target(&target) {
+            self.overlay.clear_cursor_card();
+            self.overlay.set_loading(false, Some("Текст под курсором изменился. Повторите Shift.".to_string()));
             return;
         }
 
@@ -716,7 +725,21 @@ impl AppState {
                 }
             }
         }
-        choose_cursor_target_from_readings(&initial, &readings, &helper_readings, cfg.helper_min_score)
+        let confirmed = choose_cursor_target_from_readings(&initial, &readings, &helper_readings, cfg.helper_min_score);
+        if confirmed.is_some() { return confirmed; }
+        // A numeric label can be damaged by neighbouring letters in a line
+        // crop. Confirm its actual pixels independently with two word crops.
+        if initial.raw_word.as_ref().is_some_and(|word| word.chars().any(|ch| ch.is_ascii_digit()))
+            && let Some(rect) = initial.word_rect {
+            let mut words = Vec::new();
+            for padding in [4, 8] {
+                let crop = crop_frame(frame, cursor_line_crop_with_padding(frame, rect, padding)?).ok()?;
+                let blocks = self.helper_ocr.recognize(&crop, &cfg.ocr_lang).await.ok()?;
+                words.push(find_text_under_cursor(&blocks, pt.x, pt.y));
+            }
+            return choose_cursor_target_from_readings(&initial, &[], &words, cfg.helper_min_score);
+        }
+        None
     }
 
     fn dispatch_translation_task(&self, prefetched_frame: Option<CapturedFrame>) {
@@ -745,6 +768,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        let automatic = prefetched_frame.is_some();
         let frame = match prefetched_frame {
             Some(f) => f,
             None => {
@@ -780,6 +804,8 @@ impl AppState {
             frame.width, frame.height, cfg.ocr_engine
         );
         let mut sig = FrameSignature::from_bgra(&frame.bgra_bytes, frame.width, frame.height);
+        let scene_changed = self.last_signature.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().is_none_or(|previous| sig.has_changed(previous));
 
         let (blocks, raw_json) = match self.perform_ocr(&frame, &cfg).await {
             Ok(res) => res,
@@ -826,6 +852,8 @@ impl AppState {
                             elapsed
                         );
                         info!("{}", status);
+                        *self.last_scene_content.lock().unwrap_or_else(|e| e.into_inner()) = vision_blocks.iter()
+                            .map(|block| (block.original_text.clone(), block.rect)).collect();
                         *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
                         self.overlay.update_blocks(vision_blocks, Some(status));
                         return;
@@ -853,6 +881,7 @@ impl AppState {
                 format!("Текст не найден ({} мс)", elapsed)
             };
             *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if vision_error.is_some() { None } else { Some(sig) };
+            self.last_scene_content.lock().unwrap_or_else(|e| e.into_inner()).clear();
             self.overlay.update_blocks(Vec::new(), Some(status));
             return;
         }
@@ -861,6 +890,15 @@ impl AppState {
             .into_iter()
             .filter(|b| !is_ocr_garbage(&b.text))
             .collect();
+        let content = valid_blocks.iter().map(|block| (block.text.clone(), block.rect)).collect::<Vec<_>>();
+        if automatic && !scene_changed
+            && same_scene_content(&content, &self.last_scene_content.lock().unwrap_or_else(|e| e.into_inner())) {
+            // Periodic OCR can observe background animation without a new
+            // utterance. Refresh detection, keeping dialogue history untouched.
+            *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+            self.overlay.set_loading(false, Some("Текст не изменился".to_string()));
+            return;
+        }
 
         self.overlay.set_loading(
             true,
@@ -890,6 +928,9 @@ impl AppState {
         info!("{}", status);
 
         *self.last_signature.lock().unwrap_or_else(|e| e.into_inner()) = if all_succeeded { Some(sig) } else { None };
+        if all_succeeded {
+            *self.last_scene_content.lock().unwrap_or_else(|e| e.into_inner()) = content;
+        }
 
         self.overlay.update_blocks(translations, Some(status));
     }
@@ -957,14 +998,34 @@ impl AppState {
                 let mut lines = Vec::new();
                 let mut native_error = None;
                 if let Some(ocr) = &self.ocr {
-                    match ocr.recognize(frame).await {
-                        Ok(blocks) => lines.extend(blocks.into_iter().flat_map(|b| b.lines)),
+                    // Compare independent raw pixels with RapidOCR. Aggressive
+                    // native mask passes can mistake portrait hatching for text.
+                    match ocr.recognize_raw(frame).await {
+                        Ok(native_lines) => lines.extend(native_lines),
                         Err(e) => native_error = Some(e),
                     }
                 }
                 match self.helper_ocr.recognize_raw_lines_with_raw(frame, &cfg.ocr_lang).await {
                     Ok((helper_lines, raw)) => {
-                        merge_recognized_lines(&mut lines, helper_lines);
+                        let native_lines = lines;
+                        let mut lines = helper_lines;
+                        // Native OCR may localise text RapidOCR missed, but an
+                        // unscored portrait artefact is not an independent line.
+                        // Use unmatched native locations as crop hints and keep
+                        // the independently recognised crop, not the guess.
+                        for native in native_lines.into_iter().filter(|native| !native.rect.is_empty()).take(8) {
+                            let overlaps = lines.iter().any(|line| {
+                                let a = native.rect; let b = line.rect;
+                                a.x < b.x + b.width && b.x < a.x + a.width
+                                    && a.y < b.y + b.height && b.y < a.y + a.height
+                            });
+                            if overlaps { continue; }
+                            if let Some(rect) = cursor_line_crop_with_padding(frame, native.rect, 8)
+                                && let Ok(crop) = crop_frame(frame, rect)
+                                && let Ok(candidates) = self.helper_ocr.recognize_raw_lines(&crop, &cfg.ocr_lang).await {
+                                merge_recognized_lines(&mut lines, candidates);
+                            }
+                        }
                         Ok((cluster_lines_into_blocks(lines, Some((&frame.bgra_bytes, frame.width,
                             frame.height, frame.offset_x, frame.offset_y))), raw))
                     }
@@ -978,6 +1039,73 @@ impl AppState {
             }
         }
     }
+}
+
+const AUTO_CONTROL_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn auto_frame_needs_ocr(
+    current: &FrameSignature, previous: Option<&FrameSignature>,
+    last_scan: Option<Instant>, now: Instant,
+) -> bool {
+    let Some(previous) = previous else { return true; };
+    current.has_changed(previous) || (!current.same_pixels_as(previous)
+        && last_scan.is_none_or(|last| now.saturating_duration_since(last) >= AUTO_CONTROL_SCAN_INTERVAL))
+}
+
+fn same_scene_content(current: &[(String, ScreenRect)], previous: &[(String, ScreenRect)]) -> bool {
+    current.len() == previous.len() && current.iter().zip(previous).all(|((text, rect), (old_text, old_rect))|
+        text == old_text && [(rect.x, old_rect.x), (rect.y, old_rect.y),
+                            (rect.width, old_rect.width), (rect.height, old_rect.height)]
+            .iter().all(|&(a, b)| (a as i64 - b as i64).abs() <= 2))
+}
+
+async fn cursor_image_is_current(frame: &CapturedFrame, target: &TextUnderCursor) -> bool {
+    let Some(rect) = cursor_line_crop_with_padding(frame, target.sentence_rect, 3) else { return false; };
+    let Ok(original) = crop_frame(frame, rect) else { return false; };
+    let roi = ScreenRect::new(original.offset_x, original.offset_y, original.width as i32, original.height as i32);
+    let fresh = tokio::task::spawn_blocking(move || ScreenCapture::capture_primary(Some(roi))).await;
+    match fresh {
+        Ok(Ok(fresh)) => cursor_snapshots_match(&original, &fresh, target.word_rect),
+        _ => false,
+    }
+}
+
+fn cursor_snapshots_match(original: &CapturedFrame, fresh: &CapturedFrame, word_rect: Option<ScreenRect>) -> bool {
+    if !cursor_pixels_match(original, fresh) { return false; }
+    let Some(word_rect) = word_rect else { return false; };
+    let Some(old_crop) = cursor_line_crop_with_padding(original, word_rect, 1) else { return false; };
+    let Some(new_crop) = cursor_line_crop_with_padding(fresh, word_rect, 1) else { return false; };
+    match (crop_frame(original, old_crop), crop_frame(fresh, new_crop)) {
+        (Ok(old_word), Ok(new_word)) => cursor_pixels_match(&old_word, &new_word),
+        _ => false,
+    }
+}
+
+fn cursor_pixels_match(original: &CapturedFrame, fresh: &CapturedFrame) -> bool {
+    if (original.width, original.height, original.offset_x, original.offset_y)
+        != (fresh.width, fresh.height, fresh.offset_x, fresh.offset_y)
+        || original.width == 0 || original.height == 0 {
+        return false;
+    }
+    let pixels = original.width as usize * original.height as usize;
+    if original.bgra_bytes.len() != pixels * 4 || fresh.bgra_bytes.len() != pixels * 4 { return false; }
+    let mut sums = [[0i64; 3]; 2];
+    let mut minimum = 255u8;
+    let mut maximum = 0u8;
+    for (old, new) in original.bgra_bytes.chunks_exact(4).zip(fresh.bgra_bytes.chunks_exact(4)) {
+        for channel in 0..3 {
+            sums[0][channel] += old[channel] as i64;
+            sums[1][channel] += new[channel] as i64;
+            minimum = minimum.min(old[channel]);
+            maximum = maximum.max(old[channel]);
+        }
+    }
+    let shift = std::array::from_fn::<_, 3, _>(|channel| (sums[1][channel] - sums[0][channel]) / pixels as i64);
+    let tolerance = if maximum - minimum <= 24 { 1 } else { 12 };
+    let changed = original.bgra_bytes.chunks_exact(4).zip(fresh.bgra_bytes.chunks_exact(4))
+        .filter(|(old, new)| (0..3).any(|channel|
+            (new[channel] as i64 - old[channel] as i64 - shift[channel]).abs() > tolerance)).count();
+    changed <= (pixels / 200).max(3)
 }
 
 /// A line-sized crop retains complete words while excluding unrelated paragraphs.
@@ -1010,7 +1138,7 @@ fn reliable_cursor_token(target: &TextUnderCursor, min_score: f32) -> Option<&st
     if target.word_confidence.is_some_and(|score| !score.is_finite() || score > 1.0 || score < min_score.max(0.8)) {
         return None;
     }
-    cursor_word_token(target.raw_word.as_deref()?)
+    cursor_lookup_token(target.raw_word.as_deref()?)
 }
 
 /// Agreement is required; a score cannot resolve conflicting crop readings.
@@ -1100,6 +1228,130 @@ fn translation_status(block_count: usize, elapsed_ms: u128, errors: &[String], r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static DISPATCH_SLOT_TAKEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn after_dispatch_slot_taken() {
+        let hook = DISPATCH_SLOT_TAKEN.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook { hook(); }
+    }
+
+    #[tokio::test]
+    async fn cancellation_cannot_miss_a_task_during_dispatch() {
+        let slot = Arc::new(Mutex::new(None));
+        let committed = Arc::new(AtomicBool::new(false));
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let dispatcher_slot = slot.clone();
+        let dispatcher_commit = committed.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let dispatcher = std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            DISPATCH_SLOT_TAKEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                }));
+            });
+            spawn_cancellable_task(&dispatcher_slot, async move {
+                if finish_rx.await.is_ok() {
+                    dispatcher_commit.store(true, Ordering::SeqCst);
+                }
+            });
+        });
+        paused_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Clear/provider-switch cancellation must wait until the replacement
+        // handle is installed, rather than observe a temporarily empty slot.
+        let slot_locked = matches!(slot.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+        resume_tx.send(()).unwrap();
+        dispatcher.join().unwrap();
+        let task = slot.lock().unwrap().take().unwrap();
+        task.abort();
+        let _ = finish_tx.send(());
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(slot_locked, "dispatch exposed an empty task slot to cancellation");
+    }
+
+    #[test]
+    fn auto_control_scan_recovers_changes_that_fine_and_coarse_detection_miss() {
+        let load = |name| {
+            let image = image::open(format!("tests/fixtures/capture/dialogue_{name}.png")).unwrap().to_rgba8();
+            let (width, height) = image.dimensions();
+            let mut pixels = image.into_raw();
+            for pixel in pixels.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] { *channel = 202 + (*channel as u16 * 3 / 255) as u8; }
+            }
+            FrameSignature::from_bgra(&pixels, width, height)
+        };
+        let mut yes = load("yes");
+        yes.set_text_regions([ScreenRect::new(790, 645, 100, 65)], 0, 0);
+        let no = load("no");
+        assert!(!no.has_changed(&yes), "this regression deliberately uses faint lettering");
+        let start = Instant::now();
+        assert!(!auto_frame_needs_ocr(&no, Some(&yes), Some(start), start + std::time::Duration::from_secs(1)));
+        assert!(auto_frame_needs_ocr(&no, Some(&yes), Some(start), start + AUTO_CONTROL_SCAN_INTERVAL));
+        assert!(!auto_frame_needs_ocr(&yes, Some(&yes), Some(start), start + AUTO_CONTROL_SCAN_INTERVAL));
+        let mut blank = FrameSignature::from_bgra(&vec![205u8; 1920 * 1080 * 4], 1920, 1080);
+        blank.set_text_regions([], 0, 0);
+        assert!(!yes.has_changed(&blank));
+        assert!(auto_frame_needs_ocr(&yes, Some(&blank), Some(start), start + AUTO_CONTROL_SCAN_INTERVAL));
+    }
+
+    #[test]
+    fn cursor_snapshot_rejects_changed_word_even_when_cursor_coordinates_stay_the_same() {
+        for (background, ink) in [(255u8, 0u8), (205, 202)] {
+            let mut original = CapturedFrame {
+                width: 50, height: 20, offset_x: -900, offset_y: 200,
+                bgra_bytes: vec![background; 50 * 20 * 4],
+            };
+            for y in 5..15 {
+                for x in 10..15 {
+                    original.bgra_bytes[(y * 50 + x) * 4..(y * 50 + x) * 4 + 3].fill(ink);
+                }
+            }
+            assert!(cursor_pixels_match(&original, &original.clone()));
+            let mut changed = original.clone();
+            for y in 5..15 {
+                changed.bgra_bytes[(y * 50 + 20) * 4..(y * 50 + 20) * 4 + 3].fill(ink);
+            }
+            assert!(!cursor_pixels_match(&original, &changed));
+            let mut illumination = original.clone();
+            for pixel in illumination.bgra_bytes.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] { *channel = channel.saturating_sub(2); }
+                pixel[3] = 0; // capture backends need not agree about alpha
+            }
+            assert!(cursor_pixels_match(&original, &illumination));
+            illumination.offset_x += 1;
+            assert!(!cursor_pixels_match(&original, &illumination));
+        }
+    }
+
+    #[test]
+    fn cursor_word_change_cannot_hide_in_a_large_unchanged_paragraph() {
+        let mut original = CapturedFrame {
+            width: 600, height: 200, offset_x: -900, offset_y: 200,
+            bgra_bytes: vec![255; 600 * 200 * 4],
+        };
+        for y in 20..30 {
+            for x in 20..30 {
+                original.bgra_bytes[(y * 600 + x) * 4..(y * 600 + x) * 4 + 3].fill(0);
+            }
+        }
+        let mut fresh = original.clone();
+        for y in 20..30 {
+            fresh.bgra_bytes[(y * 600 + 35) * 4..(y * 600 + 35) * 4 + 3].fill(0);
+        }
+        assert!(cursor_pixels_match(&original, &fresh), "a paragraph-wide ratio alone misses a short word");
+        let word = Some(ScreenRect::new(-885, 215, 30, 25));
+        assert!(cursor_snapshots_match(&original, &original.clone(), word));
+        assert!(!cursor_snapshots_match(&original, &fresh, word));
+    }
 
     fn cursor_reading(raw: &str, confidence: Option<f32>, estimated: bool) -> TextUnderCursor {
         let rect = ScreenRect::new(100, 100, 80, 20);
@@ -1267,6 +1519,7 @@ mod tests {
             ocr: None, helper_ocr: helper, translator: Arc::new(TranslatorService::new()),
             active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
             is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            last_scene_content: Arc::new(Mutex::new(Vec::new())),
             current_task: Arc::new(Mutex::new(None)),
         };
         let cfg = config.lock().unwrap().clone();
@@ -1301,6 +1554,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supplied_manhwa_auto_roi_and_shift_preserve_complete_dialogue() {
+        use crate::overlay::OverlaySharedState;
+        use windows::Win32::Foundation::HWND;
+        let config = Arc::new(Mutex::new(AppConfig {
+            ocr_engine: OcrMode::Auto, helper_timeout_ms: 15_000, ..AppConfig::default()
+        }));
+        let helper = OcrHelperClient::new(config.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !helper.is_ready() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+        }).await.expect("manhwa helper must initialize");
+        let state = AppState {
+            config: config.clone(), overlay: OverlayHandle { hwnd: HWND(std::ptr::null_mut()),
+                shared_state: Arc::new(Mutex::new(OverlaySharedState::default())) },
+            ocr: WinrtOcrEngine::new("en").ok().map(Arc::new), helper_ocr: helper,
+            translator: Arc::new(TranslatorService::new()), active_roi: Arc::new(Mutex::new(None)),
+            auto_mode: Arc::new(AtomicBool::new(false)), is_processing: Arc::new(AtomicBool::new(false)),
+            last_signature: Arc::new(Mutex::new(None)), last_scene_content: Arc::new(Mutex::new(vec![])),
+            current_task: Arc::new(Mutex::new(None)),
+        };
+        let cfg = config.lock().unwrap().clone();
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/ocr/corpus.json")).unwrap();
+        let normalize = |text: &str| text.replace(['’', '‘', 'ʼ'], "'").replace('…', "...")
+            .split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for case in cases.as_array().unwrap().iter().filter(|case| case["file"].as_str().unwrap().starts_with("manhwa_")) {
+            let file = case["file"].as_str().unwrap();
+            let image = image::open(format!("tests/fixtures/ocr/{file}")).unwrap().to_rgba8();
+            let (width, height) = image.dimensions();
+            let mut pixels = image.into_raw();
+            for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); }
+            let frame = CapturedFrame { width, height, bgra_bytes: pixels, offset_x: -400, offset_y: 200 };
+            let (blocks, _) = state.perform_ocr(&frame, &cfg).await.unwrap();
+            let expected = case["blocks"].as_array().unwrap().iter().map(|text| text.as_str().unwrap()).collect::<Vec<_>>();
+            if blocks.len() != expected.len() {
+                failures.push(format!("{file}: {} paragraphs instead of {}: {:?}", blocks.len(), expected.len(), blocks.iter().map(|b| &b.text).collect::<Vec<_>>()));
+            }
+            for (block, expected) in blocks.iter().zip(expected) {
+                if normalize(&block.text) != normalize(expected) { failures.push(format!("{file} Auto: {} != {expected}", block.text)); }
+                let rect = cursor_line_crop_with_padding(&frame, block.rect, 30).unwrap();
+                let roi = crop_frame(&frame, rect).unwrap();
+                let (roi_blocks, _) = state.perform_ocr(&roi, &cfg).await.unwrap();
+                let roi_text = roi_blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(" ");
+                if normalize(&roi_text) != normalize(expected) { failures.push(format!("{file} ROI {:?}: {roi_text} != {expected}", rect)); }
+                let words = block.lines.iter().flat_map(|line| &line.words).collect::<Vec<_>>();
+                let mut selected = vec![0, words.len().saturating_sub(1)];
+                selected.extend(words.iter().enumerate().filter_map(|(i, word)|
+                    word.text.chars().any(|ch| ch.is_ascii_digit()).then_some(i)));
+                selected.sort_unstable(); selected.dedup();
+                for index in selected {
+                    let Some(word) = words.get(index) else { failures.push(format!("{file}: no cursor words")); continue; };
+                    let pt = POINT { x: word.rect.x + word.rect.width / 2, y: word.rect.y + word.rect.height / 2 };
+                    let capture = cursor_capture_roi(pt, None, frame.offset_x - 100, frame.offset_y - 100,
+                        frame.offset_x + 1920, frame.offset_y + 1080);
+                    if !capture.contains(block.rect.x, block.rect.y)
+                        || !capture.contains(block.rect.x + block.rect.width - 1, block.rect.y + block.rect.height - 1) {
+                        failures.push(format!("{file} Shift capture clips the paragraph at {}", word.text));
+                    }
+                    let initial = find_text_under_cursor(&blocks, pt.x, pt.y);
+                    let confirmed = state.verify_cursor_target(&frame, &cfg, initial, pt).await;
+                    if !confirmed.as_ref().is_some_and(|target| normalize(&target.sentence_text) == normalize(expected)) {
+                        failures.push(format!("{file} Shift {}: {:?}", word.text, confirmed));
+                    }
+                }
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 17);
+        std::fs::write("target/manhwa-pipeline-errors.json", serde_json::to_string_pretty(&failures).unwrap()).unwrap();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
     async fn handwritten_black_panel_preserves_sentence_and_confirms_each_cursor_word() {
         use crate::overlay::OverlaySharedState;
         use windows::Win32::Foundation::HWND;
@@ -1323,6 +1649,7 @@ mod tests {
             translator: Arc::new(TranslatorService::new()),
             active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
             is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            last_scene_content: Arc::new(Mutex::new(Vec::new())),
             current_task: Arc::new(Mutex::new(None)),
         };
         let (blocks, _) = state.perform_ocr(&frame, &cfg).await.unwrap();
@@ -1336,6 +1663,15 @@ mod tests {
         }
         assert_eq!(blocks.len(), 1, "one utterance must be translated together: {blocks:?}");
         assert_eq!(blocks[0].text, "D-Did he find out?!");
+        state.translator.context().record_translation("Previous real dialogue".into(), "Предыдущая реплика".into());
+        let history = state.translator.context().get_recent_history();
+        let mut signature = FrameSignature::from_bgra(&frame.bgra_bytes, width, height);
+        signature.set_text_regions(blocks.iter().flat_map(|block| block.lines.iter().map(|line| line.rect)), 0, 0);
+        *state.last_signature.lock().unwrap() = Some(signature);
+        *state.last_scene_content.lock().unwrap() = blocks.iter().map(|block| (block.text.clone(), block.rect)).collect();
+        state.perform_translation(Some(frame.clone())).await;
+        assert_eq!(state.translator.context().get_recent_history(), history,
+                   "a control OCR scan of unchanged dialogue must not enter history again");
     }
 
     #[tokio::test]
@@ -1370,6 +1706,7 @@ mod tests {
             ocr: None, helper_ocr: OcrHelperClient::new(config), translator: Arc::new(TranslatorService::new()),
             active_roi: Arc::new(Mutex::new(None)), auto_mode: Arc::new(AtomicBool::new(false)),
             is_processing: Arc::new(AtomicBool::new(false)), last_signature: Arc::new(Mutex::new(None)),
+            last_scene_content: Arc::new(Mutex::new(Vec::new())),
             current_task: Arc::new(Mutex::new(None)),
         };
         let frame = CapturedFrame { width: 40, height: 40, bgra_bytes: vec![255; 40 * 40 * 4], offset_x: 0, offset_y: 0 };
@@ -1664,33 +2001,44 @@ mod tests {
     }
 
     #[test]
+    fn cursor_capture_keeps_a_tall_manhwa_paragraph_from_its_first_and_last_lines() {
+        let paragraph = ScreenRect::new(154, 348, 488, 279);
+        for pt in [POINT { x: 300, y: 370 }, POINT { x: 400, y: 605 }] {
+            let capture = cursor_capture_roi(pt, None, 0, 0, 1920, 1080);
+            assert!(capture.contains(paragraph.x, paragraph.y));
+            assert!(capture.contains(paragraph.x + paragraph.width - 1,
+                paragraph.y + paragraph.height - 1), "cursor capture truncated the utterance: {capture:?}");
+        }
+    }
+
+    #[test]
     fn test_cursor_capture_roi_multi_monitor_bounds() {
         // Primary monitor: pt=(500, 300), min=(0, 0), max=(1920, 1080)
         let pt_primary = POINT { x: 500, y: 300 };
         let roi_primary = cursor_capture_roi(pt_primary, None, 0, 0, 1920, 1080);
         assert_eq!(roi_primary.x, 0);
-        assert_eq!(roi_primary.y, 120);
+        assert_eq!(roi_primary.y, 0);
         assert_eq!(roi_primary.width, 1000);
-        assert_eq!(roi_primary.height, 360);
+        assert_eq!(roi_primary.height, 800);
 
         // Right edge of primary monitor: pt=(1850, 300) -> must clamp cap_x to 1920 - 1000 = 920
         let pt_right = POINT { x: 1850, y: 300 };
         let roi_right = cursor_capture_roi(pt_right, None, 0, 0, 1920, 1080);
         assert_eq!(roi_right.x, 920);
-        assert_eq!(roi_right.y, 120);
+        assert_eq!(roi_right.y, 0);
         assert_eq!(roi_right.x + roi_right.width, 1920);
 
         // Secondary monitor to the left: pt=(-1000, 200), min=(-1920, 0), max=(0, 1080)
         let pt_left = POINT { x: -1000, y: 200 };
         let roi_left = cursor_capture_roi(pt_left, None, -1920, 0, 0, 1080);
         assert_eq!(roi_left.x, -1500);
-        assert_eq!(roi_left.y, 20);
+        assert_eq!(roi_left.y, 0);
 
         // Secondary monitor to the top-left: pt=(-1800, -500), min=(-1920, -1080), max=(0, 0)
         let pt_topleft = POINT { x: -1800, y: -500 };
         let roi_topleft = cursor_capture_roi(pt_topleft, None, -1920, -1080, 0, 0);
         assert_eq!(roi_topleft.x, -1920); // clamped to min_x
-        assert_eq!(roi_topleft.y, -680);
+        assert_eq!(roi_topleft.y, -900);
 
         // If manual active ROI contains pt, it takes precedence
         let active = ScreenRect::new(-1200, 100, 400, 300);

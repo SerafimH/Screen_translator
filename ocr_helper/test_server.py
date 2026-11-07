@@ -677,6 +677,109 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertLess(score_ocr_candidate("Jdlk;@#k4", 0.91), 0.91)
         self.assertEqual(score_ocr_candidate("HELLO", float("nan")), 0.0)
 
+    def test_suspicious_ending_needs_two_strong_matching_crops_and_keeps_word_geometry(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required")
+        img = server.np.zeros((60, 120, 3), dtype=server.np.uint8)
+        word_box = [[40, 20], [95, 20], [95, 40], [40, 40]]
+        line = {"text": "Next mission.n.", "score": 0.99,
+                "box": [[10, 20], [95, 20], [95, 40], [10, 40]],
+                "words": [{"text": "Next", "score": 0.99,
+                           "box": [[10, 20], [35, 20], [35, 40], [10, 40]]},
+                          {"text": "mission.n.", "score": 0.99, "box": word_box}]}
+
+        def reading(text, scale, score=0.98, shift=0):
+            return [{"text": text, "score": score,
+                     "box": [[(x - 32 + shift) * scale, (y - 12) * scale] for x, y in word_box]}]
+
+        variants = [(img, 2, 2), (img, 3, 3)]
+        cases = [([reading("mission.", 2), reading("mission.", 3)], 2, True),
+                 ([reading("mission.", 2), reading("mission!", 3)], 2, False),
+                 ([reading("mission.", 2, score=0.94)], 2, False),
+                 ([reading("mission.", 2, shift=100)], 2, False),
+                 ([reading("missing.", 2)], 2, False),
+                 ([reading("mission.", 2), []], 2, False),
+                 ([reading("mission.", 2)], 1, False),
+                 ([reading("mission.n.", 2)], 2, False)]
+        for responses, calls, accepted in cases:
+            original = copy.deepcopy(line)
+            budget = server._RetryBudget(calls=calls)
+            with self.subTest(responses=responses, calls=calls), \
+                    patch("ocr_helper.server.lettering_variants", return_value=variants), \
+                    patch("ocr_helper.server.call_engine", side_effect=responses) as recognize:
+                result = server.refine_suspicious_ending(img, original, None, 0.5, budget)
+                self.assertEqual(result["text"], "Next mission." if accepted else line["text"])
+                self.assertEqual(original, line, "the input reading must remain unchanged")
+                self.assertEqual(result["box"], line["box"])
+                self.assertEqual(result["words"][0], line["words"][0])
+                self.assertLessEqual(recognize.call_count, calls)
+                if accepted:
+                    self.assertEqual(result["words"][-1]["text"], "mission.")
+                    self.assertEqual(result["words"][-1]["box"], word_box)
+
+    def test_normal_endings_acronyms_and_domains_do_not_trigger_word_retries(self):
+        from ocr_helper import server
+        if server.np is None:
+            self.skipTest("numpy is required")
+        img = server.np.zeros((60, 120, 3), dtype=server.np.uint8)
+        for word in ("mission.", "U.S.", "Ph.D.", "example.com", "iPhone", "O'Neill"):
+            line = {"text": word, "score": 0.99, "words": [{"text": word,
+                    "box": [[10, 10], [90, 10], [90, 30], [10, 30]]}]}
+            with self.subTest(word=word), patch("ocr_helper.server.call_engine") as recognize:
+                self.assertEqual(server.refine_suspicious_ending(img, line, None, 0.5, server._RetryBudget()), line)
+                recognize.assert_not_called()
+
+    def test_detected_fragments_follow_confirmed_text_without_splitting_names(self):
+        from ocr_helper import server
+        line = {"text": "TO VERAMONTE.", "words": [
+            {"text": "TO", "score": 0.99, "box": [[0, 0], [20, 0], [20, 20], [0, 20]]},
+            {"text": "VERAM", "score": 0.98, "box": [[30, 0], [80, 0], [80, 20], [30, 20]]},
+            {"text": "ONTE.", "score": 0.97, "box": [[90, 0], [140, 0], [140, 20], [90, 20]]}]}
+        result = server.align_detected_words(line)
+        self.assertEqual(result["text"], line["text"])
+        self.assertEqual([w["text"] for w in result["words"]], ["TO", "VERAMONTE."])
+        self.assertEqual(result["words"][1]["box"], [[30, 0], [140, 0], [140, 20], [30, 20]])
+        self.assertEqual(result["words"][1]["score"], 0.97)
+        damaged = {**line, "text": "TO OTHERNAME."}
+        self.assertEqual(server.align_detected_words(damaged), damaged)
+
+    def test_word_consensus_corrects_only_agreeing_letters_and_preserves_punctuation(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None:
+            self.skipTest("numpy is required")
+        img = server.np.zeros((80, 240, 3), dtype=server.np.uint8)
+        boxes = [[[20, 20], [100, 20], [100, 40], [20, 40]],
+                 [[120, 20], [200, 20], [200, 40], [120, 40]]]
+        line = {"text": "CAUGHT GLARD!", "score": 0.96, "box": [[20, 20], [200, 20], [200, 40], [20, 40]],
+                "words": [{"text": text, "score": 0.999, "box": box} for text, box in zip(["CAUGHT", "GLARD!"], boxes)]}
+
+        def view(texts):
+            return [{"text": " ".join(texts), "score": 0.96, "box": [[12, 12], [192, 12], [192, 32], [12, 32]],
+                     "words": [{"text": text, "score": 0.99,
+                                "box": [[x - 8, y - 8] for x, y in box]} for text, box in zip(texts, boxes)]}]
+
+        for second, expected in [(["CALGHT", "GUARD!"], "CAUGHT GUARD!"),
+                                  (["CAUGHT", "GLARD!"], "CAUGHT GLARD!")]:
+            index = 0 if second[0] == "CALGHT" else 1
+            x1 = boxes[index][0][0] - 4
+            def word_view(text):
+                return [{"text": text, "score": 0.99,
+                         "box": [[x - x1, y - 16] for x, y in boxes[index]]}]
+            extra = [word_view("CAUGHT"), word_view("CAUGHT")] if index == 0 else [word_view("GUARD!"), word_view("GLARD!")]
+            with self.subTest(second=second), \
+                    patch("ocr_helper.server.lettering_variants", return_value=[(img, 1, 1), (img, 1, 1)]), \
+                    patch("ocr_helper.server.call_engine", side_effect=[view(["CAUGHT", "GUARD!"]), view(second), *extra]):
+                result = server.refine_confirmed_words(img, copy.deepcopy(line), None, 0.5, server._RetryBudget())
+                self.assertEqual(result["text"], expected)
+
+        punctuation = {**line, "text": "CAUGHT GLARD!"}
+        with patch("ocr_helper.server.lettering_variants", return_value=[(img, 1, 1), (img, 1, 1)]), \
+                patch("ocr_helper.server.call_engine", side_effect=[view(["CAUGHT", "GLARD"]), view(["CAUGHT", "GLARD"])]):
+            self.assertEqual(server.refine_confirmed_words(img, punctuation, None, 0.5, server._RetryBudget())["text"], "CAUGHT GLARD!")
+
     def test_refinement_cannot_replace_clear_text_with_longer_low_confidence_noise(self):
         from ocr_helper import server
         if server.np is None or server.cv2 is None:
@@ -689,6 +792,151 @@ class TestOcrHelperProtocol(unittest.TestCase):
             result = refine_problematic_box(server.np.zeros((120, 180, 3), dtype=server.np.uint8),
                                             original, None)
         self.assertEqual(result, original)
+
+    def test_all_refinement_variants_keep_complete_negated_reading_and_word_metadata(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((120, 400, 3), dtype=server.np.uint8)
+        original = {"text": "DO NOT OPEN THE DOOR", "score": 0.80,
+                    "box": [[40, 50], [340, 50], [340, 80], [40, 80]],
+                    "words": [{"text": "NOT", "score": 0.90,
+                               "box": [[80, 50], [120, 50], [120, 80], [80, 80]]}]}
+        for variant in range(4):
+            for text, left in (("OPEN THE DOOR", 115), ("OPEN THE DOOR", 20),
+                               ("OPEN THE FLOOR", 115)):
+                with self.subTest(variant=variant, text=text, left=left):
+                    truncated = {"text": text, "score": 0.99,
+                                 "box": [[left, 20], [320, 20], [320, 50], [left, 50]]}
+                    responses = [[], [], [], []]
+                    responses[variant] = [copy.deepcopy(truncated)]
+                    with patch("ocr_helper.server.lettering_variants", return_value=[(img, 1, 1), (img, 1, 1)]), \
+                         patch("ocr_helper.server.call_engine", side_effect=responses):
+                        result = refine_problematic_box(img, original, None, english_lettering=True)
+                    self.assertEqual(result, original)
+                    self.assertEqual(result["words"][0]["text"], "NOT")
+        # Raising the final acceptance threshold must not authorize stripping a
+        # credible negation merely to obtain a higher-scored suffix.
+        cropped = {"text": "OPEN THE DOOR", "score": 0.99,
+                   "box": [[115, 20], [320, 20], [320, 50], [115, 50]]}
+        with patch("ocr_helper.server.call_engine", side_effect=[[cropped], []]):
+            result = refine_problematic_box(img, original, None, min_score=0.95)
+        self.assertEqual(result, original)
+
+    def test_later_refinement_does_not_truncate_a_newly_recovered_complete_reading(self):
+        from ocr_helper import server
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((120, 400, 3), dtype=server.np.uint8)
+        original = {"text": "Unreadable", "score": 0.30,
+                    "box": [[40, 50], [340, 50], [340, 80], [40, 80]]}
+        recovered = {"text": "DO NOT OPEN THE DOOR", "score": 0.80,
+                     "box": [[20, 20], [320, 20], [320, 50], [20, 50]]}
+        truncated = {"text": "OPEN THE DOOR", "score": 0.99,
+                     "box": [[115, 20], [320, 20], [320, 50], [115, 50]]}
+        with patch("ocr_helper.server.call_engine", side_effect=[[recovered], [truncated]]):
+            result = refine_problematic_box(img, original, None)
+        self.assertEqual(result["text"], "DO NOT OPEN THE DOOR")
+        self.assertEqual(result["box"], original["box"])
+
+    def test_process_refines_symbol_corruption_before_final_filtering(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((80, 160, 3), dtype=server.np.uint8)
+        clear = {"text": "HELLO", "score": 0.99,
+                 "box": [[10, 10], [110, 10], [110, 30], [10, 30]]}
+        damaged = {"text": "H@#$P", "score": 0.8,
+                   "box": [[10, 40], [90, 40], [90, 65], [10, 65]]}
+        for corrected_text, corrected_score, expected in (("HELP", 0.99, ["HELLO", "HELP"]),
+                                                           ("H@#$P", 0.99, ["HELLO"]),
+                                                           ("HELP", 0.4, ["HELLO"])):
+            corrected = {"text": corrected_text, "score": corrected_score,
+                         "box": [[10, 20], [90, 20], [90, 45], [10, 45]]}
+            calls = []
+
+            def recognize(engine, frame, min_score):
+                calls.append(frame.shape)
+                if len(calls) <= 2:
+                    lines = copy.deepcopy([clear, damaged])
+                    if len(calls) == 2:
+                        for line in lines:
+                            line["box"] = [[x * 2, y * 2] for x, y in line["box"]]
+                    return lines
+                return [copy.deepcopy(corrected)]
+
+            with self.subTest(text=corrected_text, score=corrected_score), \
+                    patch("ocr_helper.server.call_engine", side_effect=recognize):
+                response = process_request(dict(id=1, width=160, height=80, lang="en"),
+                                           img.tobytes(), None)
+                self.assertTrue(response["ok"], response)
+                self.assertEqual([line["text"] for line in response["lines"]], expected)
+                self.assertGreater(len(calls), 2, "symbol corruption must reach crop refinement")
+                self.assertLessEqual(len(calls), 2 + server.MAX_RETRY_CALLS)
+                if len(expected) == 2:
+                    self.assertEqual(response["lines"][1]["box"], damaged["box"])
+
+    def test_dense_weak_lines_are_deduplicated_before_shared_retry_call_limit(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((600, 800, 3), dtype=server.np.uint8)
+        lines = [{"text": f"Weak line {i}", "score": 0.70,
+                  "box": [[30, 15 + i * 26], [300, 15 + i * 26],
+                          [300, 35 + i * 26], [30, 35 + i * 26]]}
+                 for i in range(20)]
+        calls = []
+
+        def recognize(engine, frame, min_score):
+            calls.append(frame.shape)
+            if len(calls) > 2:
+                return []
+            result = copy.deepcopy(lines)
+            if len(calls) == 2:
+                for line in result:
+                    line["box"] = [[x * 2, y * 2] for x, y in line["box"]]
+            return result
+
+        with patch("ocr_helper.server.call_engine", side_effect=recognize):
+            response = process_request(dict(id=1, width=800, height=600, lang="en"), img.tobytes(), None)
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(len(calls), 2 + server.MAX_RETRY_CALLS)
+        self.assertEqual(len(response["lines"]), 20)
+        self.assertCountEqual([line["text"] for line in response["lines"]], [line["text"] for line in lines])
+
+    def test_retry_time_limit_returns_existing_lines_and_keeps_score_threshold(self):
+        from ocr_helper import server
+        import copy
+        if server.np is None or server.cv2 is None:
+            self.skipTest("numpy and OpenCV are required for crop refinement")
+        img = server.np.zeros((600, 800, 3), dtype=server.np.uint8)
+        original = {"text": "Existing weak text", "score": 0.70,
+                    "box": [[30, 40], [300, 40], [300, 60], [30, 60]]}
+        for threshold, expected in ((0.5, 1), (0.9, 0)):
+            clock = [0.0]
+            calls = []
+
+            def recognize(engine, frame, min_score):
+                calls.append(frame.shape)
+                if len(calls) > 2:
+                    clock[0] = server.MAX_RETRY_SECONDS + 0.1
+                    return []
+                line = copy.deepcopy(original)
+                if len(calls) == 2:
+                    line["box"] = [[x * 2, y * 2] for x, y in line["box"]]
+                return [line]
+
+            with self.subTest(threshold=threshold), \
+                 patch("ocr_helper.server.time.perf_counter", side_effect=lambda: clock[0]), \
+                 patch("ocr_helper.server.call_engine", side_effect=recognize):
+                response = process_request(dict(id=1, width=800, height=600, lang="en", min_score=threshold),
+                                           img.tobytes(), None)
+            self.assertTrue(response["ok"], response)
+            self.assertEqual(len(calls), 3, "no new retry may begin after the shared deadline")
+            self.assertEqual(len(response["lines"]), expected)
 
     def test_refinement_only_replaces_the_original_line(self):
         from ocr_helper import server

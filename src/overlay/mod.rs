@@ -684,20 +684,16 @@ unsafe extern "system" fn overlay_wndproc(
         return LRESULT(0);
     }
 
-    // SAFETY: state_ptr was initialized from Box::into_raw during window creation and is non-null
-    // until WM_NCDESTROY frees it.
-    let state = unsafe { &mut *state_ptr };
-
     match msg {
-        WM_NCHITTEST if state.mode == AppMode::SelectingRoi => LRESULT(HTCLIENT),
+        WM_NCHITTEST if unsafe { (*state_ptr).mode == AppMode::SelectingRoi } => LRESULT(HTCLIENT),
 
         WM_APP_UPDATE_STATE => {
-            render_current_scene(state);
+            unsafe { with_window_state(hwnd, render_current_scene); }
             LRESULT(0)
         }
 
         WM_APP_CLEAR => {
-            render_current_scene(state);
+            unsafe { with_window_state(hwnd, render_current_scene); }
             LRESULT(0)
         }
 
@@ -705,35 +701,35 @@ unsafe extern "system" fn overlay_wndproc(
             let id = wparam.0 as i32;
             match id {
                 HOTKEY_TRANSLATE => {
-                    let _ = state.event_tx.send(AppEvent::TriggerTranslate);
+                    unsafe { with_window_state(hwnd, |state| { let _ = state.event_tx.send(AppEvent::TriggerTranslate); }); }
                 }
                 HOTKEY_SELECT_ROI => {
-                    enter_selection_mode(state);
+                    unsafe { enter_selection_mode(hwnd); }
                 }
                 HOTKEY_TOGGLE_AUTO => {
-                    let _ = state.event_tx.send(AppEvent::ToggleAutoMode);
+                    unsafe { with_window_state(hwnd, |state| { let _ = state.event_tx.send(AppEvent::ToggleAutoMode); }); }
                 }
                 HOTKEY_CYCLE_PROVIDER => {
-                    let _ = state.event_tx.send(AppEvent::CycleProvider);
+                    unsafe { with_window_state(hwnd, |state| { let _ = state.event_tx.send(AppEvent::CycleProvider); }); }
                 }
                 HOTKEY_CYCLE_OCR_MODE => {
-                    let _ = state.event_tx.send(AppEvent::CycleOcrMode);
+                    unsafe { with_window_state(hwnd, |state| { let _ = state.event_tx.send(AppEvent::CycleOcrMode); }); }
                 }
                 HOTKEY_CLEAR => {
-                    let _ = state.event_tx.send(AppEvent::Clear);
                     // Synchronous UI clearing here is intentional for immediate visual responsiveness;
                     // it is completely idempotent with respect to AppEvent::Clear handled in the main app loop.
-                    {
+                    unsafe { with_window_state(hwnd, |state| {
+                        let _ = state.event_tx.send(AppEvent::Clear);
                         let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                         s.current_blocks.clear();
                         s.active_roi = None;
                         s.status_msg = Some("Очищено".to_string());
                         s.is_loading = false;
-                    }
-                    render_current_scene(state);
+                    }); }
+                    unsafe { with_window_state(hwnd, render_current_scene); }
                 }
                 HOTKEY_QUIT => {
-                    let _ = state.event_tx.send(AppEvent::Quit);
+                    unsafe { with_window_state(hwnd, |state| { let _ = state.event_tx.send(AppEvent::Quit); }); }
                     let _ = unsafe { DestroyWindow(hwnd) };
                 }
                 _ => {}
@@ -741,7 +737,7 @@ unsafe extern "system" fn overlay_wndproc(
             LRESULT(0)
         }
 
-        WM_SETCURSOR if state.mode == AppMode::SelectingRoi => {
+        WM_SETCURSOR if unsafe { (*state_ptr).mode == AppMode::SelectingRoi } => {
             if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
                 unsafe { SetCursor(Some(cursor)) };
                 return LRESULT(1);
@@ -749,48 +745,45 @@ unsafe extern "system" fn overlay_wndproc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
-        WM_LBUTTONDOWN if state.mode == AppMode::SelectingRoi => {
+        WM_LBUTTONDOWN if unsafe { (*state_ptr).mode == AppMode::SelectingRoi } => {
             let mut pt = POINT::default();
             let _ = unsafe { GetCursorPos(&mut pt) };
-            state.is_dragging = true;
-            state.drag_start = pt;
-            state.drag_current = pt;
+            unsafe { with_window_state(hwnd, |state| {
+                state.is_dragging = true;
+                state.drag_start = pt;
+                state.drag_current = pt;
+            }); }
             unsafe { SetCapture(hwnd) };
-
-            render_current_scene(state);
+            request_render(hwnd);
             LRESULT(0)
         }
 
-        WM_MOUSEMOVE if state.mode == AppMode::SelectingRoi && state.is_dragging => {
+        WM_MOUSEMOVE if unsafe { (*state_ptr).mode == AppMode::SelectingRoi && (*state_ptr).is_dragging } => {
             let mut pt = POINT::default();
             let _ = unsafe { GetCursorPos(&mut pt) };
-            state.drag_current = pt;
-
-            render_current_scene(state);
+            unsafe { with_window_state(hwnd, |state| state.drag_current = pt); }
+            request_render(hwnd);
             LRESULT(0)
         }
 
-        WM_LBUTTONUP if state.mode == AppMode::SelectingRoi && state.is_dragging => {
+        WM_LBUTTONUP if unsafe { (*state_ptr).mode == AppMode::SelectingRoi && (*state_ptr).is_dragging } => {
             let mut pt = POINT::default();
             let _ = unsafe { GetCursorPos(&mut pt) };
-            state.drag_current = pt;
+            let rect = unsafe { with_window_state(hwnd, |state| {
+                state.drag_current = pt;
+                ScreenRect::from_points(state.drag_start.x, state.drag_start.y, pt.x, pt.y)
+            }) }.expect("the message starts with live window state");
+            unsafe { exit_selection_mode(hwnd); }
 
-            let rect = ScreenRect::from_points(
-                state.drag_start.x,
-                state.drag_start.y,
-                state.drag_current.x,
-                state.drag_current.y,
-            );
-
-            exit_selection_mode(state);
-
+            // The focus/capture transitions above may have reentered or even
+            // destroyed the window. Reacquire instead of reusing state_ptr.
+            unsafe { with_window_state(hwnd, |state| {
             if rect.width > 20 && rect.height > 20 {
                 {
                     let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                     s.active_roi = Some(rect);
                     s.status_msg = Some(format!("Область выбрана: {}x{}", rect.width, rect.height));
                 }
-                render_current_scene(state);
                 let _ = state.event_tx.send(AppEvent::RoiSelected(rect));
             } else if rect.width <= 5 && rect.height <= 5 {
                 {
@@ -798,27 +791,25 @@ unsafe extern "system" fn overlay_wndproc(
                     s.active_roi = None;
                     s.status_msg = Some("Область сброшена (полный экран)".to_string());
                 }
-                render_current_scene(state);
                 let _ = state.event_tx.send(AppEvent::ResetRoi);
             } else {
                 {
                     let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                     s.status_msg = Some("Выделение слишком мало".to_string());
                 }
-                render_current_scene(state);
             }
-
+            }); }
+            request_render(hwnd);
             LRESULT(0)
         }
 
-        WM_KEYDOWN if state.mode == AppMode::SelectingRoi && wparam.0 == 0x1B => {
-            exit_selection_mode(state);
-
-            {
+        WM_KEYDOWN if unsafe { (*state_ptr).mode == AppMode::SelectingRoi } && wparam.0 == 0x1B => {
+            unsafe { exit_selection_mode(hwnd); }
+            unsafe { with_window_state(hwnd, |state| {
                 let mut s = state.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                 s.status_msg = Some("Выделение отменено".to_string());
-            }
-            render_current_scene(state);
+            }); }
+            request_render(hwnd);
             LRESULT(0)
         }
 
@@ -828,11 +819,14 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_DESTROY => {
-            if !state.mouse_hook.is_invalid() {
-                let _ = unsafe { UnhookWindowsHookEx(state.mouse_hook) };
+            let (mouse_hook, keyboard_hook) = unsafe {
+                with_window_state(hwnd, |state| (state.mouse_hook, state.keyboard_hook))
+            }.expect("the message starts with live window state");
+            if !mouse_hook.is_invalid() {
+                let _ = unsafe { UnhookWindowsHookEx(mouse_hook) };
             }
-            if !state.keyboard_hook.is_invalid() {
-                let _ = unsafe { UnhookWindowsHookEx(state.keyboard_hook) };
+            if !keyboard_hook.is_invalid() {
+                let _ = unsafe { UnhookWindowsHookEx(keyboard_hook) };
             }
             let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_TRANSLATE) };
             let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_SELECT_ROI) };
@@ -863,33 +857,58 @@ unsafe extern "system" fn overlay_wndproc(
     }
 }
 
-fn enter_selection_mode(state: &mut WindowThreadState) {
-    if state.mode == AppMode::SelectingRoi {
-        return;
-    }
+#[cfg(test)]
+std::thread_local! {
+    static WINDOW_STATE_ACCESS_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
+/// Only call on the owning window thread. Selection/focus/capture transitions
+/// must be performed after the closure returns; no state reference can escape.
+unsafe fn with_window_state<T>(hwnd: HWND, action: impl FnOnce(&mut WindowThreadState) -> T) -> Option<T> {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowThreadState;
+    if ptr.is_null() { return None; }
+    #[cfg(test)]
+    struct AccessGuard;
+    #[cfg(test)]
+    impl Drop for AccessGuard {
+        fn drop(&mut self) { WINDOW_STATE_ACCESS_DEPTH.with(|depth| depth.set(depth.get() - 1)); }
+    }
+    #[cfg(test)]
+    let _access = {
+        WINDOW_STATE_ACCESS_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        AccessGuard
+    };
+    Some(action(unsafe { &mut *ptr }))
+}
+
+fn request_render(hwnd: HWND) {
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_UPDATE_STATE, WPARAM(0), LPARAM(0)) };
+}
+
+unsafe fn enter_selection_mode(hwnd: HWND) {
     let fg_hwnd = unsafe { GetForegroundWindow() };
-    if fg_hwnd != state.hwnd {
-        state.previous_foreground_hwnd = fg_hwnd;
-    }
+    let Some(Some(bounds)) = (unsafe { with_window_state(hwnd, |state| {
+        if state.mode == AppMode::SelectingRoi { return None; }
+        if fg_hwnd != hwnd { state.previous_foreground_hwnd = fg_hwnd; }
+        state.mode = AppMode::SelectingRoi;
+        state.is_dragging = false;
+        Some(ScreenRect::new(state.virtual_x, state.virtual_y, state.virtual_w, state.virtual_h))
+    }) }) else { return; };
 
-    state.mode = AppMode::SelectingRoi;
-    state.is_dragging = false;
-
-    render_current_scene(state);
-
-    let ex_style = unsafe { GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE) };
+    // State borrows ended before these calls: positioning/focus changes can
+    // synchronously dispatch another overlay_wndproc invocation.
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
     let new_style = ex_style & !(WS_EX_TRANSPARENT.0 as isize) & !(WS_EX_NOACTIVATE.0 as isize);
-    unsafe { SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style) };
+    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) };
 
     let _ = unsafe {
         SetWindowPos(
-            state.hwnd,
+            hwnd,
             Some(HWND_TOPMOST),
-            state.virtual_x,
-            state.virtual_y,
-            state.virtual_w,
-            state.virtual_h,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
             SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_SHOWWINDOW.0),
         )
     };
@@ -902,43 +921,51 @@ fn enter_selection_mode(state: &mut WindowThreadState) {
 
     if fg_thread_id != 0 && fg_thread_id != current_thread_id {
         let _ = unsafe { AttachThreadInput(current_thread_id, fg_thread_id, true) };
-        let _ = unsafe { SetForegroundWindow(state.hwnd) };
-        let _ = unsafe { SetFocus(Some(state.hwnd)) };
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        let _ = unsafe { SetFocus(Some(hwnd)) };
         if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
             unsafe { SetCursor(Some(cursor)) };
         }
         let _ = unsafe { AttachThreadInput(current_thread_id, fg_thread_id, false) };
     } else {
-        let _ = unsafe { SetForegroundWindow(state.hwnd) };
-        let _ = unsafe { SetFocus(Some(state.hwnd)) };
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        let _ = unsafe { SetFocus(Some(hwnd)) };
         if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
             unsafe { SetCursor(Some(cursor)) };
         }
     }
+    request_render(hwnd);
 }
 
-fn exit_selection_mode(state: &mut WindowThreadState) {
-    let _ = unsafe { ReleaseCapture() };
-    state.is_dragging = false;
-    state.mode = AppMode::Normal;
+unsafe fn exit_selection_mode(hwnd: HWND) {
+    let Some((bounds, previous_foreground)) = (unsafe { with_window_state(hwnd, |state| {
+        state.is_dragging = false;
+        state.mode = AppMode::Normal;
+        let previous_foreground = state.previous_foreground_hwnd;
+        state.previous_foreground_hwnd = HWND(core::ptr::null_mut());
+        (ScreenRect::new(state.virtual_x, state.virtual_y, state.virtual_w, state.virtual_h), previous_foreground)
+    }) }) else { return; };
 
-    let ex_style = unsafe { GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE) };
+    // ReleaseCapture, positioning and focus restoration can all reenter. Only
+    // owned values remain here, so nested callbacks can safely access state.
+    let _ = unsafe { ReleaseCapture() };
+
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
     let new_style = ex_style | (WS_EX_TRANSPARENT.0 as isize) | (WS_EX_NOACTIVATE.0 as isize);
-    unsafe { SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, new_style) };
+    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) };
     let _ = unsafe {
         SetWindowPos(
-            state.hwnd,
+            hwnd,
             Some(HWND_TOPMOST),
-            state.virtual_x,
-            state.virtual_y,
-            state.virtual_w,
-            state.virtual_h,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
             SET_WINDOW_POS_FLAGS(SWP_FRAMECHANGED.0 | SWP_NOACTIVATE.0),
         )
     };
-    if !state.previous_foreground_hwnd.0.is_null() {
-        let _ = unsafe { SetForegroundWindow(state.previous_foreground_hwnd) };
-        state.previous_foreground_hwnd = HWND(core::ptr::null_mut());
+    if !previous_foreground.0.is_null() {
+        let _ = unsafe { SetForegroundWindow(previous_foreground) };
     }
 }
 
@@ -946,6 +973,102 @@ fn exit_selection_mode(state: &mut WindowThreadState) {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    std::thread_local! {
+        static POSITION_REENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CAPTURE_REENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static REENTRY_WHILE_BORROWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    unsafe extern "system" fn selection_test_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_CAPTURECHANGED, WM_WINDOWPOSCHANGING, WINDOWPOS};
+        if matches!(msg, WM_WINDOWPOSCHANGING | WM_CAPTURECHANGED) {
+            let has_state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 0;
+            if has_state {
+                if WINDOW_STATE_ACCESS_DEPTH.with(|depth| depth.get() != 0) {
+                    REENTRY_WHILE_BORROWED.with(|seen| seen.set(true));
+                }
+                if msg == WM_WINDOWPOSCHANGING {
+                    POSITION_REENTRIES.with(|count| count.set(count.get() + 1));
+                    // Exercise nested mutable state access, as other handled
+                    // messages do, while keeping the regression window hidden.
+                    unsafe { with_window_state(hwnd, |state| state.drag_current.x += 1); }
+                } else {
+                    CAPTURE_REENTRIES.with(|count| count.set(count.get() + 1));
+                }
+            }
+            if msg == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+                let position = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+                position.flags = SET_WINDOW_POS_FLAGS((position.flags.0 & !SWP_SHOWWINDOW.0) | SWP_NOACTIVATE.0);
+            }
+        }
+        unsafe { overlay_wndproc(hwnd, msg, wparam, lparam) }
+    }
+
+    #[test]
+    fn selection_transitions_release_state_before_synchronous_window_callbacks() {
+        POSITION_REENTRIES.with(|count| count.set(0));
+        CAPTURE_REENTRIES.with(|count| count.set(0));
+        REENTRY_WHILE_BORROWED.with(|seen| seen.set(false));
+        let instance = unsafe { GetModuleHandleW(None).unwrap() };
+        let class = w!("ScreenTranslatorSelectionReentryTest");
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(selection_test_wndproc), hInstance: instance.into(),
+            lpszClassName: class, ..Default::default()
+        };
+        unsafe { RegisterClassW(&window_class); }
+        let hwnd = unsafe { CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, class, w!("Hidden selection test"),
+            WS_POPUP, 0, 0, 300, 200, None, None, Some(instance.into()), None,
+        ).unwrap() };
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let shared = Arc::new(Mutex::new(OverlaySharedState::default()));
+        let state = Box::new(WindowThreadState {
+            hwnd, renderer: OverlayRenderer::new(0, 0, 300, 200, "Segoe UI", 16.0, 0.9).unwrap(),
+            mode: AppMode::Normal, virtual_x: 0, virtual_y: 0, virtual_w: 300, virtual_h: 200,
+            is_dragging: false, drag_start: POINT::default(), drag_current: POINT::default(),
+            shared_state: shared.clone(), event_tx, keyboard_hook: HHOOK(core::ptr::null_mut()),
+            mouse_hook: HHOOK(core::ptr::null_mut()), previous_foreground_hwnd: HWND(core::ptr::null_mut()),
+        });
+        let ptr = Box::into_raw(state);
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            SendMessageW(hwnd, WM_HOTKEY, Some(WPARAM(HOTKEY_SELECT_ROI as usize)), None);
+        }
+        assert_eq!(unsafe { (*ptr).mode }, AppMode::SelectingRoi);
+        unsafe { SendMessageW(hwnd, WM_LBUTTONDOWN, None, None); }
+        assert!(unsafe { (*ptr).is_dragging });
+        let mut cursor = POINT::default();
+        unsafe { GetCursorPos(&mut cursor).unwrap(); }
+        unsafe { with_window_state(hwnd, |state| {
+            state.drag_start = POINT { x: cursor.x - 100, y: cursor.y - 100 };
+        }); }
+        unsafe { SendMessageW(hwnd, WM_LBUTTONUP, None, None); }
+        assert_eq!(unsafe { (*ptr).mode }, AppMode::Normal);
+        assert!(!unsafe { (*ptr).is_dragging });
+        assert!(matches!(event_rx.try_recv(), Ok(AppEvent::RoiSelected(_))));
+        let selected = shared.lock().unwrap().active_roi;
+        assert!(selected.is_some());
+        unsafe {
+            SendMessageW(hwnd, WM_HOTKEY, Some(WPARAM(HOTKEY_SELECT_ROI as usize)), None);
+            SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(0x1B)), None);
+        }
+        assert_eq!(unsafe { (*ptr).mode }, AppMode::Normal);
+        assert_eq!(shared.lock().unwrap().active_roi, selected);
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        assert_ne!(style & WS_EX_TRANSPARENT.0 as isize, 0);
+        assert_ne!(style & WS_EX_NOACTIVATE.0 as isize, 0);
+        assert!(POSITION_REENTRIES.with(|count| count.get() >= 4));
+        assert!(CAPTURE_REENTRIES.with(|count| count.get() >= 1));
+        assert!(!REENTRY_WHILE_BORROWED.with(|seen| seen.get()));
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(ptr));
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
 
     #[test]
     fn display_refresh_updates_bounds_preserves_cards_and_resets_offscreen_roi() {
