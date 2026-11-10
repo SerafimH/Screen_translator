@@ -84,9 +84,12 @@ def create_ocr_engine(models_dir: Optional[str] = None, lang: str = "en"):
     """Initializes RapidOCR engine using local models if present."""
     rec_lang = RAPIDOCR_LANG_MAP.get(lang.lower(), lang.lower())
     try:
-        from rapidocr import RapidOCR
+        from rapidocr import ModelType, OCRVersion, RapidOCR
 
         params = {"Rec.lang_type": rec_lang}
+        if rec_lang in {"cyrillic", "korean"}:
+            # PP-OCRv6 small does not include these recognition languages.
+            params.update({"Rec.ocr_version": OCRVersion.PPOCRV5, "Rec.model_type": ModelType.MOBILE})
         if rec_lang == "en":
             # Thin subtitle/cursor crops must not be stretched until their short
             # side reaches 736px. Small frames already get a separate 2x pass;
@@ -1181,7 +1184,14 @@ def run_server(stdin=None, stdout=None, engine=None):
         # Third-party initialization may print; stdout remains protocol-only.
         try:
             with redirect_stdout(sys.stderr):
-                engine.get_engine(os.environ.get(SCREEN_TRANSLATOR_OCR_LANG_ENV) or "en")
+                ocr_engine = engine.get_engine(os.environ.get(SCREEN_TRANSLATOR_OCR_LANG_ENV) or "en")
+                # RapidOCR 3.10 constructs its ONNX sessions lazily. Initialize
+                # each enabled model explicitly: an empty-image inference may
+                # never reach the recognizer. Legacy engines load eagerly.
+                for stage in ("det", "cls", "rec"):
+                    load_model = getattr(ocr_engine, f"_load_{stage}_model", None)
+                    if getattr(ocr_engine, f"use_{stage}", True) and callable(load_model):
+                        load_model()
         except Exception:
             logger.exception("Failed to initialize OCR models before ready")
             raise

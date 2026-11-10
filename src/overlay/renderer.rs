@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
     D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
 };
@@ -17,8 +17,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HDC,
-    HGDIOBJ, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
+    GetMonitorInfoW, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, ULW_ALPHA, UpdateLayeredWindow,
@@ -40,6 +40,46 @@ pub struct RenderScene<'a> {
     pub selection_rect: Option<ScreenRect>,
     pub status_msg: Option<&'a str>,
     pub is_loading: bool,
+}
+
+fn card_monitor_bounds(source: ScreenRect, desktop: ScreenRect) -> ScreenRect {
+    let mut info = MONITORINFO {
+        cbSize: core::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        // Cursor cards expand the word's width for layout. Their original
+        // position, rather than that expanded rectangle, anchors the monitor.
+        let monitor = MonitorFromPoint(POINT { x: source.x, y: source.y }, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return desktop;
+        }
+    }
+    let left = info.rcMonitor.left.max(desktop.x);
+    let top = info.rcMonitor.top.max(desktop.y);
+    let right = info.rcMonitor.right.min(desktop.x + desktop.width);
+    let bottom = info.rcMonitor.bottom.min(desktop.y + desktop.height);
+    if right <= left || bottom <= top {
+        return desktop;
+    }
+    ScreenRect::new(left, top, right - left, bottom - top)
+}
+
+fn card_layout_width(bounds: ScreenRect, source_width: i32, button_space: f32) -> f32 {
+    let max_width = (bounds.width as f32 - 40.0 - button_space).max(1.0);
+    (source_width as f32).max(180.0).min(max_width)
+}
+
+fn card_position(
+    bounds: ScreenRect, source: ScreenRect, card_w: f32, card_h: f32, button_space: f32,
+) -> (f32, f32) {
+    let left = (source.x as f32 - 8.0).max(bounds.x as f32 + 4.0)
+        .min((bounds.x as f32 + bounds.width as f32 - card_w - button_space - 4.0)
+            .max(bounds.x as f32 + 4.0));
+    let top = (source.y as f32 - 8.0).max(bounds.y as f32 + 4.0)
+        .min((bounds.y as f32 + bounds.height as f32 - card_h - 4.0)
+            .max(bounds.y as f32 + 4.0));
+    (left, top)
 }
 
 pub struct MemDcGuard(pub HDC);
@@ -516,10 +556,12 @@ impl OverlayRenderer {
                     let show_button = is_cursor_card && scene.save_button_enabled;
                     let button_space = if show_button { 34.0 } else { 0.0 };
                     let pad = 8.0;
-                    let min_width = 140.0;
-                    let max_layout_w = (self.width as f32 - 40.0 - button_space).max(200.0);
-                    let target_layout_w = (block.rect.width as f32).max(180.0).min(max_layout_w);
-                    let max_layout_h = (self.height as f32 - 40.0).max(200.0);
+                    let bounds = card_monitor_bounds(block.rect,
+                        ScreenRect::new(self.origin_x, self.origin_y, self.width, self.height))
+                        .to_local(self.origin_x, self.origin_y);
+                    let min_width = 140.0_f32.min((bounds.width as f32 - button_space - 8.0).max(1.0));
+                    let target_layout_w = card_layout_width(bounds, block.rect.width, button_space);
+                    let max_layout_h = (bounds.height as f32 - 40.0).max(1.0);
 
                     let utf16: Vec<u16> = block.translated_text.encode_utf16().collect();
                     let text_layout = self.dwrite_factory.CreateTextLayout(
@@ -534,17 +576,12 @@ impl OverlayRenderer {
 
                     let card_w =
                         (metrics.widthIncludingTrailingWhitespace + pad * 2.0).max(min_width);
-                    let card_h = (metrics.height + pad * 2.0).max(30.0);
+                    // DirectWrite reports the full text height even when it
+                    // exceeds the layout. Bound the plate and clip its text.
+                    let card_h = (metrics.height.min(max_layout_h) + pad * 2.0).max(30.0);
 
-                    let block_screen_x = (block.rect.x - self.origin_x) as f32;
-                    let block_screen_y = (block.rect.y - self.origin_y) as f32;
-
-                    let left = (block_screen_x - pad)
-                        .max(4.0)
-                        .min((self.width as f32 - card_w - button_space - 4.0).max(4.0));
-                    let top = (block_screen_y - pad)
-                        .max(4.0)
-                        .min((self.height as f32 - card_h - 4.0).max(4.0));
+                    let (left, top) = card_position(bounds,
+                        block.rect.to_local(self.origin_x, self.origin_y), card_w, card_h, button_space);
                     let right = left + card_w;
                     let bottom = top + card_h;
 
@@ -581,7 +618,7 @@ impl OverlayRenderer {
                         text_pt,
                         &text_layout,
                         &self.brush_text,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     );
 
                     if show_button {
@@ -765,6 +802,78 @@ impl Drop for OverlayRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_selection_does_not_follow_the_expanded_card_width() {
+        use windows::Win32::Graphics::Gdi::MonitorFromPoint;
+        let mut info = MONITORINFO {
+            cbSize: core::mem::size_of::<MONITORINFO>() as u32, ..Default::default()
+        };
+        unsafe {
+            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST);
+            assert!(GetMonitorInfoW(monitor, &mut info).as_bool());
+        }
+        let desktop = ScreenRect::new(-32768, -32768, 65536, 65536);
+        let source = ScreenRect::new(info.rcMonitor.right - 20, info.rcMonitor.top + 20, 20, 20);
+        let expected = ScreenRect::new(info.rcMonitor.left, info.rcMonitor.top,
+            info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top);
+        for width in [20, 420, 10000] {
+            assert_eq!(card_monitor_bounds(ScreenRect { width, ..source }, desktop), expected);
+        }
+    }
+
+    #[test]
+    fn long_card_uses_real_text_metrics_and_clips_pixels_to_available_height() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_POPUP};
+        let hwnd = unsafe { CreateWindowExW(WS_EX_LAYERED, w!("STATIC"), w!("Long card test"),
+            WS_POPUP, 0, 0, 640, 240, None, None, None, None).unwrap() };
+        let mut renderer = OverlayRenderer::new(0, 0, 640, 240, "Segoe UI", 18.0, 0.9).unwrap();
+        let card = TranslationBlock {
+            original_text: "paragraph".into(),
+            translated_text: "word sentence paragraph ".repeat(300),
+            rect: ScreenRect::new(40, 180, 420, 20),
+        };
+        let text = card.translated_text.encode_utf16().collect::<Vec<_>>();
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let layout = renderer.dwrite_factory.CreateTextLayout(&text, &renderer.text_format_card, 420.0, 200.0).unwrap();
+            layout.GetMetrics(&mut metrics).unwrap();
+        }
+        assert!(metrics.height > 240.0, "exercise DirectWrite overflow, not a short card");
+        let scene = RenderScene {
+            blocks: &[], cursor_card: Some(&card), save_button_enabled: true,
+            active_roi: None, auto_mode: false, provider_name: "Google", ocr_engine_name: "WinRT",
+            mode: AppMode::Normal, selection_rect: None, status_msg: None, is_loading: false,
+        };
+        let result = renderer.render(hwnd, &scene);
+        unsafe { DestroyWindow(hwnd).unwrap(); }
+        let button = result.unwrap().unwrap();
+        assert!(button.y >= 4 && button.y + button.height <= 236);
+        let pixels = unsafe { std::slice::from_raw_parts(renderer._bits_ptr.cast::<u8>(), 640 * 240 * 4) };
+        assert!(pixels.chunks_exact(4).skip(237 * 640).all(|pixel| pixel[3] == 0),
+            "card background and text must leave the bottom margin transparent; first pixel: {:?}",
+            pixels.chunks_exact(4).enumerate().skip(237 * 640).find(|(_, pixel)| pixel[3] != 0)
+                .map(|(index, pixel)| (index % 640, index / 640, pixel)));
+    }
+
+    #[test]
+    fn cards_fit_their_monitor_in_an_uneven_virtual_desktop() {
+        // The right monitor extends below the primary; that gap cannot hold a card.
+        for monitor in [ScreenRect::new(0, 0, 1920, 1080), ScreenRect::new(-1280, -200, 1280, 1024)] {
+            let source = ScreenRect::new(monitor.x + monitor.width - 30,
+                monitor.y + monitor.height - 10, 4000, 20);
+            let button_space = 34.0;
+            let layout_w = card_layout_width(monitor, source.width, button_space);
+            let card_w = layout_w + 16.0;
+            let card_h = 200.0;
+            let (left, top) = card_position(monitor, source, card_w, card_h, button_space);
+            assert!(left >= monitor.x as f32 + 4.0);
+            assert!(top >= monitor.y as f32 + 4.0);
+            assert!(left + card_w + button_space <= (monitor.x + monitor.width) as f32 - 4.0);
+            assert!(top + card_h <= (monitor.y + monitor.height) as f32 - 4.0);
+            assert!(layout_w < source.width as f32);
+        }
+    }
 
     #[test]
     fn selected_bitmap_is_restored_before_failure_cleanup() {

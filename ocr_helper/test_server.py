@@ -198,6 +198,39 @@ class TestOcrHelperProtocol(unittest.TestCase):
                 run_server(stdin=io.BytesIO(), stdout=output)
         self.assertEqual(output.getvalue(), b"")
 
+    def test_ready_loads_lazy_rapidocr_models_before_notification(self):
+        output = io.BytesIO()
+        loaded = []
+
+        def load_model(name):
+            def load(config):
+                self.assertEqual(output.getvalue(), b"")
+                loaded.append(name)
+                print("model initialization output belongs on stderr")
+                return object()
+            return load
+
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {"SCREEN_TRANSLATOR_OCR_LANG": "en"}), \
+             patch("ocr_helper.server.resolve_models_dir", return_value=None), \
+             patch("rapidocr.main.TextDetector", side_effect=load_model("det")), \
+             patch("rapidocr.main.TextClassifier", side_effect=load_model("cls")), \
+             patch("rapidocr.main.TextRecognizer", side_effect=load_model("rec")), \
+             patch("sys.stderr", stderr):
+            run_server(stdin=io.BytesIO(), stdout=output)
+        self.assertEqual(loaded, ["det", "cls", "rec"])
+        self.assertEqual(json.loads(output.getvalue()), {"event": "ready"})
+        self.assertEqual(stderr.getvalue().count("model initialization output"), 3)
+
+    def test_lazy_model_failure_does_not_report_ready(self):
+        output = io.BytesIO()
+        with patch.dict(os.environ, {"SCREEN_TRANSLATOR_OCR_LANG": "en"}), \
+             patch("ocr_helper.server.resolve_models_dir", return_value=None), \
+             patch("rapidocr.main.TextDetector", side_effect=RuntimeError("model load failed")):
+            with self.assertRaisesRegex(RuntimeError, "model load failed"):
+                run_server(stdin=io.BytesIO(), stdout=output)
+        self.assertEqual(output.getvalue(), b"")
+
     def test_short_cjk_dialogue_keeps_native_punctuation(self):
         box = [[0, 0], [40, 0], [40, 20], [0, 20]]
         for text in ("はい？", "何？", "是。", "不！", "「はい」", "你好，世界！"):
@@ -397,6 +430,8 @@ class TestOcrHelperProtocol(unittest.TestCase):
         self.assertEqual(RAPIDOCR_LANG_MAP.get("zh"), "ch")
 
     def test_create_ocr_engine_passes_lang_type(self):
+        from rapidocr import ModelType, OCRVersion
+
         with patch("rapidocr.RapidOCR") as mock_rapid:
             create_ocr_engine(None, lang="en")
             mock_rapid.assert_called_once_with(params={
@@ -410,8 +445,21 @@ class TestOcrHelperProtocol(unittest.TestCase):
         with patch("os.path.exists", return_value=True), patch("rapidocr.RapidOCR") as mock_rapid:
             create_ocr_engine("/fake/models", lang="ru")
             mock_rapid.assert_called_once_with(
-                params={"Rec.lang_type": "cyrillic", "Global.model_root_dir": "/fake/models"}
+                params={"Rec.lang_type": "cyrillic", "Rec.ocr_version": OCRVersion.PPOCRV5,
+                        "Rec.model_type": ModelType.MOBILE, "Global.model_root_dir": "/fake/models"}
             )
+
+    def test_configured_languages_resolve_to_supported_recognition_models(self):
+        from rapidocr.inference_engine.base import FileInfo, InferSession
+
+        for lang in ("en", "ja", "zh", "ru", "ko"):
+            with self.subTest(lang=lang):
+                cfg = create_ocr_engine(lang=lang).cfg.Rec
+                model = InferSession.get_model_url(FileInfo(
+                    cfg.engine_type, cfg.ocr_version, cfg.task_type,
+                    cfg.lang_type, cfg.model_type,
+                ))
+                self.assertTrue(model["model_dir"])
 
     def test_engine_manager_cache_limit_lru(self):
         def fake_create(models_dir, lang):

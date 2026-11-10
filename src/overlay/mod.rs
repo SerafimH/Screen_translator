@@ -46,6 +46,10 @@ const HTCLIENT: isize = 1;
 
 static HOOK_TX: Mutex<Option<UnboundedSender<AppEvent>>> = Mutex::new(None);
 static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+static SHIFT_KEYS: Mutex<ShiftKeyState> = Mutex::new(ShiftKeyState {
+    pressed: 0,
+    translation_active: false,
+});
 static SAVE_BUTTON: Mutex<SaveButtonState> = Mutex::new(SaveButtonState {
     target: None,
     pressed: None,
@@ -99,6 +103,31 @@ pub fn is_shift_held() -> bool {
     SHIFT_HELD.load(Ordering::SeqCst)
 }
 
+#[derive(Default)]
+struct ShiftKeyState {
+    pressed: u8,
+    translation_active: bool,
+}
+
+impl ShiftKeyState {
+    fn update(&mut self, key: u8, down: bool, allow_translation: bool) -> Option<bool> {
+        if down {
+            self.pressed |= key;
+            if allow_translation && !self.translation_active {
+                self.translation_active = true;
+                return Some(true);
+            }
+        } else {
+            self.pressed &= !key;
+            if self.pressed == 0 && self.translation_active {
+                self.translation_active = false;
+                return Some(false);
+            }
+        }
+        None
+    }
+}
+
 unsafe extern "system" fn low_level_keyboard_proc(
     code: i32,
     wparam: WPARAM,
@@ -114,6 +143,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if is_shift {
             let is_key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             let is_key_up = msg == WM_KEYUP || msg == WM_SYSKEYUP || kbd.flags.contains(LLKHF_UP);
+            let key = if kbd.vkCode == VK_RSHIFT.0 as u32
+                || (kbd.vkCode == VK_SHIFT.0 as u32 && kbd.scanCode == 0x36)
+            {
+                2
+            } else {
+                1
+            };
 
             if is_key_down && !kbd.flags.contains(LLKHF_UP) {
                 // Ignore Shift if Alt, Ctrl, or Windows key is down (e.g. Alt+Shift / Ctrl+Shift layout switch)
@@ -124,21 +160,30 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 let win_down = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as u16 & 0x8000) != 0
                     || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } as u16 & 0x8000) != 0;
 
-                if !alt_down && !ctrl_down && !win_down
-                    && !SHIFT_HELD.swap(true, Ordering::SeqCst) {
-                        let mut pt = POINT::default();
-                        let _ = unsafe { GetCursorPos(&mut pt) };
-                        if let Ok(guard) = HOOK_TX.lock()
-                            && let Some(tx) = guard.as_ref() {
-                                let _ = tx.send(AppEvent::TranslateUnderCursor(pt));
-                            }
+                let transition = SHIFT_KEYS.lock().unwrap_or_else(|e| e.into_inner())
+                    .update(key, true, !alt_down && !ctrl_down && !win_down);
+                if transition == Some(true) {
+                    SHIFT_HELD.store(true, Ordering::SeqCst);
+                    let mut pt = POINT::default();
+                    let _ = unsafe { GetCursorPos(&mut pt) };
+                    if let Ok(guard) = HOOK_TX.lock()
+                        && let Some(tx) = guard.as_ref()
+                    {
+                        let _ = tx.send(AppEvent::TranslateUnderCursor(pt));
                     }
-            } else if is_key_up
-                && SHIFT_HELD.swap(false, Ordering::SeqCst)
-                    && let Ok(guard) = HOOK_TX.lock()
-                        && let Some(tx) = guard.as_ref() {
-                            let _ = tx.send(AppEvent::ShiftReleased);
-                        }
+                }
+            } else if is_key_up {
+                let transition = SHIFT_KEYS.lock().unwrap_or_else(|e| e.into_inner())
+                    .update(key, false, false);
+                if transition == Some(false) {
+                    SHIFT_HELD.store(false, Ordering::SeqCst);
+                    if let Ok(guard) = HOOK_TX.lock()
+                        && let Some(tx) = guard.as_ref()
+                    {
+                        let _ = tx.send(AppEvent::ShiftReleased);
+                    }
+                }
+            }
         }
     }
 
@@ -840,6 +885,8 @@ unsafe extern "system" fn overlay_wndproc(
         }
 
         WM_NCDESTROY => {
+            *SHIFT_KEYS.lock().unwrap_or_else(|e| e.into_inner()) = ShiftKeyState::default();
+            SHIFT_HELD.store(false, Ordering::SeqCst);
             *SAVE_BUTTON.lock().unwrap_or_else(|e| e.into_inner()) = SaveButtonState::default();
             // Clear global hook sender on window destruction
             *HOOK_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -973,6 +1020,33 @@ unsafe fn exit_selection_mode(hwnd: HWND) {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+    #[test]
+    fn shift_translation_ends_only_after_both_keys_are_released() {
+        for (first, second) in [(1, 2), (2, 1)] {
+            let mut state = ShiftKeyState::default();
+            assert_eq!(state.update(first, true, true), Some(true));
+            assert_eq!(state.update(first, true, true), None);
+            assert_eq!(state.update(second, true, true), None);
+            assert_eq!(state.update(first, false, false), None);
+            assert!(state.translation_active);
+            assert_eq!(state.update(second, false, false), Some(false));
+            assert!(!state.translation_active);
+            assert_eq!(state.update(second, false, false), None);
+        }
+    }
+
+    #[test]
+    fn ignored_shift_chords_do_not_start_or_prematurely_stop_translation() {
+        let mut state = ShiftKeyState::default();
+        assert_eq!(state.update(1, true, false), None);
+        assert_eq!(state.update(1, false, false), None);
+        assert_eq!(state.update(1, true, true), Some(true));
+        assert_eq!(state.update(2, true, false), None);
+        assert_eq!(state.update(2, false, false), None);
+        assert!(state.translation_active);
+        assert_eq!(state.update(1, false, false), Some(false));
+    }
 
     std::thread_local! {
         static POSITION_REENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

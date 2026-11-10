@@ -30,6 +30,7 @@ pub struct GlossaryEntry {
 pub struct ContextManager {
     history: Mutex<VecDeque<(String, String)>>, // (Original, Translated)
     glossary: Mutex<HashMap<String, GlossaryEntry>>,
+    russian_default_terms: Mutex<HashSet<String>>,
     max_history: usize,
 }
 
@@ -38,6 +39,7 @@ impl ContextManager {
         let mgr = Self {
             history: Mutex::new(VecDeque::with_capacity(max_history + 1)),
             glossary: Mutex::new(HashMap::new()),
+            russian_default_terms: Mutex::new(HashSet::new()),
             max_history,
         };
 
@@ -49,6 +51,8 @@ impl ContextManager {
         mgr.add_glossary_term("ATK", "АТК", Some("Attack power".to_string()));
         mgr.add_glossary_term("DEF", "ЗАЩ", Some("Defense power".to_string()));
         mgr.add_glossary_term("NPC", "NPC", Some("Non-player character".to_string()));
+        *mgr.russian_default_terms.lock().unwrap_or_else(|e| e.into_inner()) =
+            ["exp", "lv", "atk", "def"].into_iter().map(str::to_owned).collect();
 
         mgr
     }
@@ -63,6 +67,9 @@ impl ContextManager {
                 notes,
             },
         );
+        // An explicit custom entry applies to all targets, even when it replaces a default.
+        self.russian_default_terms.lock().unwrap_or_else(|e| e.into_inner())
+            .remove(&original.to_lowercase());
     }
 
     pub fn record_translation(&self, original: String, translated: String) {
@@ -84,11 +91,18 @@ impl ContextManager {
     }
 
     pub fn postprocess(&self, translated: &str) -> String {
+        self.postprocess_for_target(translated, "ru")
+    }
+
+    fn postprocess_for_target(&self, translated: &str, target_lang: &str) -> String {
         let g = self.glossary.lock().unwrap_or_else(|e| e.into_inner());
+        let russian_defaults = self.russian_default_terms.lock().unwrap_or_else(|e| e.into_inner());
         let mut result = translated.to_string();
         let mut lower_result = result.to_lowercase();
 
-        let mut entries: Vec<&GlossaryEntry> = g.values().collect();
+        let mut entries: Vec<&GlossaryEntry> = g.iter().filter(|(key, _)|
+            target_lang.eq_ignore_ascii_case("ru") || !russian_defaults.contains(*key))
+            .map(|(_, entry)| entry).collect();
         // Sort descending by original term length so compound terms (e.g. "MAX HP")
         // are replaced before shorter sub-terms (e.g. "HP").
         entries.sort_by_key(|a| std::cmp::Reverse(a.original.len()));
@@ -123,9 +137,12 @@ impl ContextManager {
             .join(". ")
     }
 
-    fn format_glossary_context(&self) -> String {
+    fn format_glossary_context(&self, target_lang: &str) -> String {
         let glossary = self.glossary.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries = glossary.values().collect::<Vec<_>>();
+        let russian_defaults = self.russian_default_terms.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = glossary.iter().filter(|(key, _)|
+            target_lang.eq_ignore_ascii_case("ru") || !russian_defaults.contains(*key))
+            .map(|(_, entry)| entry).collect::<Vec<_>>();
         entries.sort_by(|left, right| left.original.cmp(&right.original));
         entries.iter().map(|entry| serde_json::json!({
             "source": entry.original, "preferred": entry.replacement, "notes": entry.notes,
@@ -456,6 +473,15 @@ pub fn clean_russian_punctuation(text: &str) -> String {
     out.trim().to_string()
 }
 
+fn nonempty_translation(text: &str, service: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        Err(format!("{service}: empty translated text received"))
+    } else {
+        Ok(text.to_string())
+    }
+}
+
 /// Google treats a leading comic stutter as an untranslated Latin initial.
 /// Translate the complete question, then restore hesitation in the target
 /// alphabet. Restrict this to common English dialogue openings to preserve
@@ -578,6 +604,9 @@ pub fn parse_vision_blocks_json_with_box_2d(
 
         if orig.is_empty() && trans.is_empty() {
             continue;
+        }
+        if trans.is_empty() {
+            return Err("Vision: empty translated text received".to_string());
         }
 
         let box_coords = item
@@ -755,7 +784,7 @@ pub fn parse_deepl_batch_response(body: &str, expected: usize) -> Result<Vec<Str
     let mut results = Vec::with_capacity(translations.len());
     for item in translations {
         if let Some(txt) = item.get("text").and_then(|t| t.as_str()) {
-            results.push(txt.to_string());
+            results.push(nonempty_translation(txt, "DeepL")?);
         } else {
             return Err("Missing text in DeepL translation item".to_string());
         }
@@ -999,7 +1028,7 @@ impl TranslatorService {
         }
         if matches!(config.provider, TranslationProvider::Gemini | TranslationProvider::OpenAICompatible) {
             context.push_str("Preferred terminology and notes (use when relevant; preserve grammar and the requested target language):\n");
-            context.push_str(&self.context.format_glossary_context());
+            context.push_str(&self.context.format_glossary_context(&config.target_lang));
         }
         context
     }
@@ -1017,7 +1046,7 @@ impl TranslatorService {
         // A JSON tuple keeps text, model, endpoint, and history boundaries unambiguous.
         // Glossary changes also invalidate postprocessed Google/DeepL results.
         serde_json::json!([purpose, backend, model, source, target, text, context,
-            self.context.format_glossary_context()]).to_string()
+            self.context.format_glossary_context(target)]).to_string()
     }
 
     async fn validate_groq_vision_model(&self, base_url: &str, api_key: &str, model: &str) -> Result<(), String> {
@@ -1166,7 +1195,7 @@ impl TranslatorService {
             return Err("No translated text received from Google".to_string());
         }
 
-        Ok(restore_russian_stutter(&translated_pieces.join(""), stutter_repeats))
+        nonempty_translation(&restore_russian_stutter(&translated_pieces.join(""), stutter_repeats), "Google")
     }
 
     pub async fn translate_deepl(
@@ -1320,7 +1349,7 @@ impl TranslatorService {
             .and_then(|txt| txt.as_str())
             .ok_or_else(|| redact_secrets(&format!("Invalid Gemini structure: {:?}", json)))?;
 
-        Ok(candidate.trim().to_string())
+        nonempty_translation(candidate, "Gemini")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1383,7 +1412,7 @@ impl TranslatorService {
             .and_then(|txt| txt.as_str())
             .ok_or_else(|| redact_secrets(&format!("Invalid OpenAI structure: {:?}", json)))?;
 
-        Ok(text_res.trim().to_string())
+        nonempty_translation(text_res, "OpenAI")
     }
 
     /// Vision OCR Fallback: directly sends PNG frame to multimodal vision model to recognize stylized manga/SFX.
@@ -1651,7 +1680,9 @@ impl TranslatorService {
             .translate_provider_with_context(preprocessed, source_lang, target_lang, config, context)
             .await.map_err(|message| self.translation_error(message))?;
         let clean_ru = clean_russian_punctuation(&raw);
-        let final_text = self.context.postprocess(&clean_ru);
+        let final_text = self.context.postprocess_for_target(&clean_ru, target_lang);
+        let final_text = nonempty_translation(&final_text, "Translation")
+            .map_err(|message| self.translation_error(message))?;
 
         self.cache.insert(cache_key, final_text.clone());
         if record_history {
@@ -1834,7 +1865,7 @@ impl TranslatorService {
                 }
             }
 
-        if primary.is_empty() {
+        if primary.trim().is_empty() {
             return Err("No translation found".to_string());
         }
 
@@ -1887,9 +1918,11 @@ impl TranslatorService {
         if let Some(Ok(translated)) = batch.as_ref()
             && translated.len() == batch_indices.len() {
             for (&i, text) in batch_indices.iter().zip(translated) {
-                let value = self.context.postprocess(&clean_russian_punctuation(text.trim()));
-                self.cache.insert(keys[i].clone(), value.clone());
-                values[i] = Some(value);
+                let value = self.context.postprocess_for_target(&clean_russian_punctuation(text.trim()), &config.target_lang);
+                if !value.trim().is_empty() {
+                    self.cache.insert(keys[i].clone(), value.clone());
+                    values[i] = Some(value);
+                }
             }
         }
         let remaining = uncached.into_iter().filter(|&i| values[i].is_none()).collect::<Vec<_>>();
@@ -1989,6 +2022,99 @@ mod tests {
 
     fn completion_response(text: &str) -> String {
         serde_json::json!({"choices":[{"message":{"content":text}}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn regression_empty_completion_is_retried_without_caching_or_history() {
+        let (base_url, server) = mock_responses(vec![
+            (200, String::new(), completion_response(" \n\t")),
+            (200, String::new(), completion_response("A valid translation")),
+        ]).await;
+        let config = openai_config(base_url);
+        let service = TranslatorService::with_history_size(5);
+        let blocks = vec![OcrBlock {
+            text: "A real dialogue line".into(), rect: ScreenRect::new(0, 0, 100, 20), lines: vec![],
+        }];
+        let failed = service.translate_blocks_report(&blocks, &config).await;
+        assert_eq!(failed.errors.len(), 1, "empty output must not mark a scene complete");
+        assert!(service.cache.inner.lock().unwrap().map.is_empty());
+        assert!(service.context.get_recent_history().is_empty());
+        assert!(!service.automatic_retry_ready());
+        service.reset_retry();
+        let recovered = service.translate_blocks_report(&blocks, &config).await;
+        assert!(recovered.errors.is_empty());
+        assert_eq!(recovered.blocks[0].translated_text, "A valid translation");
+        assert_eq!(service.context.get_recent_history(),
+            vec![("A real dialogue line".into(), "A valid translation".into())]);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn regression_google_rejects_whitespace_translation() {
+        let (endpoint, server) = mock_responses(vec![(200, String::new(),
+            serde_json::json!({"sentences":[{"trans":" \n "}]}).to_string())]).await;
+        let mut service = TranslatorService::new();
+        service.google_endpoint = Some(endpoint);
+        assert!(service.translate_google("Hello world", "en", "ru").await.is_err());
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn regression_deepl_rejects_an_empty_item_in_a_successful_batch() {
+        let body = serde_json::json!({"translations":[{"text":"Valid"},{"text":" \n "}]}).to_string();
+        assert!(parse_deepl_batch_response(&body, 2).is_err());
+    }
+
+    #[test]
+    fn regression_russian_defaults_follow_target_and_custom_terms_remain_unscoped() {
+        let service = TranslatorService::new();
+        let text = "100 EXP, 20 ATK, 10 DEF, Lv 5, HP, MP, NPC";
+        assert_eq!(service.context.postprocess_for_target(text, "de"), text);
+        assert_eq!(service.context.postprocess_for_target(text, "en"), text);
+        assert_eq!(service.context.postprocess_for_target(text, "RU"),
+            "100 Опыт, 20 АТК, 10 ЗАЩ, Ур. 5, HP, MP, NPC");
+        let mut config = AppConfig { provider: TranslationProvider::OpenAICompatible,
+            openai_api_key: Some("dummy-test-key".into()), target_lang: "de".into(),
+            ..AppConfig::default() };
+        let context = service.translation_context(&[], &config);
+        for russian in ["Опыт", "АТК", "ЗАЩ", "Ур."] {
+            assert!(!context.contains(russian));
+        }
+        assert!(context.contains("Health points"));
+        config.target_lang = "ru".into();
+        assert!(service.translation_context(&[], &config).contains("Опыт"));
+        service.context.add_glossary_term("EXP", "XP", Some("Custom terminology".into()));
+        assert_eq!(service.context.postprocess_for_target("100 EXP", "de"), "100 XP");
+        assert_eq!(service.context.postprocess_for_target("100 EXP", "ru"), "100 XP");
+        config.target_lang = "de".into();
+        assert!(service.translation_context(&[], &config).contains("Custom terminology"));
+    }
+
+    #[tokio::test]
+    async fn regression_single_and_batch_translation_use_the_configured_glossary_language() {
+        let (base_url, server) = mock_responses(vec![
+            (200, String::new(), completion_response("100 EXP, 20 ATK")),
+            (200, String::new(), completion_response("Lv 5")),
+        ]).await;
+        let mut config = openai_config(base_url);
+        config.target_lang = "de".into();
+        let service = TranslatorService::new();
+        assert_eq!(service.translate_text("Game stats", "en", "de", &config).await.unwrap(),
+            "100 EXP, 20 ATK");
+        let report = service.translate_blocks_report(&[OcrBlock {
+            text: "Game level".into(), rect: ScreenRect::new(0, 0, 100, 20), lines: vec![],
+        }], &config).await;
+        assert!(report.errors.is_empty());
+        assert_eq!(report.blocks[0].translated_text, "Lv 5");
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn regression_vision_rejects_missing_translation_for_detected_dialogue() {
+        let roi = ScreenRect::new(0, 0, 100, 100);
+        assert!(parse_vision_blocks_json_with_box_2d(
+            r#"[{"original":"Hello world","translation":" "}]"#, &roi).is_err());
+        assert!(parse_vision_blocks_json_with_box_2d("[]", &roi).unwrap().is_empty());
     }
 
     #[tokio::test]
