@@ -1,0 +1,598 @@
+[
+  {
+    "blocks": [
+      "PLEASE FOLLOW INSTRUCTIONS!"
+    ],
+    "file": "please_follow.png",
+    "lines": [
+      "PLEASE FOLLOW",
+      "INSTRUCTIONS!"
+    ],
+    "ms": 244.084,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "PLEASE FOLLOW INSTRUCTIONS!",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "LET'S POST IT ON UTUBE SHORTS!"
+    ],
+    "file": "utube_shorts.png",
+    "lines": [
+      "LET'S POST",
+      "IT ON UTUBE",
+      "SHORTS!"
+    ],
+    "ms": 201.9887,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "LET'S POST IT ON UTUBE SHORTS!",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "HAS ENTERED h\"ANEW ERAS",
+      "NEW ERAS};"
+    ],
+    "file": "new_era_white_glow.png",
+    "lines": [
+      "HAS ENTERED",
+      "h\"ANEW ERAS",
+      "NEW ERAS};"
+    ],
+    "ms": 126.3777,
+    "cer": 0.5909090909090909,
+    "wer": 0.6,
+    "missing_lines": 1,
+    "text": "HAS ENTERED H\"ANEW ERAS NEW ERAS};",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "- EXCUSEME SIR",
+      "EXCUSEME SW",
+      "EXCUSE ME SIR",
+      "SH€ASKED FOR NO PICKLES",
+      "SHE ASKED FOR NO PICKLES"
+    ],
+    "file": "meme_no_pickles.png",
+    "lines": [
+      "- EXCUSEME SIR",
+      "EXCUSEME SW",
+      "EXCUSE ME SIR",
+      "SH€ASKED FOR NO PICKLES",
+      "SHE ASKED FOR NO PICKLES"
+    ],
+    "ms": 2615.4432,
+    "cer": 1.3421052631578947,
+    "wer": 1.125,
+    "missing_lines": 0,
+    "text": "- EXCUSEME SIR EXCUSEME SW EXCUSE ME SIR SH€ASKED FOR NO PICKLES SHE ASKED FOR NO PICKLES",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "Please wait for the next mission."
+    ],
+    "file": "small_subtitle.png",
+    "lines": [
+      "Please wait for the next mission."
+    ],
+    "ms": 269.9442,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "PLEASE WAIT FOR THE NEXT MISSION.",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "Please wait for the next mission."
+    ],
+    "file": "small_subtitle_noisy.png",
+    "lines": [
+      "Please wait for the next mission."
+    ],
+    "ms": 268.6443,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "PLEASE WAIT FOR THE NEXT MISSION.",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "Dont quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "file": "english_thin_10.png",
+    "lines": [
+      "Dont quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "ms": 280.2804,
+    "cer": 0.018518518518518517,
+    "wer": 0.16666666666666666,
+    "missing_lines": 0,
+    "text": "DONT QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "file": "english_dark_14.png",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "ms": 275.645,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "file": "english_italic_14.png",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "ms": 269.7285,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "file": "english_edge_14.png",
+    "lines": [
+      "Don't quit! iPhone saves state-of-the-art screenshots."
+    ],
+    "ms": 268.0231,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "file": "manga_comic.png",
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "ms": 177.4792,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "WArT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "file": "manga_italic.png",
+    "lines": [
+      "WArT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "ms": 174.2918,
+    "cer": 0.030303030303030304,
+    "wer": 0.125,
+    "missing_lines": 0,
+    "text": "WART! WE HAVE TO GET OUT OF HERE!",
+    "pass": false
+  },
+  {
+    "blocks": [],
+    "file": "manga_condensed.png",
+    "lines": [],
+    "ms": 241.0347,
+    "cer": 1.0,
+    "wer": 1.0,
+    "missing_lines": 1,
+    "text": "",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "file": "manga_heavy.png",
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "ms": 179.2531,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "WAIT! we HAVÜTO GET OF HERE!"
+    ],
+    "file": "manga_outline.png",
+    "lines": [
+      "WAIT! we HAVÜTO GET OF HERE!"
+    ],
+    "ms": 181.16199999999998,
+    "cer": 0.18181818181818182,
+    "wer": 0.375,
+    "missing_lines": 0,
+    "text": "WAIT! WE HAVÜTO GET OF HERE!",
+    "pass": false
+  },
+  {
+    "blocks": [],
+    "file": "manga_low_contrast.png",
+    "lines": [],
+    "ms": 206.9471,
+    "cer": 1.0,
+    "wer": 1.0,
+    "missing_lines": 1,
+    "text": "",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "file": "manga_handwritten.png",
+    "lines": [
+      "WAIT! WE HAVE TO GET OUT OF HERE!"
+    ],
+    "ms": 175.9505,
+    "cer": 0.0,
+    "wer": 0.0,
+    "missing_lines": 0,
+    "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+    "pass": true
+  },
+  {
+    "blocks": [
+      "finA 044?!",
+      "firlA our !"
+    ],
+    "file": "manga_handwritten_black.png",
+    "lines": [
+      "finA 044?!",
+      "firlA our !"
+    ],
+    "ms": 224.6095,
+    "cer": 0.7894736842105263,
+    "wer": 1.25,
+    "missing_lines": 2,
+    "text": "FINA 044?! FIRLA OUR !",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "K4fPfM! Vf VOV 4Lß/6M7?!"
+    ],
+    "file": "manhwa_01.png",
+    "lines": [
+      "K4fPfM!",
+      "Vf VOV 4Lß/6M7?!"
+    ],
+    "ms": 834.6055,
+    "cer": 0.68,
+    "wer": 1.0,
+    "missing_lines": 2,
+    "text": "K4FPFM! VF VOV 4LSS/6M7?!",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "No, W WKOCE BODY HURTS LIKE KELL.",
+      "W WHOLE BODY KURTS CSKE KEW."
+    ],
+    "file": "manhwa_02.png",
+    "lines": [
+      "No,",
+      "W WKOCE",
+      "BODY HURTS",
+      "LIKE KELL.",
+      "W WHOLE",
+      "BODY KURTS",
+      "CSKE KEW."
+    ],
+    "ms": 936.1777999999999,
+    "cer": 1.0,
+    "wer": 1.2857142857142858,
+    "missing_lines": 1,
+    "text": "NO, W WKOCE BODY HURTS LIKE KELL. W WHOLE BODY KURTS CSKE KEW.",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "S CAN BARELY MOVE ONE OF W ARMS, AND W CORE SS COMPLETEW OVERLOADED.„"
+    ],
+    "file": "manhwa_03.png",
+    "lines": [
+      "S CAN BARELY",
+      "MOVE ONE OF W",
+      "ARMS, AND W CORE",
+      "SS COMPLETEW",
+      "OVERLOADED.„"
+    ],
+    "ms": 963.1982,
+    "cer": 0.136986301369863,
+    "wer": 0.42857142857142855,
+    "missing_lines": 1,
+    "text": "S CAN BARELY MOVE ONE OF W ARMS, AND W CORE SS COMPLETEW OVERLOADED.„",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "DON'T LOOK AT Me LIKE THAT,",
+      "FOUeHT TWO TOP IO'S"
+    ],
+    "file": "manhwa_04.png",
+    "lines": [
+      "DON'T LOOK",
+      "AT Me LIKE THAT,",
+      "FOUeHT",
+      "TWO TOP IO'S"
+    ],
+    "ms": 1160.0457,
+    "cer": 0.2711864406779661,
+    "wer": 0.46153846153846156,
+    "missing_lines": 2,
+    "text": "DON'T LOOK AT ME LIKE THAT, FOUEHT TWO TOP IO'S",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "STILL, IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WOPPY"
+    ],
+    "file": "manhwa_05.png",
+    "lines": [
+      "STILL, IT'S",
+      "ONLY THIS BAD,",
+      "THEN I'M FINE, SO",
+      "DON'T WOPPY"
+    ],
+    "ms": 1061.3895,
+    "cer": 0.1,
+    "wer": 0.16666666666666666,
+    "missing_lines": 2,
+    "text": "STILL, IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WOPPY",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "I'LL HEAD DOWN AND eeT some PEST TO pecovep,",
+      "SOME- PEST TO"
+    ],
+    "file": "manhwa_06.png",
+    "lines": [
+      "I'LL HEAD",
+      "DOWN AND eeT",
+      "some PEST TO",
+      "pecovep,",
+      "SOME- PEST TO"
+    ],
+    "ms": 1203.2618,
+    "cer": 0.4318181818181818,
+    "wer": 0.6666666666666666,
+    "missing_lines": 1,
+    "text": "I'LL HEAD DOWN AND EET SOME PEST TO PECOVEP, SOME- PEST TO",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "WON THIS TIME, TOO,"
+    ],
+    "file": "manhwa_07.png",
+    "lines": [
+      "WON THIS",
+      "TIME, TOO,"
+    ],
+    "ms": 794.9815,
+    "cer": 0.14285714285714285,
+    "wer": 0.4,
+    "missing_lines": 0,
+    "text": "WON THIS TIME, TOO,",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "dust you SAID, HAD A Of A"
+    ],
+    "file": "manhwa_08.png",
+    "lines": [
+      "dust",
+      "you SAID, HAD",
+      "A Of A"
+    ],
+    "ms": 1020.2005999999999,
+    "cer": 0.45454545454545453,
+    "wer": 0.45454545454545453,
+    "missing_lines": 3,
+    "text": "DUST YOU SAID, HAD A OF A",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "IAN PATPICK WAS ALIVE,"
+    ],
+    "file": "manhwa_09.png",
+    "lines": [
+      "IAN PATPICK",
+      "WAS ALIVE,"
+    ],
+    "ms": 1386.2575,
+    "cer": 0.09090909090909091,
+    "wer": 0.5,
+    "missing_lines": 0,
+    "text": "IAN PATPICK WAS ALIVE,",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "THAT'S PteHT, ALTHOUeH HIS CONDITION WASN'T CPEAT,"
+    ],
+    "file": "manhwa_10.png",
+    "lines": [
+      "THAT'S PteHT,",
+      "ALTHOUeH HIS",
+      "CONDITION WASN'T",
+      "CPEAT,"
+    ],
+    "ms": 1073.6846,
+    "cer": 0.14,
+    "wer": 0.42857142857142855,
+    "missing_lines": 2,
+    "text": "THAT'S PTEHT, ALTHOUEH HIS CONDITION WASN'T CPEAT,",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "PESCUED HIM FPOM WHepe THEY wepe HOLDINe HIM CAPTIVE- AND SENT HIM TO VEPAMONTE,"
+    ],
+    "file": "manhwa_11.png",
+    "lines": [
+      "PESCUED",
+      "HIM FPOM WHepe",
+      "THEY wepe HOLDINe HIM",
+      "CAPTIVE- AND SENT HIM",
+      "TO VEPAMONTE,"
+    ],
+    "ms": 1205.9759999999999,
+    "cer": 0.12345679012345678,
+    "wer": 0.5333333333333333,
+    "missing_lines": 1,
+    "text": "PESCUED HIM FPOM WHEPE THEY WEPE HOLDINE HIM CAPTIVE- AND SENT HIM TO VEPAMONTE,",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "THWKf0U 60 MVCH./"
+    ],
+    "file": "manhwa_12.png",
+    "lines": [
+      "THWKf0U",
+      "60 MVCH./"
+    ],
+    "ms": 1725.1278000000002,
+    "cer": 0.5555555555555556,
+    "wer": 1.0,
+    "missing_lines": 2,
+    "text": "THWKF0U 60 MVCH./",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "eveN THOUéH THE OUTCOME WAS ALPEADY oectoeo, IT CAUeHT ME- OFF eUAPD WHEN THEY PUSHED IN LIKE- THEY WANTED TO DE TOeeTHEP,",
+      "THE-Y WANTED TO"
+    ],
+    "file": "manhwa_13.png",
+    "lines": [
+      "eveN THOUéH",
+      "THE OUTCOME WAS",
+      "ALPEADY oectoeo, IT",
+      "CAUeHT ME- OFF eUAPD",
+      "WHEN THEY PUSHED IN",
+      "LIKE- THEY WANTED TO",
+      "DE TOeeTHEP,",
+      "THE-Y WANTED TO"
+    ],
+    "ms": 1217.8291,
+    "cer": 0.2644628099173554,
+    "wer": 0.5909090909090909,
+    "missing_lines": 3,
+    "text": "EVEN THOUÉH THE OUTCOME WAS ALPEADY OECTOEO, IT CAUEHT ME- OFF EUAPD WHEN THEY PUSHED IN LIKE- THEY WANTED TO DE TOEETHEP, THE-Y WANTED TO",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "HOLDINe BACK OUST gecAuse THE ENEMY SAID THEY SUPPE-NDE-P„,",
+      "fit"
+    ],
+    "file": "manhwa_14.png",
+    "lines": [
+      "HOLDINe BACK",
+      "OUST gecAuse THE",
+      "ENEMY SAID THEY",
+      "SUPPE-NDE-P„,",
+      "fit"
+    ],
+    "ms": 1115.5577,
+    "cer": 0.2413793103448276,
+    "wer": 0.5555555555555556,
+    "missing_lines": 1,
+    "text": "HOLDINE BACK OUST GECAUSE THE ENEMY SAID THEY SUPPE-NDE-P„, FIT",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "3—3iA",
+      "044?!",
+      "60"
+    ],
+    "file": "manhwa_15.png",
+    "lines": [
+      "3—3iA",
+      "044?!",
+      "60"
+    ],
+    "ms": 1133.3208,
+    "cer": 0.8421052631578947,
+    "wer": 1.0,
+    "missing_lines": 2,
+    "text": "3—3IA 044?! 60",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "BUT THE PLACE FEELS LIKE COMPLETEW D/FFEVE//T WORLD"
+    ],
+    "file": "manhwa_16.png",
+    "lines": [
+      "BUT THE",
+      "PLACE FEELS LIKE",
+      "COMPLETEW D/FFEVE//T",
+      "WORLD"
+    ],
+    "ms": 767.0551,
+    "cer": 0.2,
+    "wer": 0.5555555555555556,
+    "missing_lines": 2,
+    "text": "BUT THE PLACE FEELS LIKE COMPLETEW D/FFEVE//T WORLD",
+    "pass": false
+  },
+  {
+    "blocks": [
+      "COME- TO THINK OF IT„.",
+      "KAPTE-(N AND PLUTON APEN'T THE ONLY ONES SHOWINe stoes NO ONE COULD'VE evep (MAetNE-D."
+    ],
+    "file": "manhwa_17.png",
+    "lines": [
+      "COME- TO",
+      "THINK OF IT„.",
+      "KAPTE-(N AND",
+      "PLUTON APEN'T THE",
+      "ONLY ONES SHOWINe",
+      "stoes NO ONE COULD'VE",
+      "evep (MAetNE-D."
+    ],
+    "ms": 1073.1494,
+    "cer": 0.14018691588785046,
+    "wer": 0.42105263157894735,
+    "missing_lines": 2,
+    "text": "COME- TO THINK OF IT„. KAPTE-(N AND PLUTON APEN'T THE ONLY ONES SHOWINE STOES NO ONE COULD'VE EVEP (MAETNE-D.",
+    "pass": false
+  }
+]

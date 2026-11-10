@@ -392,12 +392,11 @@ pub fn find_text_under_cursor(blocks: &[OcrBlock], px: i32, py: i32) -> Option<T
     let block = &blocks[block_idx];
     let line = &block.lines[line_idx];
     let word = &line.words[word_idx];
-    let context_indices = collect_context_lines(&block.lines, line_idx);
-    let sentence_text = context_indices.iter().map(|&i| block.lines[i].text.trim())
-        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" ");
+    // Paragraph grouping already resolved spacing, hyphenation, and boundaries.
+    // Re-selecting neighbouring lines here can drop negations or split a word.
+    let sentence_text = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
     if sentence_text.is_empty() { return None; }
-    let sentence_rect = context_indices.iter().fold(line.rect,
-        |rect, &i| rect.union(&block.lines[i].rect));
+    let sentence_rect = block.rect;
     Some(TextUnderCursor {
         raw_word: Some(word.text.clone()),
         word_confidence: word.confidence,
@@ -858,6 +857,31 @@ fn safe_config_parse_error(content: &str, error: &toml::de::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_uses_complete_grouped_paragraph_including_negations_and_wrapped_words() {
+        for (first, second, gap, expected) in [
+            ("DO NOT", "OPEN THE DOOR", 20, "DO NOT OPEN THE DOOR"),
+            ("well-", "known", 4, "well-known"),
+            ("D-", "Did he find out?!", 4, "D-Did he find out?!"),
+            ("adven\u{00ad}", "ture", 4, "adventure"),
+        ] {
+            let lines = [(first, 100), (second, 120 + gap)].into_iter().map(|(text, y)| {
+                let rect = ScreenRect::new(-300, y, 240, 20);
+                RecognizedLine { text: text.into(), rect, confidence: Some(0.99),
+                    words: vec![RecognizedWord { text: text.split_whitespace().next().unwrap().into(),
+                        rect, confidence: Some(0.99), is_estimated: false }] }
+            }).collect();
+            let blocks = crate::ocr::cluster_lines_into_blocks(lines, None);
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, expected);
+            for y in [110, 130 + gap] {
+                let target = find_text_under_cursor(&blocks, -290, y).unwrap();
+                assert_eq!(target.sentence_text, expected);
+                assert_eq!(target.sentence_rect, blocks[0].rect);
+            }
+        }
+    }
 
     #[test]
     fn config_errors_never_include_secret_source_or_values() {

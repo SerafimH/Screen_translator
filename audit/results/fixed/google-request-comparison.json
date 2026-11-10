@@ -1,0 +1,236 @@
+[
+  {
+    "file": "manhwa_08.png",
+    "variant": "upper_context",
+    "input": "DON'T LOOK AT ME LIKE THAT.\n[---]\nI FOUGHT TWO TOP 10'S YOU KNOW?\n[---]\nSTILL, IF IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WORRY.\n[---]\nI'LL HEAD DOWN AND GET SOME REST TO RECOVER.\n[---]\nI WON THIS TIME, TOO.\n[---]\nJUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.",
+    "translation": "НЕ СМОТРИТЕ НА МЕНЯ ТАК.\n[---]\nЯ БОРАЛСЯ С ДВУМЯ ТОП-10, ПОНИМАЕШЬ?\n[---]\nТЕПЕРЬ, ЕСЛИ ВСЁ ТОЛЬКО ТАК ПЛОХО, ТО СО МНОЙ В ПОРЯДКЕ, ТАК НЕ БОЙТЕСЬ.\n[---]\nЯ спущусь вниз и немного отдохну, чтобы восстановиться.\n[---]\nЯ ТОЖЕ ВЫИГРАЛ В ЭТОТ РАЗ.\n[---]\nКАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "upper_alone",
+    "input": "JUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.",
+    "translation": "КАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_alone",
+    "input": "Just like you said, i had a hell of a fight.",
+    "translation": "Как ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "upper_context_nmt",
+    "input": "DON'T LOOK AT ME LIKE THAT.\n[---]\nI FOUGHT TWO TOP 10'S YOU KNOW?\n[---]\nSTILL, IF IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WORRY.\n[---]\nI'LL HEAD DOWN AND GET SOME REST TO RECOVER.\n[---]\nI WON THIS TIME, TOO.\n[---]\nJUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.",
+    "translation": "НЕ СМОТРИТЕ НА МЕНЯ ТАК.\n[---]\nЯ БОРАЛСЯ С ДВУМЯ ТОП-10, ПОНИМАЕШЬ?\n[---]\nТЕПЕРЬ, ЕСЛИ ВСЁ ТОЛЬКО ТАК ПЛОХО, ТО СО МНОЙ В ПОРЯДКЕ, ТАК НЕ БОЙТЕСЬ.\n[---]\nЯ спущусь вниз и немного отдохну, чтобы восстановиться.\n[---]\nЯ ТОЖЕ ВЫИГРАЛ В ЭТОТ РАЗ.\n[---]\nКАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "upper_alone_nmt",
+    "input": "JUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.",
+    "translation": "КАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_context",
+    "input": "Don't look at me like that.\n[---]\nI fought two top 10's you know?\n[---]\nStill, if it's only this bad, then i'm fine, so don't worry.\n[---]\nI'll head down and get some rest to recover.\n[---]\nI won this time, too.\n[---]\nJust like you said, i had a hell of a fight.",
+    "translation": "Не смотри на меня так.\n[---]\nЯ дрался с двумя игроками из топ-10, понимаешь?\n[---]\nТем не менее, если всё настолько плохо, то со мной всё в порядке, так что не волнуйся.\n[---]\nЯ спущусь и отдохну, чтобы прийти в себя.\n[---]\nЯ выиграл и в этот раз.\n[---]\nКак ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_period",
+    "input": "Just like you said, i had a hell of a fight.",
+    "translation": "Как ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_unicode_ellipsis",
+    "input": "Just like you said, i had a hell of a fight.",
+    "translation": "Как ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_pronoun",
+    "input": "Just like you said, I had a hell of a fight.",
+    "translation": "Как ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "sentence_pronoun_context",
+    "input": "Don't look at me like that.\n[---]\nI fought two top 10's you know?\n[---]\nStill, if it's only this bad, then i'm fine, so don't worry.\n[---]\nI'll head down and get some rest to recover.\n[---]\nI won this time, too.\n[---]\nJust like you said, I had a hell of a fight.",
+    "translation": "Не смотри на меня так.\n[---]\nЯ дрался с двумя игроками из топ-10, понимаешь?\n[---]\nТем не менее, если всё настолько плохо, то со мной всё в порядке, так что не волнуйся.\n[---]\nЯ спущусь и отдохну, чтобы прийти в себя.\n[---]\nЯ выиграл и в этот раз.\n[---]\nКак ты и сказал, я ужасно поссорился."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "english_idiom_paraphrase",
+    "input": "Just like you said, I had an extremely intense fight.",
+    "translation": "Как вы и сказали, у меня была очень напряженная ссора."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "tough_fight_paraphrase",
+    "input": "Just like you said, I had a very tough fight.",
+    "translation": "Как вы и сказали, у меня был очень тяжелый бой."
+  },
+  {
+    "file": "manhwa_08.png",
+    "variant": "conservative_case",
+    "input": "just like you SAID, I had a HELL of a FIGHT.",
+    "translation": "как ты и сказал, у меня была АДСКАЯ драка."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "upper_context",
+    "input": "I'LL HEAD DOWN AND GET SOME REST TO RECOVER.\n[---]\nI WON THIS TIME, TOO.\n[---]\nJUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.\n[---]\nIAN PATRICK WAS ALIVE.\n[---]\nTHAT'S RIGHT. ALTHOUGH HIS CONDITION WASN'T GREAT,\n[---]\nI RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE.",
+    "translation": "Я спущусь вниз и немного отдохну, чтобы восстановиться.\n[---]\nЯ ТОЖЕ ВЫИГРАЛ В ЭТОТ РАЗ.\n[---]\nКАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА.\n[---]\nЙЕН ПАТРИК БЫЛ ЖИВ.\n[---]\nЭТО ВЕРНО. ХОТЯ СОСТОЯНИЕ ЕГО БЫЛО НЕ ОТЛИЧНЫМ,\n[---]\nЯ СПАСЛА ЕГО ОТ ГОДА, ОТКУДА ЕГО ДЕРЖАЛИ В ПЛЕНЕ, И ОТПРАВИЛА В ВЕРАМОНТЕ."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "upper_alone",
+    "input": "I RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE.",
+    "translation": "Я СПАСЛА ЕГО ОТ ГОДА, ОТКУДА ЕГО ДЕРЖАЛИ В ПЛЕНЕ, И ОТПРАВИЛА В ВЕРАМОНТЕ."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_alone",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "upper_context_nmt",
+    "input": "I'LL HEAD DOWN AND GET SOME REST TO RECOVER.\n[---]\nI WON THIS TIME, TOO.\n[---]\nJUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.\n[---]\nIAN PATRICK WAS ALIVE.\n[---]\nTHAT'S RIGHT. ALTHOUGH HIS CONDITION WASN'T GREAT,\n[---]\nI RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE.",
+    "translation": "Я спущусь вниз и немного отдохну, чтобы восстановиться.\n[---]\nЯ ТОЖЕ ВЫИГРАЛ В ЭТОТ РАЗ.\n[---]\nКАК ТЫ СКАЗАЛ, У МЕНЯ АДАЯ ПОРАДА.\n[---]\nЙЕН ПАТРИК БЫЛ ЖИВ.\n[---]\nЭТО ВЕРНО. ХОТЯ СОСТОЯНИЕ ЕГО БЫЛО НЕ ОТЛИЧНЫМ,\n[---]\nЯ СПАСЛА ЕГО ОТ ГОДА, ОТКУДА ЕГО ДЕРЖАЛИ В ПЛЕНЕ, И ОТПРАВИЛА В ВЕРАМОНТЕ."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "upper_alone_nmt",
+    "input": "I RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE.",
+    "translation": "Я СПАСЛА ЕГО ОТ ГОДА, ОТКУДА ЕГО ДЕРЖАЛИ В ПЛЕНЕ, И ОТПРАВИЛА В ВЕРАМОНТЕ."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_context",
+    "input": "I'll head down and get some rest to recover.\n[---]\nI won this time, too.\n[---]\nJust like you said, i had a hell of a fight.\n[---]\nIan patrick was alive.\n[---]\nThat's right. although his condition wasn't great,\n[---]\nI rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спущусь и отдохну, чтобы прийти в себя.\n[---]\nЯ выиграл и в этот раз.\n[---]\nКак ты и сказал, я ужасно поссорился.\n[---]\nЯн Патрик был жив.\n[---]\nЭто верно. хотя его состояние было не очень хорошим,\n[---]\nЯ спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_period",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_unicode_ellipsis",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_pronoun",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "sentence_pronoun_context",
+    "input": "I'll head down and get some rest to recover.\n[---]\nI won this time, too.\n[---]\nJust like you said, I had a hell of a fight.\n[---]\nIan patrick was alive.\n[---]\nThat's right. although his condition wasn't great,\n[---]\nI rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спущусь и отдохну, чтобы прийти в себя.\n[---]\nЯ выиграл и в этот раз.\n[---]\nКак ты и сказал, я ужасно поссорился.\n[---]\nЯн Патрик был жив.\n[---]\nЭто верно. хотя его состояние было не очень хорошим,\n[---]\nЯ спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "english_idiom_paraphrase",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "tough_fight_paraphrase",
+    "input": "I rescued him from where they were holding him captive and sent him to veramonte.",
+    "translation": "Я спас его из плена и отправил в Верамонте."
+  },
+  {
+    "file": "manhwa_11.png",
+    "variant": "conservative_case",
+    "input": "I RESCUED him from where they were holding him CAPTIVE and sent him to VERAMONTE.",
+    "translation": "Я СПАСЛА его из того места, где его держали в плену, и отправила в ВЕРАМОНТЕ."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "upper_context",
+    "input": "THANK YOU SO MUCH!\n[---]\nEVEN THOUGH THE OUTCOME WAS ALREADY DECIDED, IT CAUGHT ME OFF GUARD WHEN THEY RUSHED IN LIKE THEY WANTED TO DIE TOGETHER.\n[---]\nHOLDING BACK JUST BECAUSE THE ENEMY SAID THEY SURRENDER...\n[---]\nD-Did he find out?!\n[---]\nBUT THIS PLACE FEELS LIKE A COMPLETELY DIFFERENT WORLD.\n[---]\nCOME TO THINK OF IT...",
+    "translation": "БОЛЬШОЕ СПАСИБО!\n[---]\nДАЖЕ ХОТЯ РЕЗУЛЬТАТ УЖЕ БЫЛ РЕШЕН, ОН ЗАСТАВИЛ МЕНЯ Врасплох, КОГДА ОНИ ворвались, ТАК, КАК ХОТИЛИ УМЕРТЬ ВМЕСТЕ.\n[---]\nСДЕРЖИВАЮТСЯ ТОЛЬКО ПОТОМУ ЧТО ВРАГ СКАЗАЛ, ЧТО СДАЕТСЯ...\n[---]\nД-он узнал?!\n[---]\nНО ЭТО МЕСТО КАЖЕТСЯ СОВЕРШЕННО ДРУГИМ МИРОМ.\n[---]\nПОДУМАЙТЕ ОБ ЭТОМ..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "upper_alone",
+    "input": "COME TO THINK OF IT...",
+    "translation": "ПОДУМАЙТЕ ОБ ЭТОМ..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_alone",
+    "input": "Come to think of it...",
+    "translation": "Давай подумаем об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "upper_context_nmt",
+    "input": "THANK YOU SO MUCH!\n[---]\nEVEN THOUGH THE OUTCOME WAS ALREADY DECIDED, IT CAUGHT ME OFF GUARD WHEN THEY RUSHED IN LIKE THEY WANTED TO DIE TOGETHER.\n[---]\nHOLDING BACK JUST BECAUSE THE ENEMY SAID THEY SURRENDER...\n[---]\nD-Did he find out?!\n[---]\nBUT THIS PLACE FEELS LIKE A COMPLETELY DIFFERENT WORLD.\n[---]\nCOME TO THINK OF IT...",
+    "translation": "БОЛЬШОЕ СПАСИБО!\n[---]\nДАЖЕ ХОТЯ РЕЗУЛЬТАТ УЖЕ БЫЛ РЕШЕН, ОН ЗАСТАВИЛ МЕНЯ Врасплох, КОГДА ОНИ ворвались, ТАК, КАК ХОТИЛИ УМЕРТЬ ВМЕСТЕ.\n[---]\nСДЕРЖИВАЮТСЯ ТОЛЬКО ПОТОМУ ЧТО ВРАГ СКАЗАЛ, ЧТО СДАЕТСЯ...\n[---]\nД-он узнал?!\n[---]\nНО ЭТО МЕСТО КАЖЕТСЯ СОВЕРШЕННО ДРУГИМ МИРОМ.\n[---]\nПОДУМАЙТЕ ОБ ЭТОМ..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "upper_alone_nmt",
+    "input": "COME TO THINK OF IT...",
+    "translation": "ПОДУМАЙТЕ ОБ ЭТОМ..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_context",
+    "input": "Thank you so much!\n[---]\nEven though the outcome was already decided, it caught me off guard when they rushed in like they wanted to die together.\n[---]\nHolding back just because the enemy said they surrender...\n[---]\nD-did he find out?!\n[---]\nBut this place feels like a completely different world.\n[---]\nCome to think of it...",
+    "translation": "Большое спасибо!\n[---]\nНесмотря на то, что исход уже был определен, меня застало врасплох, когда они ворвались сюда, как будто хотели умереть вместе.\n[---]\nСдерживается только потому, что враг сказал, что сдается...\n[---]\nД-он узнал?!\n[---]\nНо это место похоже на совершенно другой мир.\n[---]\nДавай подумаем об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_period",
+    "input": "Come to think of it.",
+    "translation": "Подумайте об этом."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_unicode_ellipsis",
+    "input": "Come to think of it…",
+    "translation": "Давай подумаем об этом…"
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_pronoun",
+    "input": "Come to think of it...",
+    "translation": "Давай подумаем об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "sentence_pronoun_context",
+    "input": "Thank you so much!\n[---]\nEven though the outcome was already decided, it caught me off guard when they rushed in like they wanted to die together.\n[---]\nHolding back just because the enemy said they surrender...\n[---]\nD-did he find out?!\n[---]\nBut this place feels like a completely different world.\n[---]\nCome to think of it...",
+    "translation": "Большое спасибо!\n[---]\nНесмотря на то, что исход уже был определен, меня застало врасплох, когда они ворвались сюда, как будто хотели умереть вместе.\n[---]\nСдерживается только потому, что враг сказал, что сдается...\n[---]\nД-он узнал?!\n[---]\nНо это место похоже на совершенно другой мир.\n[---]\nДавай подумаем об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "english_idiom_paraphrase",
+    "input": "Now that I think about it...",
+    "translation": "Теперь, когда я думаю об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "tough_fight_paraphrase",
+    "input": "Now that I think about it...",
+    "translation": "Теперь, когда я думаю об этом..."
+  },
+  {
+    "file": "manhwa_17.png",
+    "variant": "conservative_case",
+    "input": "come to think of IT...",
+    "translation": "подумай об ЭТО..."
+  }
+]

@@ -47,8 +47,12 @@ a translation service.
 The explicit network test `live_google_supplied_manhwa_translation_report`
 translates the supplied dialogue with its preceding context and writes
 `target/manhwa-google-translations.json`. It is ignored by the default test run.
-Successful requests prove service integration and paragraph separation, not
-literary translation quality; the report must be reviewed for semantic mistakes.
+The test also checks the manually reviewed semantic criteria in
+`../translation/google-en-ru.json`: negation, combat rather than an argument,
+captivity, surprise, hesitation, and a speaker's reflection rather than a command.
+It writes failures to `target/google-semantic-errors.json`. These checks accept
+alternative wording and catch the audited mistakes; they do not replace a full
+literary translation review.
 
 The local RapidOCR report includes character error rate (CER), word error rate (WER), missing lines,
 recognized text, and processing time per image. Model initialization time is

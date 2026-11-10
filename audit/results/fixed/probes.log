@@ -1,0 +1,19 @@
+
+running 6 tests
+test audit_probes::paragraph_context_keeps_negation_at_an_accepted_line_gap ... VERIFIED gap: paragraph="DO NOT OPEN THE DOOR", cursor="DO NOT OPEN THE DOOR"
+ok
+test audit_probes::paragraph_context_keeps_wrapped_words ... VERIFIED hyphen: paragraph="well-known", cursor="well-known"
+VERIFIED hyphen: paragraph="D-Did he find out?!", cursor="D-Did he find out?!"
+ok
+test audit_probes::vision_parser_rejects_huge_model_coordinates_without_panicking ... VERIFIED vision overflow: invalid coordinates return an error without panic
+ok
+test audit_probes::vision_parser_rejects_reversed_and_out_of_image_boxes ... VERIFIED vision geometry rejected: [-100,-100,2000,2000]
+VERIFIED vision geometry rejected: [900,900,100,100]
+ok
+test audit_probes::vision_uses_dialogue_history_and_glossary ... VERIFIED vision context: history/glossary sent; result recorded in history
+ok
+test audit_probes::winrt_corpus_report ... WinRT corpus: 35 images measured; see target/audit-winrt-quality.json
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 209 filtered out; finished in 32.72s
+

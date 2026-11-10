@@ -1,0 +1,36 @@
+{
+  "cargo_test": {
+    "passed": 208,
+    "failed": 0,
+    "ignored": 1
+  },
+  "python_unittest": {
+    "passed": 59,
+    "failed": 0,
+    "skipped": 0
+  },
+  "audit_probes": {
+    "passed": 6,
+    "failed": 0
+  },
+  "google_live": {
+    "scenes": 17,
+    "blocks": 19,
+    "semantic_rules": 8,
+    "semantic_errors": []
+  },
+  "rapidocr": {
+    "passed": 35,
+    "cases": 35
+  },
+  "winrt": {
+    "passed": 12,
+    "cases": 35,
+    "old_passed": 10,
+    "old_passes_lost": [],
+    "old_mean_cer": 0.30767362931662523,
+    "new_mean_cer": 0.21419650437704976,
+    "old_mean_wer": 0.45972420645352974,
+    "new_mean_wer": 0.37327295928799686
+  }
+}

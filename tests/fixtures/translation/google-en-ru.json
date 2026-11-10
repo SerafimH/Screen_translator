@@ -1,0 +1,10 @@
+[
+  {"file":"manhwa_02.png","block":0,"required_any":[["нет"],["тел"],["бол"]],"forbidden":["как ад"]},
+  {"file":"manhwa_04.png","block":0,"required_any":[["не"],["смотр"]],"forbidden":[]},
+  {"file":"manhwa_04.png","block":1,"required_any":[["дв"],["10","десят"]],"forbidden":[]},
+  {"file":"manhwa_08.png","block":0,"required_any":[["бой","битв","сраж","драк"],["тяж","труд","жест","адск"]],"forbidden":["поссор","ссор","адая","порада"]},
+  {"file":"manhwa_11.png","block":0,"required_any":[["спас"],["плен","держал","удержива"],["верамонт"]],"forbidden":["от года"]},
+  {"file":"manhwa_13.png","block":0,"required_any":[["врасплох"],["вместе"]],"forbidden":["хотили"]},
+  {"file":"manhwa_15.png","block":0,"required_any":[["узнал","выяснил","догадал"]],"forbidden":["д-","d-"]},
+  {"file":"manhwa_17.png","block":0,"required_any":[["дума","подум","вспом"]],"forbidden":["подумайте","давай"]}
+]

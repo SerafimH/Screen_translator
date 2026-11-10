@@ -102,6 +102,65 @@ fn strong_line_covers_unscored(strong: &RecognizedLine, unscored: &RecognizedLin
         && b.y as i64 + b.height as i64 <= a.y as i64 + a.height as i64 + 2
 }
 
+/// Competing WinRT preprocessing passes have no confidence values. Resolve
+/// alternative readings of the same complete baseline before paragraph grouping;
+/// keep this separate from tile merging, where partial lines may add real words.
+fn merge_native_pass(lines: &mut Vec<RecognizedLine>, candidates: Vec<RecognizedLine>) {
+    fn quality(line: &RecognizedLine) -> i64 {
+        let letters = line.text.chars().filter(|ch| ch.is_alphanumeric()).count() as i64;
+        let words = line.text.split_whitespace().filter(|word| !is_spike_word(word)).count() as i64;
+        let noise = line.text.chars().filter(|ch| !ch.is_alphanumeric() && !ch.is_whitespace()
+            && !matches!(ch, '.' | ',' | '!' | '?' | ':' | ';' | '\'' | '’' | '"' | '“' | '”' | '-' | '—' | '…' | '(' | ')')).count() as i64;
+        let spikes = line.text.split_whitespace().filter(|word| is_spike_word(word)).count() as i64;
+        letters + words * 3 - noise * 8 - spikes * 8
+    }
+    for candidate in candidates {
+        if is_ocr_garbage(&candidate.text) { continue; }
+        let matching = lines.iter().enumerate().filter_map(|(index, line)| {
+            let a = line.rect;
+            let b = candidate.rect;
+            if a.is_empty() || b.is_empty() { return None; }
+            let height = a.height.max(b.height) as i64;
+            let vertical = ((a.y as i64 + a.height as i64).min(b.y as i64 + b.height as i64)
+                - a.y.max(b.y) as i64).max(0);
+            let horizontal = ((a.x as i64 + a.width as i64).min(b.x as i64 + b.width as i64)
+                - a.x.max(b.x) as i64).max(0);
+            let same_extent = (a.x as i64 - b.x as i64).abs() <= height / 2
+                && (a.x as i64 + a.width as i64 - b.x as i64 - b.width as i64).abs() <= height / 2;
+            let same_region = horizontal * 10 >= a.width.min(b.width) as i64 * 9
+                && horizontal * 10 >= a.width.max(b.width) as i64 * 6;
+            let contained_reading = (contains_word_sequence(&line.text.to_lowercase(), &candidate.text.to_lowercase())
+                || contains_word_sequence(&candidate.text.to_lowercase(), &line.text.to_lowercase()))
+                && (covers_additional_region(a, b) || covers_additional_region(b, a));
+            let aligned = (same_extent || same_region || contained_reading)
+                && horizontal * 10 >= a.width.min(b.width) as i64 * 7
+                && (2 * a.y as i64 + a.height as i64 - 2 * b.y as i64 - b.height as i64).abs() * 10 <= height * 7
+                && vertical * 10 >= a.height.min(b.height) as i64 * 7;
+            aligned.then_some(index)
+        }).collect::<Vec<_>>();
+        if matching.is_empty() {
+            merge_recognized_lines(lines, vec![candidate]);
+            continue;
+        }
+        let mut winner = candidate;
+        for &index in &matching {
+            let existing = &lines[index];
+            let fuller = word_tokens(&existing.text).len() > word_tokens(&winner.text).len()
+                && contains_word_sequence(&existing.text.to_lowercase(), &winner.text.to_lowercase())
+                && covers_additional_region(existing.rect, winner.rect);
+            let winner_fuller = word_tokens(&winner.text).len() > word_tokens(&existing.text).len()
+                && contains_word_sequence(&winner.text.to_lowercase(), &existing.text.to_lowercase())
+                && covers_additional_region(winner.rect, existing.rect);
+            if fuller || (!winner_fuller && quality(existing) >= quality(&winner)) {
+                winner = existing.clone();
+            }
+        }
+        let first = matching[0];
+        for &index in matching.iter().rev() { lines.remove(index); }
+        lines.insert(first, winner);
+    }
+}
+
 pub fn ocr_tiles(width: u32, height: u32) -> Vec<ScreenRect> {
     let mut tiles = Vec::new();
     let side = if width.max(height) > 2000 { 1200 } else { width.max(height).max(1) };
@@ -370,12 +429,13 @@ impl WinrtOcrEngine {
             bgra_bytes: &frame.bgra_bytes, width: frame.width, height: frame.height,
             remap: RemapParams { pad: 0, scale: 1.0, offset_x: frame.offset_x, offset_y: frame.offset_y },
         }).await {
-            merge_recognized_lines(&mut best_lines, raw_lines);
+            merge_native_pass(&mut best_lines, raw_lines);
         }
-        let mut best_score = first_score;
+        let mut best_score = score_recognized_lines(&best_lines);
 
-        // If first pass found quality text, do not waste time on extra passes
-        if best_score < 25 {
+        // A long readable caption says nothing about other regions. Always
+        // compare the outline mask so a missed second caption can be recovered.
+        {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
 
             // Pass 2: Outlined text mask (meme font filter)
@@ -409,7 +469,7 @@ impl WinrtOcrEngine {
                         score
                     );
                     best_score = best_score.max(score);
-                    merge_recognized_lines(&mut best_lines, mask_lines);
+                    merge_native_pass(&mut best_lines, mask_lines);
                 }
             }
 
@@ -433,7 +493,7 @@ impl WinrtOcrEngine {
                         score
                     );
                     best_score = best_score.max(score);
-                    merge_recognized_lines(&mut best_lines, inv_lines);
+                    merge_native_pass(&mut best_lines, inv_lines);
                 }
             }
 
@@ -467,7 +527,7 @@ impl WinrtOcrEngine {
                             up_lines.len(),
                             score
                         );
-                        merge_recognized_lines(&mut best_lines, up_lines);
+                        merge_native_pass(&mut best_lines, up_lines);
                     }
                 }
             }
@@ -593,6 +653,16 @@ impl WinrtOcrEngine {
                 });
             }
 
+            // Isolated frame strokes can expand a line box by hundreds of
+            // pixels and keep a corrupt duplicate beside another pass's text.
+            // Remove only punctuation strokes; digits (including 1), the
+            // pronoun I, and D- stutters are real text and must remain.
+            let word_count_before_filter = words.len();
+            words.retain(|word| !is_spike_word(&word.text) || word.text.chars().any(char::is_alphanumeric));
+            let line_text = if words.len() != word_count_before_filter {
+                line_rect = words.iter().fold(ScreenRect::new(0, 0, 0, 0), |rect, word| rect.union(&word.rect));
+                words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ")
+            } else { line_text };
             let trimmed = line_text.trim();
             if !trimmed.is_empty() && !is_ocr_garbage(trimmed) {
                 lines.push(RecognizedLine {
@@ -1245,6 +1315,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_passes_resolve_conflicting_baselines_without_merging_neighbours_or_losing_negation() {
+        let line = |text: &str, rect| RecognizedLine { text: text.into(), rect, confidence: None, words: vec![] };
+        let mut lines = vec![line("- EXCUSEME SIR", ScreenRect::new(100, 60, 700, 140)),
+            line("Next line", ScreenRect::new(100, 210, 700, 90))];
+        merge_native_pass(&mut lines, vec![line("EXCUSEME SW", ScreenRect::new(104, 65, 680, 100)),
+            line("EXCUSE ME SIR", ScreenRect::new(100, 67, 675, 92))]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "EXCUSE ME SIR");
+        assert_eq!(lines[1].text, "Next line");
+        merge_native_pass(&mut lines, vec![line("EXCUSE ME", ScreenRect::new(100, 76, 501, 82))]);
+        assert_eq!(lines.len(), 2, "a partial prefix must not remain beside its full reading");
+        for (clear, alternative) in [("DON'T QUIT", "DONT QUIT"), ("WAIT!", "WARR!")] {
+            let rect = ScreenRect::new(100, 100, 240, 20);
+            let mut lines = vec![line(clear, rect)];
+            merge_native_pass(&mut lines, vec![line(alternative, rect)]);
+            assert_eq!(lines[0].text, clear, "an equal score is not evidence to rewrite existing text");
+        }
+        let mut punctuation = vec![line("STOP!", ScreenRect::new(100, 100, 100, 20))];
+        merge_native_pass(&mut punctuation, vec![line("STOP", ScreenRect::new(98, 98, 104, 24))]);
+        assert_eq!(punctuation[0].text, "STOP!", "a larger box without extra words is not a fuller reading");
+        let mut labels = vec![line("ON", ScreenRect::new(100, 100, 10, 40))];
+        merge_native_pass(&mut labels, vec![line("GO", ScreenRect::new(120, 100, 10, 40))]);
+        assert_eq!(labels.len(), 2, "adjacent narrow labels must not compete without horizontal overlap");
+        for (first, second) in [("DO NOT OPEN THE DOOR", "OPEN THE DOOR"),
+                                ("OPEN THE DOOR", "DO NOT OPEN THE DOOR")] {
+            let full = ScreenRect::new(100, 100, 240, 20);
+            let short = ScreenRect::new(130, 100, 210, 20);
+            let mut lines = vec![line(first, if first.starts_with("DO NOT") { full } else { short })];
+            merge_native_pass(&mut lines, vec![line(second, if second.starts_with("DO NOT") { full } else { short })]);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, "DO NOT OPEN THE DOOR");
+        }
+    }
+
+    #[test]
     fn test_merge_keeps_missing_regions_and_uses_confidence() {
         let line = |text: &str, x, confidence| RecognizedLine {
             confidence, text: text.to_string(), rect: ScreenRect::new(x, 10, 100, 20), words: vec![],
@@ -1778,16 +1883,8 @@ mod tests {
             return;
         }
 
-        let img = match image::open("tests/fixtures/meme_no_pickles.png") {
-            Ok(im) => im.to_rgba8(),
-            Err(e) => {
-                println!(
-                    "SKIPPED: tests/fixtures/meme_no_pickles.png not found: {}",
-                    e
-                );
-                return;
-            }
-        };
+        let img = image::open("tests/fixtures/meme_no_pickles.png")
+            .expect("The committed meme fixture must be readable").to_rgba8();
 
         let (width, height) = (img.width(), img.height());
         let mut bgra = Vec::with_capacity((width * height * 4) as usize);
@@ -1811,11 +1908,7 @@ mod tests {
             .await
             .expect("OCR recognition failed");
 
-        assert!(
-            blocks.len() >= 2,
-            "Expected at least 2 distinct blocks (top and bottom), found {}",
-            blocks.len()
-        );
+        assert_eq!(blocks.len(), 2, "Expected one reading per caption: {blocks:?}");
 
         let full_text = blocks
             .iter()
@@ -1824,24 +1917,7 @@ mod tests {
             .join(" ");
         println!("Full recognized meme text: {}", full_text);
 
-        // Check top text: "EXCUSE ME SIR" (allowing 1-2 symbol errors)
-        assert!(
-            full_text.contains("EXCUSE")
-                && (full_text.contains("SIR")
-                    || full_text.contains("SOR")
-                    || full_text.contains("SW")),
-            "Top text 'EXCUSE ME SIR' must be detected: {}",
-            full_text
-        );
-
-        // Check bottom text: "SHE ASKED FOR NO PICKLES" (allowing 1-2 symbol errors)
-        assert!(
-            full_text.contains("ASKED")
-                && full_text.contains("NO")
-                && (full_text.contains("PICKLE") || full_text.contains("PIC")),
-            "Bottom text 'SHE ASKED FOR NO PICKLES' must be detected: {}",
-            full_text
-        );
+        assert_eq!(full_text, "EXCUSE ME SIR SHE ASKED FOR NO PICKLES");
     }
 
     #[test]
@@ -1890,16 +1966,17 @@ mod tests {
         if !WinrtOcrEngine::is_language_available("en") {
             return;
         }
-        let img = match image::open("tests/fixtures/meme_no_pickles.png") {
-            Ok(im) => im.to_rgba8(),
-            Err(_) => return,
-        };
+        let img = image::open("tests/fixtures/meme_no_pickles.png")
+            .expect("The committed meme fixture must be readable").to_rgba8();
         let screen_w = 1920;
-        let screen_h = 1080;
+        // The fixture is 1117px tall. Keep the whole image on this desktop;
+        // the old 1080px test silently removed the bottom caption.
+        let screen_h = 1200;
         let mut bgra = vec![40u8; (screen_w * screen_h * 4) as usize];
 
         let paste_x = 400;
         let paste_y = 50;
+        assert!(img.width() <= screen_w - paste_x && img.height() <= screen_h - paste_y);
         for y in 0..img.height().min(screen_h - paste_y) {
             for x in 0..img.width().min(screen_w - paste_x) {
                 let px = img.get_pixel(x, y);
@@ -1925,6 +2002,9 @@ mod tests {
         for b in &blocks {
             println!("  Block: '{}' at {:?}", b.text, b.rect);
         }
+        assert_eq!(blocks.len(), 2, "One complete reading per caption: {blocks:?}");
+        assert_eq!(blocks.iter().map(|block| block.text.to_uppercase()).collect::<Vec<_>>().join(" "),
+            "EXCUSE ME SIR SHE ASKED FOR NO PICKLES");
     }
 
     #[test]

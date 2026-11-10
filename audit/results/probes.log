@@ -1,0 +1,23 @@
+
+running 6 tests
+test audit_probes::paragraph_context_drops_negation_at_an_accepted_line_gap ... OBSERVED gap: paragraph="DO NOT OPEN THE DOOR", cursor="OPEN THE DOOR"
+ok
+test audit_probes::paragraph_context_reintroduces_a_space_into_wrapped_words ... OBSERVED hyphen: paragraph="well-known", cursor="well- known"
+OBSERVED hyphen: paragraph="D-Did he find out?!", cursor="D- Did he find out?!"
+ok
+test audit_probes::vision_ignores_dialogue_history_and_glossary ... OBSERVED vision context: no history/glossary in request; result absent from history
+ok
+test audit_probes::vision_parser_accepts_reversed_and_out_of_image_boxes ... OBSERVED vision geometry: [-100,-100,2000,2000] => ScreenRect { x: 20, y: 140, width: 1680, height: 1260 }
+OBSERVED vision geometry: [900,900,100,100] => ScreenRect { x: 820, y: 740, width: 1, height: 1 }
+ok
+test audit_probes::vision_parser_can_panic_on_model_coordinates ... OBSERVED vision overflow: valid JSON caused a panic in the parser
+ok
+test audit_probes::winrt_corpus_report ... WinRT corpus: 35 images measured; see target/audit-winrt-quality.json
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 202 filtered out; finished in 26.11s
+
+
+thread 'audit_probes::vision_parser_can_panic_on_model_coordinates' (6592) panicked at C:/Users/Yaggdrasil/Documents/GitHub/Screen_translator/src\translator\mod.rs:634:17:
+attempt to add with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

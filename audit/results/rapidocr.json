@@ -1,0 +1,321 @@
+{
+  "engine": "RapidOCR",
+  "load_ms": 558.73,
+  "results": [
+    {
+      "file": "please_follow.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "PLEASE FOLLOW INSTRUCTIONS!",
+      "ms": 692.34,
+      "pass": true
+    },
+    {
+      "file": "utube_shorts.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "LET'S POST IT ON UTUBE SHORTS!",
+      "ms": 457.5,
+      "pass": true
+    },
+    {
+      "file": "new_era_white_glow.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "HAS ENTERED A NEW ERA.",
+      "ms": 273.93,
+      "pass": true
+    },
+    {
+      "file": "meme_no_pickles.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "EXCUSE ME SIR SHE ASKED FOR NO PICKLES",
+      "ms": 3693.83,
+      "pass": true
+    },
+    {
+      "file": "small_subtitle.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "PLEASE WAIT FOR THE NEXT MISSION.",
+      "ms": 891.65,
+      "pass": true
+    },
+    {
+      "file": "small_subtitle_noisy.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "PLEASE WAIT FOR THE NEXT MISSION.",
+      "ms": 816.51,
+      "pass": true
+    },
+    {
+      "file": "english_thin_10.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+      "ms": 626.22,
+      "pass": true
+    },
+    {
+      "file": "english_dark_14.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+      "ms": 661.59,
+      "pass": true
+    },
+    {
+      "file": "english_italic_14.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+      "ms": 555.56,
+      "pass": true
+    },
+    {
+      "file": "english_edge_14.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "DON'T QUIT! IPHONE SAVES STATE-OF-THE-ART SCREENSHOTS.",
+      "ms": 811.28,
+      "pass": true
+    },
+    {
+      "file": "manga_comic.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 819.8,
+      "pass": true
+    },
+    {
+      "file": "manga_italic.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 806.05,
+      "pass": true
+    },
+    {
+      "file": "manga_condensed.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 1060.88,
+      "pass": true
+    },
+    {
+      "file": "manga_heavy.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 467.27,
+      "pass": true
+    },
+    {
+      "file": "manga_outline.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 449.56,
+      "pass": true
+    },
+    {
+      "file": "manga_low_contrast.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 818.3,
+      "pass": true
+    },
+    {
+      "file": "manga_handwritten.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "WAIT! WE HAVE TO GET OUT OF HERE!",
+      "ms": 754.76,
+      "pass": true
+    },
+    {
+      "file": "manga_handwritten_black.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "D-DID HE FIND OUT?!",
+      "ms": 555.22,
+      "pass": true
+    },
+    {
+      "file": "manhwa_01.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "KAYDEN! ARE YOU ALRIGHT?!",
+      "ms": 1774.35,
+      "pass": true
+    },
+    {
+      "file": "manhwa_02.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "NO, MY WHOLE BODY HURTS LIKE HELL.",
+      "ms": 1860.8,
+      "pass": true
+    },
+    {
+      "file": "manhwa_03.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "I CAN BARELY MOVE ONE OF MY ARMS, AND MY CORE IS COMPLETELY OVERLOADED...",
+      "ms": 2050.97,
+      "pass": true
+    },
+    {
+      "file": "manhwa_04.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "DON'T LOOK AT ME LIKE THAT. I FOUGHT TWO TOP 10'S YOU KNOW?",
+      "ms": 2394.95,
+      "pass": true
+    },
+    {
+      "file": "manhwa_05.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "STILL, IF IT'S ONLY THIS BAD, THEN I'M FINE, SO DON'T WORRY.",
+      "ms": 2417.12,
+      "pass": true
+    },
+    {
+      "file": "manhwa_06.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "I'LL HEAD DOWN AND GET SOME REST TO RECOVER.",
+      "ms": 2423.48,
+      "pass": true
+    },
+    {
+      "file": "manhwa_07.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "I WON THIS TIME, TOO.",
+      "ms": 1572.22,
+      "pass": true
+    },
+    {
+      "file": "manhwa_08.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "JUST LIKE YOU SAID, I HAD A HELL OF A FIGHT.",
+      "ms": 2320.58,
+      "pass": true
+    },
+    {
+      "file": "manhwa_09.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "IAN PATRICK WAS ALIVE.",
+      "ms": 2688.3,
+      "pass": true
+    },
+    {
+      "file": "manhwa_10.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "THAT'S RIGHT. ALTHOUGH HIS CONDITION WASN'T GREAT,",
+      "ms": 2557.23,
+      "pass": true
+    },
+    {
+      "file": "manhwa_11.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "I RESCUED HIM FROM WHERE THEY WERE HOLDING HIM CAPTIVE AND SENT HIM TO VERAMONTE.",
+      "ms": 3372.26,
+      "pass": true
+    },
+    {
+      "file": "manhwa_12.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "THANK YOU SO MUCH!",
+      "ms": 2548.35,
+      "pass": true
+    },
+    {
+      "file": "manhwa_13.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "EVEN THOUGH THE OUTCOME WAS ALREADY DECIDED, IT CAUGHT ME OFF GUARD WHEN THEY RUSHED IN LIKE THEY WANTED TO DIE TOGETHER.",
+      "ms": 2680.27,
+      "pass": true
+    },
+    {
+      "file": "manhwa_14.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "HOLDING BACK JUST BECAUSE THE ENEMY SAID THEY SURRENDER...",
+      "ms": 1754.69,
+      "pass": true
+    },
+    {
+      "file": "manhwa_15.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "D-DID HE FIND OUT?!",
+      "ms": 1423.9,
+      "pass": true
+    },
+    {
+      "file": "manhwa_16.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "BUT THIS PLACE FEELS LIKE A COMPLETELY DIFFERENT WORLD.",
+      "ms": 1785.43,
+      "pass": true
+    },
+    {
+      "file": "manhwa_17.png",
+      "cer": 0.0,
+      "wer": 0.0,
+      "missing_lines": 0,
+      "text": "COME TO THINK OF IT... KARTEIN AND PLUTON AREN'T THE ONLY ONES SHOWING SIDES NO ONE COULD'VE EVER IMAGINED.",
+      "ms": 3380.56,
+      "pass": true
+    }
+  ]
+}
